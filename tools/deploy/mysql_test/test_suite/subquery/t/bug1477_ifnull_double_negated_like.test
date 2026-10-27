@@ -1,0 +1,11 @@
+#description: IFNULL with a boolean scalar subquery and double-negated LIKE
+#issue: https://github.com/oceanbase/seekdb/issues/1477
+
+# The double negation used to fail in push_not rewrite with ERROR 4016
+SELECT 1 FROM dual WHERE IFNULL((SELECT FALSE), !(!(1 LIKE "x")));
+
+# Control case: a single negation instead of two
+SELECT 1 FROM dual WHERE IFNULL((SELECT FALSE), !(1 LIKE "x"));
+
+# Control case: a literal instead of a scalar subquery
+SELECT 1 FROM dual WHERE IFNULL(FALSE, !(!(1 LIKE "x")));

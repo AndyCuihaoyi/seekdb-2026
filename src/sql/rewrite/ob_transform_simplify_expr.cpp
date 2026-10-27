@@ -2378,12 +2378,23 @@ int ObTransformSimplifyExpr::do_push_not(ObRawExpr *&expr,
       // size of not is even
       // not(not c1 > 1)) -> c1>1
       ObRawExpr *temp = NULL;
+      ObRawExpr *new_temp = NULL;
       if (OB_FAIL(ObRawExprUtils::try_create_bool_expr(cur, temp, *expr_factory))) {
       } else if (OB_ISNULL(temp)) {
         ret = OB_ERR_UNEXPECTED;
       } else if (OB_FAIL(temp->formalize(ctx_->session_info_))) {
+      } else if (OB_FAIL(ObRawExprUtils::try_add_cast_expr_above(expr_factory,
+                                                                 ctx_->session_info_,
+                                                                 *temp,
+                                                                 expr->get_result_type(),
+                                                                 new_temp))) {
+      } else if (OB_ISNULL(new_temp)) {
+        ret = OB_ERR_UNEXPECTED;
       } else {
-        expr = temp;
+        // NOT returns int32 while some boolean operands such as LIKE return int64,
+        // keep the result type of the removed NOT chain so that outer expressions
+        // do not re-deduce a different type during formalize.
+        expr = new_temp;
         is_valid = false;
         trans_happened = true;
       }
