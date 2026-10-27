@@ -9,3 +9,7 @@ SELECT 1 FROM dual WHERE IFNULL((SELECT FALSE), !(1 LIKE "x"));
 
 # Control case: a literal instead of a scalar subquery
 SELECT 1 FROM dual WHERE IFNULL(FALSE, !(!(1 LIKE "x")));
+
+# IFNULL's first argument takes the other NOT-elimination path
+SELECT IFNULL(!(!(1 LIKE "x")), (SELECT FALSE)) AS value;
+SELECT IFNULL(!(!(1 LIKE "1")), (SELECT FALSE)) AS value;
