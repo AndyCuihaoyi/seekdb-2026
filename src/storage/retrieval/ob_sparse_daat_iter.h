@@ -46,6 +46,7 @@ struct ObSRMergeCmp
 
   int init(sql::ObDatumMeta id_meta, const ObFixedArray<const ObDatum *, ObIAllocator> *iter_ids);
   int cmp(const ObSRMergeItem &l, const ObSRMergeItem &r, int64_t &cmp_ret);
+  int cmp_datum(const ObDatum &l, const ObDatum &r, int64_t &cmp_ret);
 private:
   common::ObDatumCmpFuncType cmp_func_;
   // raw backing storage of the caller-provided fixed array, valid for the iter's lifetime (count fixed at init)
@@ -58,6 +59,16 @@ private:
 typedef ObSimpleRowsMerger<ObSRMergeItem, ObSRMergeCmp> ObSRSimpleMerger;
 typedef ObMergeLoserTree<ObSRMergeItem, ObSRMergeCmp> ObSRLoserTree;
 typedef common::ObRowsMerger<ObSRMergeItem, ObSRMergeCmp> ObSRMergeHeap;
+
+// per-dim current row of the register-based DAAT merge (replaces the merge heap in the
+// base-class round path; the heap path stays for iters that drive the heap directly)
+struct ObSRDimState
+{
+  ObSRDimState() : id_(nullptr), rel_(0.0), active_(false) {}
+  const ObDatum *id_;
+  double rel_;
+  bool active_;
+};
 
 // implementation of basic DaaT query processing algorithm primitives
 class ObSRDaaTIterImpl : public ObISparseRetrievalMergeIter
@@ -93,6 +104,10 @@ protected:
   int do_one_merge_round_raw(int64_t &count);
   int buffer_raw_result(int64_t &count, const ObDatum &id_datum, const double relevance);
   int apply_batch_filter(const int64_t raw_count, int64_t &count);
+  // register-based DAAT merge: advance dims consumed last round, pick the min docid,
+  // collect all dims holding it (ascending iter_idx, same float-sum order as the heap path)
+  int fast_fill_dims();
+  int fast_collect_dims(const ObDatum *&id_datum, double &relevance, bool &got_valid_id);
 protected:
   ObIAllocator *iter_allocator_;
   ObSparseRetrievalMergeParam *iter_param_;
@@ -114,6 +129,9 @@ protected:
   int64_t next_round_cnt_;
   sql::ObBitVector *filter_skip_;
   void (*set_datum_func_)(ObDatum &, const ObDocIdExt &);
+  // register-based merge state; used when use_fast_merge_ is set, otherwise merge_heap_
+  ObSRDimState *dim_states_;
+  bool use_fast_merge_;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObSRDaaTIterImpl);
 };
