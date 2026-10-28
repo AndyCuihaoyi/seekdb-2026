@@ -222,15 +222,37 @@ int ObExprTokenize::construct_ft_parser_inner_name(const ObString &input_str, To
 {
   int ret = OB_SUCCESS;
   storage::ObFTParser parser;
+  storage::ObFTParseData *parse_data = storage::ObFTParseData::try_instance();
+  bool cache_hit = false;
 
-  char *parser_name_buf = nullptr;
-  if (OB_ISNULL(parser_name_buf
-                = static_cast<char *>(param.allocator_.alloc(storage::OB_FT_PARSER_NAME_LENGTH)))) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
-  } else if (OB_FAIL(parser.init(input_str))) {
-  } else if (OB_FAIL(parser.serialize_to_str(parser_name_buf, storage::OB_FT_PARSER_NAME_LENGTH))) {
+  if (OB_NOT_NULL(parse_data)) {
+    int tmp_ret = parse_data->get_cached_parser_name(input_str, param.parser_name_);
+    if (OB_SUCCESS == tmp_ret) {
+      cache_hit = true;
+    } else if (OB_ENTRY_NOT_EXIST != tmp_ret) {
+      ret = tmp_ret;
+    }
+  }
+
+  if (OB_FAIL(ret) || cache_hit) {
+    // done
   } else {
-    param.parser_name_ = ObString::make_string(parser_name_buf);
+    char *parser_name_buf = nullptr;
+    if (OB_ISNULL(parser_name_buf
+                  = static_cast<char *>(param.allocator_.alloc(storage::OB_FT_PARSER_NAME_LENGTH)))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else if (OB_FAIL(parser.init(input_str))) {
+    } else if (OB_FAIL(parser.serialize_to_str(parser_name_buf, storage::OB_FT_PARSER_NAME_LENGTH))) {
+    } else {
+      param.parser_name_ = ObString::make_string(parser_name_buf);
+      if (OB_NOT_NULL(parse_data)) {
+        int tmp_ret = parse_data->put_cached_parser_name(input_str, param.parser_name_);
+        if (OB_SUCCESS != tmp_ret && OB_SIZE_OVERFLOW != tmp_ret
+            && OB_ALLOCATE_MEMORY_FAILED != tmp_ret) {
+          LOG_WARN("failed to cache parser name", K(tmp_ret));
+        }
+      }
+    }
   }
   return ret;
 }
@@ -376,14 +398,33 @@ int ObExprTokenize::TokenizeParam::reform_parser_properties(const ObString &prop
 {
   int ret = OB_SUCCESS;
   storage::ObFTParserJsonProps parser_properties;
+  storage::ObFTParseData *parse_data = storage::ObFTParseData::try_instance();
+  bool cache_hit = false;
 
-  if (OB_FAIL(parser_properties.init())) {
+  if (OB_NOT_NULL(parse_data)) {
+    int tmp_ret = parse_data->get_cached_reformed_props(parser_name_, properties, properties_);
+    if (OB_SUCCESS == tmp_ret) {
+      cache_hit = true;
+    } else if (OB_ENTRY_NOT_EXIST != tmp_ret) {
+      ret = tmp_ret;
+    }
+  }
+
+  if (OB_FAIL(ret) || cache_hit) {
+    // done
+  } else if (OB_FAIL(parser_properties.init())) {
   } else if (OB_FAIL(parser_properties.parse_from_valid_str(properties))) {
     LOG_USER_ERROR(OB_INVALID_ARGUMENT, "parser properties invalid.");
   } else if (OB_FAIL(parser_properties.rebuild_props_for_ddl(parser_name_,
                                                              ObCollationType::CS_TYPE_UTF8MB4_BIN,
                                                              true))) {
   } else if (OB_FAIL(parser_properties.to_format_json(allocator_, properties_))) {
+  } else if (OB_NOT_NULL(parse_data)) {
+    int tmp_ret = parse_data->put_cached_reformed_props(parser_name_, properties, properties_);
+    if (OB_SUCCESS != tmp_ret && OB_SIZE_OVERFLOW != tmp_ret
+        && OB_ALLOCATE_MEMORY_FAILED != tmp_ret) {
+      LOG_WARN("failed to cache reformed parser properties", K(tmp_ret));
+    }
   }
 
   return ret;

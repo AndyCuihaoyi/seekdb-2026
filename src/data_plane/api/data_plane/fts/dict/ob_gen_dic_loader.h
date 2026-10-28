@@ -17,6 +17,8 @@
 #ifndef OCEANBASE_STORAGE_DICT_OB_GEN_DIC_LOADER_H_
 #define OCEANBASE_STORAGE_DICT_OB_GEN_DIC_LOADER_H_
 
+#include <atomic>
+
 #include "lib/lock/ob_tc_rwlock.h"
 #include "data_plane/fts/dict/ob_dic_loader.h"
 #include "data_plane/fts/ob_fts_parser_name.h"
@@ -76,7 +78,7 @@ public:
 
 private:
   ObGenDicLoader()
-      : is_inited_(false), lock_(), dic_loader_map_() { }
+      : is_inited_(false), lock_(), dic_loader_map_(), cached_ik_utf8mb4_loader_(nullptr) { }
   ~ObGenDicLoader() { dic_loader_map_.destroy(); }
   int gen_dic_loader(const ObGenDicLoaderKey &dic_loader_key,
                      ObDicLoader *&dic_loader);
@@ -85,6 +87,9 @@ private:
   bool is_inited_;
   common::TCRWLock lock_;
   hash::ObHashMap<ObGenDicLoaderKey, ObDicLoader*> dic_loader_map_;
+  // Lock-free fast path for the hot ("ik", utf8mb4) key. The loader has process
+  // lifetime (dic_loader_map_ never erases), so a bare pointer is safe to publish.
+  std::atomic<ObDicLoader *> cached_ik_utf8mb4_loader_;
   DISALLOW_COPY_AND_ASSIGN(ObGenDicLoader);
 };
 } //end storage

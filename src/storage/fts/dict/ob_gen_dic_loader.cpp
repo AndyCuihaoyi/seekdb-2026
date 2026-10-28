@@ -123,6 +123,11 @@ int ObGenDicLoader::get_dic_loader(const ObString &parser_name,
   } else if (parser_name.empty()
              || charset == CHARSET_INVALID) {
     ret = OB_INVALID_ARGUMENT;
+  } else if (ObCharsetType::CHARSET_UTF8MB4 == charset
+             && 0 == parser_name.case_compare(ObFTSLiteral::PARSER_NAME_IK)
+             && OB_NOT_NULL(dic_loader = cached_ik_utf8mb4_loader_.load(std::memory_order_acquire))) {
+    // Hot key already created: skip the global write lock entirely.
+    ret = loader_handle.set_loader(dic_loader);
   } else if (OB_FAIL(dic_loader_key.init(parser_name, charset))) {
   } else {
     TCWLockGuard guard(lock_);
@@ -139,6 +144,16 @@ int ObGenDicLoader::get_dic_loader(const ObString &parser_name,
         ret = OB_ERR_UNEXPECTED;
       }
     } else if (OB_FAIL(loader_handle.set_loader(dic_loader))) {
+    }
+
+    if (OB_SUCC(ret)
+        && ObCharsetType::CHARSET_UTF8MB4 == charset
+        && 0 == parser_name.case_compare(ObFTSLiteral::PARSER_NAME_IK)) {
+      ObDicLoader *expected = nullptr;
+      cached_ik_utf8mb4_loader_.compare_exchange_strong(expected,
+                                                        dic_loader,
+                                                        std::memory_order_release,
+                                                        std::memory_order_relaxed);
     }
   }
   return ret;

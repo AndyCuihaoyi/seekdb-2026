@@ -18,7 +18,9 @@
 #define OB_FTS_PARSER_HELPER_H_
 
 #include "lib/allocator/ob_fifo_allocator.h"
+#include "lib/allocator/page_arena.h"
 #include "lib/charset/ob_charset.h"
+#include "lib/lock/ob_tc_rwlock.h"
 #include "lib/string/ob_string.h"
 #include "object/ob_object.h"
 #include "data_plane/fts/ob_fts_parser.h"
@@ -100,6 +102,69 @@ private:
   int64_t parser_version_;
 };
 
+// Cache entries for ObFTParseData parser setup caches. All strings are deep copied
+// into the entry arena, which lives as long as the process global ObFTParseData.
+class ObFTNameAlias final
+{
+public:
+  ObFTNameAlias() : alloc_(lib::ObMemAttr("FTNameAlias")) {}
+  ~ObFTNameAlias() = default;
+
+  bool match(const common::ObString &raw_name) const { return raw_name_ == raw_name; }
+  int assign(const common::ObString &raw_name, const common::ObString &canonical_name);
+
+public:
+  common::ObArenaAllocator alloc_;
+  common::ObString raw_name_;
+  common::ObString canonical_name_;
+  DISALLOW_COPY_AND_ASSIGN(ObFTNameAlias);
+};
+
+class ObFTReformedProps final
+{
+public:
+  ObFTReformedProps() : alloc_(lib::ObMemAttr("FTReformProps")) {}
+  ~ObFTReformedProps() = default;
+
+  bool match(const common::ObString &parser_name, const common::ObString &raw_props) const
+  {
+    return parser_name_ == parser_name && raw_props_ == raw_props;
+  }
+  int assign(const common::ObString &parser_name,
+             const common::ObString &raw_props,
+             const common::ObString &canonical_props);
+
+public:
+  common::ObArenaAllocator alloc_;
+  common::ObString parser_name_;
+  common::ObString raw_props_;
+  common::ObString canonical_props_;
+  DISALLOW_COPY_AND_ASSIGN(ObFTReformedProps);
+};
+
+class ObFTParserConf final
+{
+public:
+  ObFTParserConf() : alloc_(lib::ObMemAttr("FTParserConf")), parser_desc_(nullptr) {}
+  ~ObFTParserConf() = default;
+
+  bool match(const common::ObString &parser_name, const common::ObString &props) const
+  {
+    return parser_name_ == parser_name && props_ == props;
+  }
+  int assign_names(const common::ObString &parser_name, const common::ObString &props);
+
+public:
+  common::ObArenaAllocator alloc_;
+  common::ObString parser_name_;
+  common::ObString props_;
+  ObFTParser parser_;
+  const ObIFTParserDesc *parser_desc_;
+  ObFTParserProperty property_;
+  ObAddWordFlag add_word_flag_;
+  DISALLOW_COPY_AND_ASSIGN(ObFTParserConf);
+};
+
 class ObFTParseData final
 {
 public:
@@ -112,6 +177,8 @@ public:
   static int  init_global();
   static void deinit_global();
   static ObFTParseData &instance();
+  // Returns nullptr before init_global()/after deinit_global(), e.g. in unit tests.
+  static ObFTParseData *try_instance();
 
   int init();
   void destroy();
@@ -120,15 +187,51 @@ public:
   ObStopWordChecker *stop_word_checker() const { return stop_word_checker_; }
   int get_dict_hub(ObFTDictHub *&hub);
 
+  // ---- process-wide parser setup caches --------------------------------------------
+  // Tokenize() runs the same parser-name/property/parser construction on every row.
+  // These caches memoize the (deterministic) results by exact input strings. Entries
+  // are immutable once published and never replaced, so returned views stay valid.
+  // Misses return OB_ENTRY_NOT_EXIST; put failures are best effort (cache is optional).
+  int get_cached_parser_name(const common::ObString &raw_name, common::ObString &canonical_name);
+  int put_cached_parser_name(const common::ObString &raw_name, const common::ObString &canonical_name);
+  int get_cached_reformed_props(const common::ObString &parser_name,
+                                const common::ObString &raw_props,
+                                common::ObString &canonical_props);
+  int put_cached_reformed_props(const common::ObString &parser_name,
+                                const common::ObString &raw_props,
+                                const common::ObString &canonical_props);
+  int get_cached_parser_conf(const common::ObString &parser_name,
+                             const common::ObString &parser_props,
+                             const ObFTParserConf *&conf);
+  int put_cached_parser_conf(const common::ObString &parser_name,
+                             const common::ObString &parser_props,
+                             const ObFTParser &parser,
+                             const ObIFTParserDesc *parser_desc,
+                             const ObFTParserProperty &property,
+                             const ObAddWordFlag &add_word_flag);
+
 private:
   int init_and_set_stopword_list();
   int init_dict_hub();
+  void destroy_caches();
+
+  static constexpr int64_t MAX_PARSER_NAME_ALIAS = 32;
+  static constexpr int64_t MAX_REFORMED_PROPS = 32;
+  static constexpr int64_t MAX_PARSER_CONF = 64;
 
 private:
   ObStopWordChecker *     stop_word_checker_ = nullptr;
   ObFTDictHub *           dict_hub_          = nullptr;
   common::ObFIFOAllocator handler_allocator_;
   bool                    is_inited_         = false;
+
+  common::TCRWLock cache_lock_;
+  ObFTNameAlias *name_aliases_[MAX_PARSER_NAME_ALIAS] = {};
+  int64_t name_alias_cnt_ = 0;
+  ObFTReformedProps *reformed_props_[MAX_REFORMED_PROPS] = {};
+  int64_t reformed_props_cnt_ = 0;
+  ObFTParserConf *parser_confs_[MAX_PARSER_CONF] = {};
+  int64_t parser_conf_cnt_ = 0;
 };
 
 class ObFTParseHelper final

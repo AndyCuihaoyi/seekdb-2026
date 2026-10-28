@@ -35,7 +35,14 @@ int ObFTDictHub::init()
   if (OB_FAIL(dict_map_.create(K_MAX_DICT_BUCKET, "dict_map"))) {
   } else if (OB_FAIL(rw_dict_lock_.init(K_MAX_DICT_BUCKET))) {
   } else {
-    is_inited_ = true;
+    for (int64_t i = 0; OB_SUCC(ret) && i < FT_DICT_TYPE_CNT; ++i) {
+      if (OB_ISNULL(cached_dicts_[i] = OB_NEW(ObFTCachedRangeDict, ObMemAttr("FTCachedDict")))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      }
+    }
+    if (OB_SUCC(ret)) {
+      is_inited_ = true;
+    }
   }
   return ret;
 };
@@ -44,6 +51,16 @@ int ObFTDictHub::destroy()
 {
   int ret = OB_SUCCESS;
   is_inited_ = false;
+  {
+    ObMemAttr attr("FTCachedDict");
+    common::TCWLockGuard guard(dict_cache_lock_);
+    for (int64_t i = 0; i < FT_DICT_TYPE_CNT; ++i) {
+      if (OB_NOT_NULL(cached_dicts_[i])) {
+        OB_DELETE(ObFTCachedRangeDict, attr, cached_dicts_[i]);
+        cached_dicts_[i] = nullptr;
+      }
+    }
+  }
   return ret;
 }
 int ObFTDictHub::build_cache(const ObFTDictDesc &desc, ObFTCacheRangeContainer &container)
@@ -114,6 +131,82 @@ int ObFTDictHub::load_cache(const ObFTDictDesc &desc, ObFTCacheRangeContainer &c
   return ret;
 }
 
+
+int ObFTDictHub::get_cached_dict(const ObFTDictDesc &desc, ObIFTDict *&dict)
+{
+  int ret = OB_SUCCESS;
+  dict = nullptr;
+  const int64_t type_idx = static_cast<int64_t>(desc.type_);
+  if (!is_inited_) {
+    ret = OB_NOT_INIT;
+  } else if (OB_UNLIKELY(type_idx <= 0 || type_idx >= FT_DICT_TYPE_CNT
+                         || OB_ISNULL(cached_dicts_[type_idx]))) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    ObFTCachedRangeDict *entry = cached_dicts_[type_idx];
+    {
+      common::TCRLockGuard guard(dict_cache_lock_);
+      dict = entry->dict_;
+    }
+    if (OB_ISNULL(dict)) {
+      common::TCWLockGuard guard(dict_cache_lock_);
+      if (OB_ISNULL(entry->dict_)) {
+        if (OB_FAIL(build_cached_dict(desc, *entry))) {
+        } else {
+          dict = entry->dict_;
+        }
+      } else {
+        dict = entry->dict_;
+      }
+    }
+  }
+  return ret;
+}
+
+int ObFTDictHub::build_cached_dict(const ObFTDictDesc &desc, ObFTCachedRangeDict &entry)
+{
+  int ret = OB_SUCCESS;
+  ObFTCacheRangeContainer &container = entry.container_;
+  ObFTRangeDict *range_dict = nullptr;
+  char *name_buf = nullptr;
+
+  container.reset();
+  if (OB_FAIL(load_cache(desc, container))) {
+    if (OB_ENTRY_NOT_EXIST == ret) {
+      ret = OB_SUCCESS;
+      if (OB_FAIL(build_cache(desc, container))) {
+      }
+    }
+  }
+
+  if (OB_FAIL(ret)) {
+  } else if (desc.name_.length() > 0
+             && OB_ISNULL(name_buf = static_cast<char *>(entry.alloc_.alloc(desc.name_.length())))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else {
+    ObString name_copy;
+    if (desc.name_.length() > 0) {
+      MEMCPY(name_buf, desc.name_.ptr(), desc.name_.length());
+      name_copy.assign_ptr(name_buf, desc.name_.length());
+    }
+    ObFTDictDesc local_desc(name_copy, desc.type_, desc.charset_, desc.coll_type_);
+    if (OB_ISNULL(range_dict = OB_NEWx(ObFTRangeDict, &entry.alloc_,
+                                       entry.alloc_, &container, local_desc))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else if (OB_FAIL(range_dict->init())) {
+      range_dict->~ObFTRangeDict();
+      entry.alloc_.free(range_dict);
+      range_dict = nullptr;
+    } else {
+      entry.dict_ = range_dict;
+    }
+  }
+
+  if (OB_FAIL(ret)) {
+    container.reset();
+  }
+  return ret;
+}
 
 int ObFTDictHub::get_dict_info(const ObFTDictInfoKey &key, ObFTDictInfo &info)
 {
