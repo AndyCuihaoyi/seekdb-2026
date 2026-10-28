@@ -417,11 +417,19 @@ bool ObSortOpImpl::Compare::operator()(
     const ObDatum *lcells = l->cells();
     const ObDatum *rcells = r->cells();
     int cmp = 0;
+    // the two key descriptor arrays are contiguous and immutable while the sort runs:
+    // resolve them once per comparison instead of a bounds-checked at() per key
+    const ObSortFieldCollation *collations = nullptr;
+    const ObSortCmpFunc *cmp_funcs = nullptr;
+    if (cmp_end_ > cmp_start_) {
+      collations = &sort_collations_->at(cmp_start_);
+      cmp_funcs = &sort_cmp_funs_->at(cmp_start_);
+    }
     for (int64_t i = cmp_start_; 0 == cmp && i < cmp_end_ && OB_SUCC(ret); i++) {
-      const ObSortFieldCollation& sort_collation = sort_collations_->at(i);
+      const ObSortFieldCollation& sort_collation = collations[i - cmp_start_];
       const int64_t idx = sort_collation.field_idx_;
       if (OB_FAIL(
-              sort_cmp_funs_->at(i).cmp_func_(lcells[idx], rcells[idx], cmp, access_ctx_))) {
+              cmp_funcs[i - cmp_start_].cmp_func_(lcells[idx], rcells[idx], cmp, access_ctx_))) {
       } else if (cmp < 0) {
         less = sort_collation.is_ascending_;
       } else if (cmp > 0) {

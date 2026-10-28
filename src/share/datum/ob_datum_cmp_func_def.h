@@ -387,7 +387,33 @@ struct ObDatumStrCmp : public ObDefined<SupportedCollection<CS_TYPE>::defined_>
 {
   inline static int cmp(const ObDatum &l, const ObDatum &r, int &cmp_ret)
   {
-    return ObDatumStrCmpImpl::cmp(l, r, cmp_ret, CS_TYPE, WITH_END_SPACE);
+    int ret = OB_SUCCESS;
+    const ObCharsetInfo *cs_info = coll_info();
+    if (OB_ISNULL(cs_info) || OB_ISNULL(l.ptr_) || OB_ISNULL(r.ptr_)) {
+      // keep the validating entry point for the pathological cases it guards
+      ret = ObDatumStrCmpImpl::cmp(l, r, cmp_ret, CS_TYPE, WITH_END_SPACE);
+    } else if (l.len_ == r.len_
+               && (0 == l.len_ || 0 == MEMCMP(l.ptr_, r.ptr_, l.len_))) {
+      // byte-identical operands are equal in every collation, so the whole collation walk
+      // can be skipped; key-duplicate heavy sorts (index build orders by the word column)
+      // spend most of their comparisons here
+      cmp_ret = 0;
+    } else {
+      cmp_ret = cs_info->coll->strnncollsp(
+          cs_info, reinterpret_cast<const unsigned char *>(l.ptr_), l.len_,
+          reinterpret_cast<const unsigned char *>(r.ptr_), r.len_, WITH_END_SPACE);
+      cmp_ret = cmp_ret > 0 ? 1 : (cmp_ret < 0 ? -1 : 0);
+    }
+    return ret;
+  }
+
+private:
+  // ObCharset::strcmpsp() rediscovers the collation on every call through a switch over
+  // the collation type; these comparators run once per key per comparison
+  static const ObCharsetInfo *coll_info()
+  {
+    static const ObCharsetInfo *cs_info = ObCharset::get_charset(CS_TYPE);
+    return cs_info;
   }
 };
 
