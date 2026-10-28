@@ -19,6 +19,9 @@
 
 #include "lib/charset/ob_charset.h"
 #include "lib/lock/ob_bucket_lock.h"
+#include "lib/lock/ob_tc_rwlock.h"
+#include "lib/allocator/page_arena.h"
+#include "storage/fts/dict/ob_ft_cache_container.h"
 #include "storage/fts/dict/ob_ft_dict_def.h"
 
 namespace oceanbase
@@ -93,10 +96,44 @@ private:
 };
 
 class ObFTCacheRangeContainer;
+class ObIFTDict;
+
+// A range dict built once per built-in dict type and shared by all parsers. The dict
+// content is already pinned by the ObDictCache once built, so sharing the wrapper adds
+// no additional staleness: the same KV cache entries back every parser today.
+class ObFTCachedRangeDict final
+{
+public:
+  ObFTCachedRangeDict() : alloc_(lib::ObMemAttr("FTCachedDict")), container_(alloc_), dict_(nullptr) {}
+  ~ObFTCachedRangeDict() { reset(); }
+
+  void reset()
+  {
+    if (OB_NOT_NULL(dict_)) {
+      dict_->~ObIFTDict();
+      alloc_.free(dict_);
+      dict_ = nullptr;
+    }
+    container_.reset();
+    alloc_.reset();
+  }
+
+public:
+  common::ObArenaAllocator alloc_;
+  ObFTCacheRangeContainer container_;
+  ObIFTDict *dict_;
+  DISALLOW_COPY_AND_ASSIGN(ObFTCachedRangeDict);
+};
+
 class ObFTDictHub
 {
 public:
-  ObFTDictHub() : is_inited_(false), dict_map_(), rw_dict_lock_() {}
+  static constexpr int64_t FT_DICT_TYPE_CNT = static_cast<int64_t>(ObFTDictType::DICT_IK_STOP) + 1;
+
+  ObFTDictHub() : is_inited_(false), dict_map_(), rw_dict_lock_(), dict_cache_lock_()
+  {
+    MEMSET(cached_dicts_, 0, sizeof(cached_dicts_));
+  }
   ~ObFTDictHub() {}
 
   int init();
@@ -107,17 +144,24 @@ public:
 
   int load_cache(const ObFTDictDesc &desc, ObFTCacheRangeContainer &container);
 
+  // Returns the process-lifetime cached dict for desc.type_, loading/building it on first
+  // use. The returned dict is immutable after init and safe to share across threads.
+  int get_cached_dict(const ObFTDictDesc &desc, ObIFTDict *&dict);
+
 private:
   int get_dict_info(const ObFTDictInfoKey &key, ObFTDictInfo &info);
 
   int put_dict_info(const ObFTDictInfoKey &key, const ObFTDictInfo &info);
 
+  int build_cached_dict(const ObFTDictDesc &desc, ObFTCachedRangeDict &entry);
 
 private:
   bool is_inited_;
   // holds info of dict
   hash::ObHashMap<ObFTDictInfoKey, ObFTDictInfo> dict_map_;
   ObBucketLock rw_dict_lock_;
+  common::TCRWLock dict_cache_lock_;
+  ObFTCachedRangeDict *cached_dicts_[FT_DICT_TYPE_CNT];
 };
 
 } //  namespace storage
