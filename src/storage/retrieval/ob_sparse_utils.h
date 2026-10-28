@@ -37,6 +37,9 @@ struct ObSRDaaTRelevanceCollector
   virtual void reuse() = 0;
   virtual int collect_one_dim(const int64_t dim_idx, const double relevance) = 0;
   virtual int get_result(double &relevance, bool &is_valid) = 0;
+  // True when every merged doc (at least one dim holding the docid) is accepted regardless
+  // of the collected relevance, so the collector can be bypassed entirely.
+  virtual bool accepts_every_merged_doc() const { return false; }
 };
 
 struct ObSRDaaTInnerProductRelevanceCollector : ObSRDaaTRelevanceCollector
@@ -52,6 +55,8 @@ struct ObSRDaaTInnerProductRelevanceCollector : ObSRDaaTRelevanceCollector
   virtual void reuse() override;
   virtual int collect_one_dim(const int64_t dim_idx, const double) override;
   virtual int get_result(double &relevance, bool &is_valid) override;
+  // a merged doc always matches at least one dim, so matched_cnt >= should_match holds
+  virtual bool accepts_every_merged_doc() const override { return should_match_ <= 1; }
 private:
   double total_relevance_;
   int64_t matched_cnt_;

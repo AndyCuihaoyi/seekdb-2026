@@ -19,6 +19,7 @@
 
 #include "common/datum/ob_datum.h"
 #include "share/datum/ob_datum_funcs.h"
+#include <cstring>
 
 namespace oceanbase
 {
@@ -28,13 +29,16 @@ namespace storage
 class ObDomainIdCmp
 {
 public:
-  ObDomainIdCmp() : cmp_func_(nullptr) {}
+  ObDomainIdCmp() : cmp_func_(nullptr), is_binary_id_(false) {}
   ~ObDomainIdCmp() {}
   inline int init(const ObObjMeta &obj_meta);
   inline int compare(const ObDatum &lhs, const ObDatum &rhs, int &cmp_ret) const;
-  inline void reset() { cmp_func_ = nullptr; }
+  inline void reset() { cmp_func_ = nullptr; is_binary_id_ = false; }
 private:
   common::ObDatumCmpFuncType cmp_func_;
+  // binary collation domain ids can be compared with memcmp, same result as the
+  // charset-aware compare but without the charset lookup and argument validation
+  bool is_binary_id_;
   DISALLOW_COPY_AND_ASSIGN(ObDomainIdCmp);
 };
 
@@ -52,6 +56,10 @@ int ObDomainIdCmp::init(const ObObjMeta &obj_meta)
       STORAGE_LOG(WARN,"failed to get basic functions", K(ret), K(obj_meta));
     } else {
       cmp_func_ = id_basic_funcs->null_first_cmp_;
+      // numeric domain ids keep their value in the union bytes that ptr_ aliases, so a byte
+      // compare would both mis-order them and dereference the value as an address
+      is_binary_id_ = (common::CS_TYPE_BINARY == obj_meta.get_collation_type())
+          && common::ObDatumFuncs::is_string_type(obj_meta.get_type());
     }
   }
   return ret;
@@ -78,6 +86,14 @@ int ObDomainIdCmp::compare(const ObDatum &lhs, const ObDatum &rhs, int &cmp_ret)
     } else {
       ret = OB_ERR_UNEXPECTED;
     }
+  } else if (OB_LIKELY(is_binary_id_) && !lhs.is_null() && !rhs.is_null()) {
+    // bit-identical to strcmpsp(CS_TYPE_BINARY, ...): memcmp over the common prefix with a
+    // length-difference tiebreak, without the charset lookup and argument validation
+    const int64_t min_len = MIN(lhs.len_, rhs.len_);
+    const int memcmp_ret = min_len > 0 ? memcmp(lhs.ptr_, rhs.ptr_, min_len) : 0;
+    cmp_ret = memcmp_ret < 0 ? -1
+            : (memcmp_ret > 0 ? 1
+            : (lhs.len_ < rhs.len_ ? -1 : (lhs.len_ > rhs.len_ ? 1 : 0)));
   } else {
     ret = cmp_func_(lhs, rhs, cmp_ret, nullptr);
   }

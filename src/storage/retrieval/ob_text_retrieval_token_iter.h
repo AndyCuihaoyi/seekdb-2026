@@ -148,6 +148,9 @@ public:
 private:
   int save_relevances_and_docids();
   int save_docids();
+  // compare a target docid with the dim's current one: memcmp for binary-collation docids,
+  // the charset-aware datum cmp otherwise (same result, no charset lookup per call)
+  int compare_ids(const ObDatum &target, const ObDatum &curr, int &result) const;
   ObArenaAllocator *allocator_;
   ObTextRetrievalTokenIter *token_iter_;
   sql::ObEvalCtx *eval_ctx_;
@@ -158,7 +161,12 @@ private:
   int64_t count_;
   ObFixedArray<double, ObIAllocator> relevance_; // when ~ObFixedArray(), wikll destory itself
   ObFixedArray<ObDocIdExt, ObIAllocator> doc_id_;
+  // raw backing storage of doc_id_/relevance_, count fixed at init; keeps the bounds-checked
+  // array accessor out of the per-row merge and skip-ahead loops
+  ObDocIdExt *doc_id_vals_;
+  double *rel_vals_;
   common::ObDatumCmpFuncType cmp_func_;
+  bool is_binary_id_;
   bool skip_relevance_eval_;
   bool is_inited_;
   DISALLOW_COPY_AND_ASSIGN(ObTextRetrievalDaaTTokenIter);
