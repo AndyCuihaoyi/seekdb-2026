@@ -82,6 +82,7 @@ ObSRDaaTIterImpl::ObSRDaaTIterImpl()
     buffered_relevances_(),
     next_round_iter_idxes_(),
     next_round_cnt_(0),
+    filter_skip_(nullptr),
     set_datum_func_(nullptr)
 {
 }
@@ -123,6 +124,9 @@ int ObSRDaaTIterImpl::init(
     } else if (FALSE_IT(buffered_relevances_.set_allocator(iter_allocator_))) {
     } else if (OB_FAIL(buffered_relevances_.init(max_batch_size))) {
     } else if (OB_FAIL(buffered_relevances_.prepare_allocate(max_batch_size))) {
+    } else if (OB_ISNULL(filter_skip_ = sql::to_bit_vector(
+                            iter_allocator_->alloc(sql::ObBitVector::memory_size(max_batch_size))))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
     } else if (OB_FAIL(merge_cmp_.init(iter_param_->id_proj_expr_->datum_meta_, &iter_domain_ids_))) {
     } else if (OB_FAIL(init_merge_heap(dim_iters_->count()))) {
     } else {
@@ -155,6 +159,7 @@ void ObSRDaaTIterImpl::reset()
   buffered_domain_ids_.reset();
   buffered_relevances_.reset();
   next_round_iter_idxes_.reset();
+  filter_skip_ = nullptr;
   next_round_cnt_ = 0;
   input_row_cnt_ = 0;
   output_row_cnt_ = 0;
@@ -231,19 +236,65 @@ int ObSRDaaTIterImpl::get_next_rows(const int64_t capacity, int64_t &count)
     }
   } else {
     count = 0;
-    const int64_t real_capacity = MIN(capacity, iter_param_->max_batch_size_);
-    while (OB_SUCC(ret) && count < real_capacity) {
-      if (OB_FAIL(do_one_merge_round(count))) {
-        if (OB_UNLIKELY(OB_ITER_END != ret)) {
+    int64_t real_capacity = MIN(capacity, iter_param_->max_batch_size_);
+    // A filter can only be evaluated in batch under vectorized execution, and only when
+    // the filter itself produces per-row results; otherwise keep the original row-wise
+    // behavior.
+    const bool use_batch_filter = iter_param_->need_filter()
+                                  && iter_param_->eval_ctx_->is_vectorized()
+                                  && OB_NOT_NULL(iter_param_->filter_expr_)
+                                  && iter_param_->filter_expr_->is_batch_result();
+    if (use_batch_filter) {
+      // batch evaluation indexes the eval ctx datum vectors, which are sized by the ctx
+      real_capacity = MIN(real_capacity, iter_param_->eval_ctx_->max_batch_size_);
+    }
+    if (!use_batch_filter) {
+      while (OB_SUCC(ret) && count < real_capacity) {
+        if (OB_FAIL(do_one_merge_round(count))) {
+          if (OB_UNLIKELY(OB_ITER_END != ret)) {
+          }
         }
       }
-    }
 
-    if (OB_SUCC(ret) || OB_ITER_END == ret) {
-      if (count > 0 && OB_FAIL(project_results(count))) {
+      if (OB_SUCC(ret) || OB_ITER_END == ret) {
+        if (count > 0 && OB_FAIL(project_results(count))) {
+        }
+      }
+    } else {
+      bool iter_end = false;
+      // A raw batch can be fully filtered out, in which case no row is produced and the
+      // next raw batch must be merged before returning.
+      while (OB_SUCC(ret) && 0 == count && !iter_end) {
+        int64_t raw_count = 0;
+        while (OB_SUCC(ret) && !iter_end && raw_count < real_capacity) {
+          if (OB_FAIL(do_one_merge_round_raw(raw_count))) {
+            if (OB_UNLIKELY(OB_ITER_END != ret)) {
+            } else {
+              iter_end = true;
+              ret = OB_SUCCESS;
+            }
+          }
+        }
+
+        if (OB_SUCC(ret) && raw_count > 0) {
+          if (OB_FAIL(apply_batch_filter(raw_count, count))) {
+            if (OB_UNLIKELY(OB_ITER_END != ret)) {
+            } else {
+              iter_end = true;
+              ret = OB_SUCCESS;
+            }
+          }
+        } else if (OB_SUCC(ret)) {
+          iter_end = true;
+        }
+      }
+
+      if (OB_SUCC(ret) && count > 0 && OB_FAIL(project_results(count))) {
+      }
+      if (OB_SUCC(ret) && iter_end) {
+        ret = OB_ITER_END;
       }
     }
-
   }
   return ret;
 }
@@ -266,6 +317,89 @@ int ObSRDaaTIterImpl::do_one_merge_round(int64_t &count)
   } else if (need_project && OB_FAIL(filter_on_demand(count, relevance, need_project))) {
   } else if (need_project && OB_FAIL(cache_result(count, *id_datum, relevance))) {
     if (OB_ITER_END != ret) {
+    }
+  }
+  return ret;
+}
+
+int ObSRDaaTIterImpl::do_one_merge_round_raw(int64_t &count)
+{
+  int ret = OB_SUCCESS;
+  bool got_valid_id = false;
+  double relevance = 0.0;
+  const ObDatum *id_datum = nullptr;
+  if (OB_FAIL(fill_merge_heap())) {
+    if (OB_UNLIKELY(OB_ITER_END != ret)) {
+    }
+  } else if (OB_FAIL(collect_dims_by_id(id_datum, relevance, got_valid_id))) {
+  } else if (got_valid_id && OB_FAIL(buffer_raw_result(count, *id_datum, relevance))) {
+  }
+  return ret;
+}
+
+int ObSRDaaTIterImpl::buffer_raw_result(int64_t &count,
+                                        const ObDatum &id_datum,
+                                        const double relevance)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(count < 0 || count >= buffered_domain_ids_.count()
+                  || count >= buffered_relevances_.count())) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(buffered_domain_ids_[count].from_datum(id_datum))) {
+  } else {
+    buffered_relevances_[count] = relevance;
+    ++count;
+  }
+  return ret;
+}
+
+int ObSRDaaTIterImpl::apply_batch_filter(const int64_t raw_count, int64_t &count)
+{
+  int ret = OB_SUCCESS;
+  ObExpr *filter_expr = iter_param_->filter_expr_;
+  ObExpr *relevance_proj_expr = iter_param_->relevance_proj_expr_;
+  ObEvalCtx *eval_ctx = iter_param_->eval_ctx_;
+  const common::ObLimitParam *limit_param = iter_param_->limit_param_;
+  const int64_t limit = limit_param->limit_;
+  const int64_t offset = limit_param->offset_;
+  count = 0;
+  if (OB_NOT_NULL(filter_skip_)) {
+    filter_skip_->init(raw_count);
+  }
+  {
+    ObEvalCtx::BatchInfoScopeGuard guard(*eval_ctx);
+    for (int64_t i = 0; i < raw_count; ++i) {
+      guard.set_batch_idx(i);
+      ObDatum &relevance_proj_datum = relevance_proj_expr->locate_datum_for_write(*eval_ctx);
+      relevance_proj_datum.set_double(buffered_relevances_[i]);
+      relevance_proj_expr->get_evaluated_flags(*eval_ctx).set(i);
+      relevance_proj_expr->set_evaluated_projected(*eval_ctx);
+    }
+    guard.set_batch_idx(0);
+    filter_expr->get_evaluated_flags(*eval_ctx).reset(raw_count);
+    if (OB_FAIL(filter_expr->eval_batch(*eval_ctx, *filter_skip_, raw_count))) {
+    }
+  }
+
+  if (OB_SUCC(ret)) {
+    for (int64_t i = 0; OB_SUCC(ret) && i < raw_count; ++i) {
+      const ObDatum &filter_datum = filter_expr->locate_expr_datum(*eval_ctx, i);
+      if (filter_datum.is_null() || 0 == filter_datum.get_int()) {
+        continue;
+      }
+      ++input_row_cnt_;
+      if (limit_param->is_valid() && input_row_cnt_ <= offset) {
+        continue;
+      }
+      if (count != i) {
+        buffered_domain_ids_[count] = buffered_domain_ids_[i];
+        buffered_relevances_[count] = buffered_relevances_[i];
+      }
+      ++count;
+      ++output_row_cnt_;
+      if (limit_param->is_valid() && output_row_cnt_ >= limit) {
+        ret = OB_ITER_END;
+      }
     }
   }
   return ret;
