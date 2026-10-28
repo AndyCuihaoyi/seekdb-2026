@@ -19,6 +19,7 @@
 
 #include "ob_i_sparse_retrieval_iter.h"
 #include "ob_sparse_utils.h"
+#include "share/vector/ob_bit_vector.h"
 #include "storage/access/ob_scan_merge_loser_tree.h"
 #include "storage/access/ob_simple_rows_merger.h"
 
@@ -93,6 +94,11 @@ protected:
   virtual int cache_result(int64_t &count, const ObDatum &id_datum, const double relevance);
   virtual int project_results(const int64_t count);
   int init_merge_heap(const int64_t count);
+  // Batched filter path: merge rows without evaluating the filter per row, then evaluate
+  // the filter expression once for the whole batch and compact the surviving rows.
+  int do_one_merge_round_raw(int64_t &count);
+  int buffer_raw_result(int64_t &count, const ObDatum &id_datum, const double relevance);
+  int apply_batch_filter(const int64_t raw_count, int64_t &count);
 protected:
   ObIAllocator *iter_allocator_;
   ObSparseRetrievalMergeParam *iter_param_;
@@ -105,6 +111,7 @@ protected:
   ObFixedArray<double, ObIAllocator> buffered_relevances_;
   ObFixedArray<int64_t, ObIAllocator> next_round_iter_idxes_;
   int64_t next_round_cnt_;
+  sql::ObBitVector *filter_skip_;
   void (*set_datum_func_)(ObDatum &, const ObDocIdExt &);
 private:
   DISALLOW_COPY_AND_ASSIGN(ObSRDaaTIterImpl);
