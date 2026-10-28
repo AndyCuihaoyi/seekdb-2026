@@ -128,11 +128,13 @@ static int build_spec_json(ObIAllocator &allocator, const ObAIColumnMeta &meta,
     const char *func = meta.is_embed_ ? "AI_EMBED" : "AI_COMPLETE";
     const ObString func_str = ObString::make_string(func);
     if (OB_FAIL(ret)) {
-    } else if (pos + 12 > buf_len) {
+    } else if (pos + 11 > buf_len) {
       ret = OB_SIZE_OVERFLOW;
     } else {
-      MEMCPY(buf + pos, "{\"ai_func\":\"", 12);
-      pos += 12;
+      // write_escaped_json_string supplies the value's own quotes, so the key
+      // prefix must not end with an opening quote
+      MEMCPY(buf + pos, "{\"ai_func\":", 11);
+      pos += 11;
       if (OB_FAIL(write_escaped_json_string(buf, buf_len, pos, func_str))) {
       } else if (pos + 9 > buf_len) {
         ret = OB_SIZE_OVERFLOW;

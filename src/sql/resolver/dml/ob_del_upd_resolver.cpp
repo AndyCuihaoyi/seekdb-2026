@@ -752,6 +752,12 @@ int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment>
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("fail to get table schema", KPC(table_item), K(table_schema));
     } else if (OB_FAIL(table_schema->has_before_update_row_trigger(*schema_guard, trigger_exist))) {
+    } else if (T_UPDATE_SCOPE == scope
+               && OB_FAIL(invalidate_ai_columns(assigns, table_item, table_schema))) {
+      // run before the vector-index check: the implicit "ai_col = NULL"
+      // assignment must be visible to it, otherwise an invalidated vector
+      // column is reset physically but never deleted from the HNSW index
+      LOG_WARN("invalidate ai columns failed", K(ret));
     } else if (OB_FAIL(generate_wrapper_expr_for_assignemnts(assigns.at(i).assignments_, trigger_exist))) {
     } else if (OB_FAIL(check_update_vector_col_with_vector_index(table_schema,
                                                                  schema_guard,
@@ -856,9 +862,6 @@ int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment>
     } else if (OB_SUCC(ret)) {
       // for UPDATE
       if (OB_FAIL(check_heap_table_update(assigns.at(i)))) {
-      } else if (T_UPDATE_SCOPE == scope
-                 && OB_FAIL(invalidate_ai_columns(assigns, table_item, table_schema))) {
-        LOG_WARN("invalidate ai columns failed", K(ret));
       }
     }
   }
