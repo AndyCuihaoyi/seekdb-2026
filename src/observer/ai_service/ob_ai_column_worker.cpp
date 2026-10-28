@@ -211,7 +211,11 @@ static int obj_to_content(ObIAllocator &allocator, const ObObj &obj,
   is_null = obj.is_null();
   if (!is_null) {
     if (obj.is_string_type() || obj.is_lob_storage()) {
-      content = obj.get_string();
+      // the ObObj string points into the result buffer, which is freed once the
+      // read result dies; the content outlives it, so copy it into our allocator
+      if (OB_FAIL(deep_copy_str(allocator, obj.get_string(), content))) {
+        LOG_WARN("copy content failed", K(ret));
+      }
     } else {
       char buf[512] = {0};
       const int64_t pos = obj.to_string(buf, sizeof(buf));
