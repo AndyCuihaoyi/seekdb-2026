@@ -108,6 +108,11 @@ protected:
   // collect all dims holding it (ascending iter_idx, same float-sum order as the heap path)
   int fast_fill_dims();
   int fast_collect_dims(const ObDatum *&id_datum, double &relevance, bool &got_valid_id);
+  int fast_pick_min(const ObDatum *&id_datum, bool &got_valid_id);
+  // direct-to-output merge: writes the projected datums straight from the merge loop,
+  // no intermediate buffer, no filter (keep-all) and no collector when merge_emit_all_
+  int do_one_merge_round_emit(int64_t &count, ObDatum *id_datums, ObDatum *rel_datums);
+  int emit_row(int64_t &count, const ObDatum &id_datum, ObDatum *id_datums, ObDatum *rel_datums);
 protected:
   ObIAllocator *iter_allocator_;
   ObSparseRetrievalMergeParam *iter_param_;
@@ -126,6 +131,13 @@ protected:
   ObFixedArray<ObDocIdExt, ObIAllocator> buffered_domain_ids_; // cache for output
   ObFixedArray<double, ObIAllocator> buffered_relevances_;
   ObFixedArray<int64_t, ObIAllocator> next_round_iter_idxes_;
+  // raw backing storage of the three arrays above, fixed count at init; avoids the
+  // bounds-checked virtual element access in the per-row merge loops
+  ObDocIdExt *buffered_ids_;
+  double *buffered_rels_;
+  int64_t *next_round_idx_;
+  // per-dim weights copied at init; nullptr when the caller supplies none
+  double *dim_weight_vals_;
   int64_t next_round_cnt_;
   sql::ObBitVector *filter_skip_;
   void (*set_datum_func_)(ObDatum &, const ObDocIdExt &);
@@ -134,6 +146,10 @@ protected:
   bool use_fast_merge_;
   // BOOL(relevance) filter with relevance skipped by optimizer: always true
   bool relevance_keep_all_;
+  // keep-all and the collector accepts every merged doc: skip the collector per doc
+  bool merge_emit_all_;
+  // relevance is not computed at all: never fetch the per-dim posting score
+  bool skip_dim_score_;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObSRDaaTIterImpl);
 };
