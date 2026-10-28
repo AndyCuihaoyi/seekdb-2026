@@ -38,7 +38,8 @@ public:
   ObFTRangeDict(ObIAllocator &alloc,
                 ObFTCacheRangeContainer *range_container,
                 const ObFTDictDesc &desc)
-      : is_inited_(false), desc_(desc), range_alloc_(lib::ObMemAttr("Range Dict")),
+      : is_inited_(false), has_char_codes_(false), desc_(desc),
+        range_alloc_(lib::ObMemAttr("Range Dict")),
         range_dicts_(&range_alloc_), range_container_(range_container)
   {
   }
@@ -50,6 +51,9 @@ public:
     ObFTSingleWord start_;
     ObFTSingleWord end_;
     ObIFTDict *dict_; // a cache dict
+    // codepoints of start_/end_, valid only when has_char_codes_ is true
+    uint32_t start_code_;
+    uint32_t end_code_;
   };
 
 public:
@@ -102,6 +106,9 @@ private:
 private:
   static constexpr int DEFAULT_KEY_PER_RANGE = 50000; // by estimated
   bool is_inited_;
+  // true when every range start_/end_ is a canonical single UTF-8 character, so range
+  // resolution can compare codepoints instead of binary-comparing strings
+  bool has_char_codes_;
   ObFTDictDesc desc_;
   ObArenaAllocator range_alloc_;
   ObVector<ObFTRange, ObArenaAllocator> range_dicts_;
