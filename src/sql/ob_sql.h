@@ -518,6 +518,7 @@ private:
                      ObSQLSessionInfo &session,
                      ObPhysicalPlan *plan,
                      bool from_plan_cache);
+  int check_ai_column_strict_read(ObSQLSessionInfo &session, ObPhysicalPlan &phy_plan);
   int need_add_plan(const ObPlanCacheCtx &ctx,
                     ObResultSet &result,
                     bool is_enable_pc,

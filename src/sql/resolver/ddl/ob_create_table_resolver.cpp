@@ -15,6 +15,7 @@
  */
 
 #define USING_LOG_PREFIX SQL_RESV
+#include "sql/resolver/ddl/ob_ai_column_resolver.h"
 #include "sql/resolver/ddl/ob_create_table_resolver.h"
 #include "sql/resolver/dml/ob_select_resolver.h"
 #include "sql/resolver/ddl/ob_fts_index_builder_util.h"
@@ -672,6 +673,8 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
     int64_t resolved_cols_count = resolved_cols.count();
     // Second pass traversal, use resolved_cols to parse out all column schema and save to table_schema
     // And parse index etc
+    reset_ai_column_state();
+    set_ai_declared_cols(&resolved_cols);
     for (int32_t i = 0, ele_pos = 0; OB_SUCC(ret) && i < node->num_child_; ++i) {
       ParseNode *element = node->children_[i];
       CK (OB_NOT_NULL(element));
@@ -881,6 +884,18 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
         // won't be here
         ret = OB_ERR_UNEXPECTED;
         SQL_RESV_LOG(WARN, "unexpected branch", K(ret));
+      }
+    }
+
+    if (OB_SUCC(ret)) {
+      const common::ObIArray<ObAIColumnMeta> &ai_metas = get_ai_column_metas();
+      for (int64_t i = 0; OB_SUCC(ret) && i < ai_metas.count(); ++i) {
+        const ObAIColumnMeta &meta = ai_metas.at(i);
+        if (OB_FAIL(build_ai_hidden_columns(*allocator_, meta,
+                                            gen_column_id(), gen_column_id(), gen_column_id(),
+                                            resolved_cols))) {
+          SQL_RESV_LOG(WARN, "build ai hidden columns failed", K(ret));
+        }
       }
     }
 

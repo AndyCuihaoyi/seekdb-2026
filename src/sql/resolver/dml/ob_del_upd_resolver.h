@@ -213,6 +213,13 @@ protected:
                                                 ObSchemaGetterGuard *schema_guard,
                                                 const common::ObIArray<ObAssignment> &assigns,
                                                 bool &update_with_vector_index);
+  int invalidate_ai_columns(common::ObIArray<ObTableAssignment> &assigns,
+                            const TableItem *table_item,
+                            const share::schema::ObTableSchema *table_schema);
+  int add_ai_invalidate_assignment(common::ObIArray<ObTableAssignment> &assigns,
+                                   const TableItem *table_item,
+                                   const share::schema::ObColumnSchemaV2 &column,
+                                   ObRawExpr *value_expr);
 protected:
   int generate_insert_table_info(const TableItem &table_item,
                                  ObInsertTableInfo &table_info,

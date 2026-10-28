@@ -67,6 +67,7 @@
 #include "observer/ob_srv_network_frame.h"
 #include "observer/ob_service.h"
 #include "observer/ob_server_reload_config.h"
+#include "observer/ai_service/ob_ai_column_worker.h"
 #include "storage/slog_ckpt/ob_startup_accel_task_handler.h"
 #include "storage/ddl/ob_ddl_heart_beat_task.h"
 
@@ -383,6 +384,7 @@ private:
   int refresh_cpu_frequency();
   int clean_up_invalid_tables();
   int init_ctas_clean_up_task(); //Regularly clean up the residuals related to querying and building tables and temporary tables
+  int init_ai_column_worker(); //Regularly scan AI column hidden state and drive background AI calls
   int init_redef_heart_beat_task();
   int init_ddl_heart_beat_task_container();
   int init_refresh_cpu_frequency();
@@ -483,9 +485,11 @@ private:
   common::ObTimer server_gtimer_;
   common::ObTimer sql_mem_timer_;
   common::ObTimer ctas_clean_up_timer_;
+  common::ObTimer ai_column_worker_timer_;
   ObServerDutyTask duty_task_;
   ObSqlMemoryTimerTask sql_mem_task_;
   ObCTASCleanUpTask ctas_clean_up_task_;     // repeat & no retry
+  ObAIColumnWorker ai_column_worker_;        // repeat & no retry
   ObRedefTableHeartBeatTask redef_table_heart_beat_task_;
   ObRefreshCpuFreqTimeTask refresh_cpu_frequency_task_;
   blocksstable::ObStorageEnv storage_env_;

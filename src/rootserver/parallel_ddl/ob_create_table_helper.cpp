@@ -26,6 +26,7 @@
 #include "query/vector/ob_vector_index_util.h"
 #include "sql/resolver/ob_resolver_utils.h"
 #include "sql/resolver/ddl/ob_fts_index_builder_util.h"
+#include "share/ai_service/ob_ai_column_meta_writer.h"
 
 using namespace oceanbase::lib;
 using namespace oceanbase::common;
@@ -878,6 +879,12 @@ int ObCreateTableHelper::clean_on_fail_commit_()
 int ObCreateTableHelper::operation_before_commit_() {
   int ret = OB_SUCCESS;
   if (OB_FAIL(check_inner_stat_())) {
+  } else if (new_tables_.count() > 0) {
+    int64_t affected_rows = 0;
+    if (OB_FAIL(share::ObAIColumnMetaWriter::write_meta_rows(
+            get_trans_(), new_tables_.at(0).get_table_id(), arg_.schema_, affected_rows))) {
+      LOG_WARN("write ai column meta rows failed", K(ret), K(affected_rows));
+    }
   }
   return ret;
 }

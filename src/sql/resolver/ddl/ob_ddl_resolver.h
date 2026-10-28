@@ -24,6 +24,7 @@
 #include "share/ob_rpc_struct.h"
 #include "share/schema/ob_schema_struct.h"
 #include "common/sql_mode/ob_sql_mode.h"
+#include "sql/resolver/ddl/ob_ai_column_resolver.h"
 #include "sql/resolver/ddl/ob_table_stmt.h"
 #include "sql/resolver/ddl/ob_alter_table_stmt.h"
 #include "sql/resolver/ddl/ob_create_index_stmt.h"
@@ -558,6 +559,19 @@ protected:
   int resolve_lob_chunk_size(const ParseNode &size_node, int64_t &lob_chunk_size);
   int resolve_lob_chunk_size(share::schema::ObColumnSchemaV2 &column, const ParseNode &lob_chunk_size_node);
   int resolve_semistruct_encoding_type(const ParseNode *option_node, const bool is_index_option);
+
+  // AI COLUMN members and helpers. ai_declared_cols_ points at the column list used
+  // for dependency validation and is set by the create/alter table resolvers.
+  const common::ObIArray<common::ObString> &get_ai_column_names() const { return ai_column_names_; }
+  common::ObSEArray<common::ObString, 1> &get_ai_column_names_for_append() { return ai_column_names_; }
+  const common::ObIArray<ObAIColumnMeta> &get_ai_column_metas() const { return ai_column_metas_; }
+  void set_ai_declared_cols(const common::ObIArray<share::schema::ObColumnSchemaV2> *cols)
+  { ai_declared_cols_ = cols; }
+  void reset_ai_column_state()
+  { ai_declared_cols_ = NULL; ai_column_names_.reset(); ai_column_metas_.reset(); ai_declared_cols_store_.reset(); }
+  const common::ObIArray<share::schema::ObColumnSchemaV2> *get_ai_declared_cols() const
+  { return ai_declared_cols_; }
+  int fill_ai_declared_cols(const share::schema::ObTableSchema &table_schema);
   /*
   int resolve_generated_column_definition(
       share::schema::ObColumnSchemaV2 &column,
@@ -881,6 +895,10 @@ protected:
   common::ObString vec_column_name_;
   ObIndexType vec_index_type_;
   ObSemiStructEncodingType semistruct_encoding_type_;
+  const common::ObIArray<share::schema::ObColumnSchemaV2> *ai_declared_cols_;
+  common::ObSEArray<common::ObString, 1> ai_column_names_;
+  common::ObSEArray<ObAIColumnMeta, 1> ai_column_metas_;
+  common::ObSEArray<share::schema::ObColumnSchemaV2, 16> ai_declared_cols_store_;
 private:
   template <typename STMT>
   DISALLOW_COPY_AND_ASSIGN(ObDDLResolver);

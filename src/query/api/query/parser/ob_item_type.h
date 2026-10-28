@@ -2276,6 +2276,10 @@ typedef enum ObItemType
   T_MERGE_TABLE = 4919,
   T_FLUSH_PRIVILEGES = 4920,
   T_FILE_TABLE_EXPRESSION = 4921, // file-as-table functions: read_csv/read_json/read_ndjson/read_parquet/glob
+  T_AI_COLUMN_ATTR = 4922,        // AI COLUMN ( expr ) WITH ( options ) column attribute
+  T_AI_COLUMN_OPTION = 4923,      // single key = value AI column option
+  T_AI_COLUMN_OPTION_LIST = 4924, // list of AI column options
+  T_ALTER_AI_COLUMN_RETRY = 4925, // ALTER TABLE ... RETRY AI COLUMN col [WHERE expr]
   T_MAX //Attention: add a new type before T_MAX
 } ObItemType;
 

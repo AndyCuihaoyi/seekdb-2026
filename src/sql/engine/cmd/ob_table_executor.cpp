@@ -24,6 +24,7 @@
 #include "query/command/ob_root_service_serialization.h"
 #include "query/runtime/ob_query_runtime_environment.h"
 #include "query/session/ob_inner_sql_connection_access.h"
+#include "query/session/ob_session_inner_sql.h"
 #include "sql/engine/expr/ob_expr_regexp_context.h"  // ObExprRegexpSessionVariables (unity regroup)
 #include "sql/engine/cmd/ob_index_executor.h"
 #include "sql/engine/cmd/ob_ddl_executor_util.h"
@@ -751,6 +752,55 @@ int ObAlterTableExecutor::alter_table_exchange_partition_rpc(obcall::ObExchangeP
   return ret;
 }
 
+int ObAlterTableExecutor::execute_ai_column_retry(ObExecContext &ctx, ObAlterTableStmt &stmt)
+{
+  int ret = OB_SUCCESS;
+  ObSQLSessionInfo *my_session = ctx.get_my_session();
+  ObSqlString sql;
+  int64_t affected_rows = 0;
+  const ObString &column = stmt.get_ai_retry_column();
+  const ObString &db_name = stmt.get_ai_retry_db();
+  const ObString &table_name = stmt.get_ai_retry_table();
+  const ObString &pred = stmt.get_ai_retry_pred();
+  if (OB_ISNULL(my_session)) {
+    ret = OB_ERR_UNEXPECTED;
+    SQL_EXE_LOG(WARN, "no session for ai column retry", K(ret));
+  } else if (OB_FAIL(sql.assign_fmt(
+      "UPDATE /*+OPT_PARAM('hidden_column_visible','true')*/ `%.*s`.`%.*s` SET"
+      " `%.*s` = NULL, `__ai_state_%.*s` = 'PENDING', `__ai_request_%.*s` = NULL",
+      static_cast<int32_t>(db_name.length()), db_name.ptr(),
+      static_cast<int32_t>(table_name.length()), table_name.ptr(),
+      static_cast<int32_t>(column.length()), column.ptr(),
+      static_cast<int32_t>(column.length()), column.ptr(),
+      static_cast<int32_t>(column.length()), column.ptr()))) {
+    SQL_EXE_LOG(WARN, "build ai column retry sql failed", K(ret));
+  } else if (!pred.empty()
+             && OB_FAIL(sql.append_fmt(" WHERE %.*s",
+                  static_cast<int32_t>(pred.length()), pred.ptr()))) {
+    SQL_EXE_LOG(WARN, "append ai column retry pred failed", K(ret));
+  } else {
+    query::ObSessionInnerSql inner_sql(static_cast<void *>(my_session));
+    // the AI state/request columns are schema-hidden; resolve them through the
+    // inner-session path like the background worker does
+    const bool was_inner = my_session->is_inner();
+    if (!was_inner) {
+      my_session->set_inner_session();
+    }
+    int tmp_ret = OB_SUCCESS;
+    tmp_ret = inner_sql.execute_write(sql, affected_rows);
+    if (!was_inner) {
+      my_session->set_user_session();
+    }
+    if (OB_SUCCESS != tmp_ret) {
+      ret = tmp_ret;
+      SQL_EXE_LOG(WARN, "execute ai column retry failed", K(ret), K(sql));
+    } else {
+      SQL_EXE_LOG(INFO, "ai column retry executed", K(affected_rows), K(sql));
+    }
+  }
+  return ret;
+}
+
 int ObAlterTableExecutor::execute(ObExecContext &ctx, ObAlterTableStmt &stmt)
 {
   int ret = OB_SUCCESS;
@@ -762,6 +812,8 @@ int ObAlterTableExecutor::execute(ObExecContext &ctx, ObAlterTableStmt &stmt)
   OV (OB_NOT_NULL(task_exec_ctx = GET_SQL_EXECUTOR_CTX(ctx)), OB_NOT_INIT);
   if (OB_FAIL(ret)) {
     // do nothing
+  } else if (stmt.has_ai_column_retry()) {
+    OZ (execute_ai_column_retry(ctx, stmt));
   } else if (stmt.is_alter_triggers()) {
     if (stmt.get_tg_arg().trigger_infos_.count() > 0) {
       stmt.get_tg_arg().ddl_stmt_str_ = first_stmt;

@@ -32,6 +32,7 @@
 #include "storage/blocksstable/index_block/ob_index_block_util.h"
 #include "sql/resolver/ddl/ob_index_builder_util.h"
 #include "sql/resolver/ddl/ob_fts_index_builder_util.h"
+#include "share/ai_service/ob_ai_column_meta_writer.h"
 #include "sql/resolver/expr/ob_raw_expr_util.h"
 #include "sql/session/ob_local_session_var.h"
 #include "sql/engine/cmd/ob_partition_executor_utils.h"
@@ -10429,6 +10430,7 @@ int ObDDLService::alter_table_in_trans(obcall::ObAlterTableArg &alter_table_arg,
                                     timeout_us))) {
       } else {
         ObArray<ObTableSchema> global_idx_schema_array;
+        int64_t ai_column_affected_rows = 0;
         //table columns
         if (OB_SUCC(ret) && alter_table_arg.is_alter_columns_) {
           if (OB_FAIL(check_can_alter_column(alter_table_schema,
@@ -10441,6 +10443,10 @@ int ObDDLService::alter_table_in_trans(obcall::ObAlterTableArg &alter_table_arg,
                                                 ddl_operator,
                                                 trans,
                                                 &global_idx_schema_array))) {
+          } else if (OB_FAIL(share::ObAIColumnMetaWriter::write_meta_rows(trans,
+                                                                          new_table_schema.get_table_id(),
+                                                                          new_table_schema,
+                                                                          ai_column_affected_rows))) {
           }
         }
         //table options
@@ -17089,6 +17095,13 @@ int ObDDLService::drop_table_in_trans(
       }
     }
     // deal with mock_fk_parent_table_schema in drop_table end
+    if (OB_SUCC(ret) && table_schema.is_user_table() && !table_schema.is_index_table()) {
+      int64_t ai_meta_affected_rows = 0;
+      if (OB_FAIL(share::ObAIColumnMetaWriter::delete_meta_rows(trans,
+                                                                table_schema.get_table_id(),
+                                                                ai_meta_affected_rows))) {
+      }
+    }
     if (OB_ISNULL(sql_trans) && trans.is_started()) {
       int temp_ret = OB_SUCCESS;
       if (OB_SUCCESS != (temp_ret = trans.end(OB_SUCC(ret)))) {

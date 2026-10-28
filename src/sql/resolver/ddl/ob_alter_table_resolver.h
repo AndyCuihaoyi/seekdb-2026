@@ -62,6 +62,7 @@ public:
   int resolve_index_options(const ParseNode &action_node_list, const ParseNode &node,
                             bool &is_add_index);
   int resolve_partition_options(const ParseNode &node);
+  int resolve_ai_column_retry(const ParseNode &action_node, const ParseNode &all_actions);
   int resolve_constraint_options(const ParseNode &node, const bool is_multi_actions);
   int resolve_modify_check_constraint_state_mysql(const ParseNode* node);
   int resolve_convert_to_character(const ParseNode &node);

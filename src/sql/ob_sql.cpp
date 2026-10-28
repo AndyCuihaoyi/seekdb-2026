@@ -38,6 +38,8 @@
 #include "sql/monitor/show_trace/ob_show_trace.h"
 #include "sql/optimizer/ob_optimizer.h"
 #include "share/rc/ob_server_runtime.h"
+#include "lib/string/ob_sql_string.h"
+#include "common/mysqlclient/ob_mysql_proxy.h"
 
 namespace oceanbase
 {
@@ -2306,6 +2308,94 @@ int ObSql::generate_physical_plan(ParseResult &parse_result,
   return ret;
 }
 
+static int collect_ai_strict_cols_recursively(ObDMLStmt &stmt,
+                                              share::schema::ObSchemaGetterGuard &schema_guard,
+                                              common::ObIArray<ObAIStrictColRef> &strict_cols)
+{
+  int ret = OB_SUCCESS;
+  ObSEArray<ObColumnRefRawExpr *, 64> col_exprs;
+  ObSEArray<ObSelectStmt *, 4> child_stmts;
+  if (OB_FAIL(stmt.get_column_exprs(col_exprs))) {
+    LOG_WARN("get column exprs failed", K(ret));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < col_exprs.count(); ++i) {
+    const ObColumnRefRawExpr *col = col_exprs.at(i);
+    const TableItem *table_item = NULL;
+    if (OB_ISNULL(col) || NULL == (table_item = stmt.get_table_item_by_id(col->get_table_id()))) {
+      // skip
+    } else {
+      const TableItem &base_item = table_item->get_base_table_item();
+      bool dup = false;
+      for (int64_t j = 0; !dup && j < strict_cols.count(); ++j) {
+        dup = (strict_cols.at(j).table_id_ == base_item.ref_id_
+               && strict_cols.at(j).column_id_ == col->get_column_id());
+      }
+      if (dup) {
+        // already collected
+      } else {
+        const share::schema::ObTableSchema *table_schema = NULL;
+        char state_col_name[OB_MAX_COLUMN_NAME_LENGTH + sizeof("__ai_state_")] = {0};
+        int64_t pos = 0;
+        const ObString &col_name = col->get_column_name();
+        if (OB_FAIL(schema_guard.get_table_schema(base_item.ref_id_, table_schema))) {
+          LOG_WARN("get table schema failed", K(ret), K(base_item.ref_id_));
+        } else if (OB_ISNULL(table_schema)
+                   || !table_schema->is_user_table()
+                   || table_schema->is_in_recyclebin()) {
+          // skip non-user table
+        } else if (OB_FAIL(databuff_printf(state_col_name, sizeof(state_col_name), pos,
+                                           "__ai_state_%.*s", col_name.length(), col_name.ptr()))) {
+          LOG_WARN("build ai state column name failed", K(ret), K(col_name));
+        } else if (NULL == table_schema->get_column_schema(
+                     ObString(static_cast<int32_t>(pos), state_col_name))) {
+          // not an AI column
+        } else {
+          ObAIStrictColRef strict_col;
+          strict_col.table_id_ = base_item.ref_id_;
+          strict_col.column_id_ = col->get_column_id();
+          strict_col.column_name_ = col_name;
+          const share::schema::ObColumnSchemaV2 *base_col_schema =
+              table_schema->get_column_schema(col_name);
+          if (NULL != base_col_schema) {
+            strict_col.column_id_ = base_col_schema->get_column_id();
+          }
+          if (OB_FAIL(strict_cols.push_back(strict_col))) {
+            LOG_WARN("push ai strict col failed", K(ret));
+          }
+        }
+      }
+    }
+  }
+  if (OB_SUCC(ret) && OB_FAIL(stmt.get_child_stmts(child_stmts))) {
+    LOG_WARN("get child stmts failed", K(ret));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < child_stmts.count(); ++i) {
+    if (OB_NOT_NULL(child_stmts.at(i))
+        && OB_FAIL(collect_ai_strict_cols_recursively(*child_stmts.at(i), schema_guard, strict_cols))) {
+      LOG_WARN("collect ai strict cols from child stmt failed", K(ret));
+    }
+  }
+  return ret;
+}
+
+static int collect_ai_strict_cols(ObDMLStmt &stmt,
+                                  share::schema::ObSchemaGetterGuard &schema_guard,
+                                  ObPhysicalPlan &phy_plan)
+{
+  int ret = OB_SUCCESS;
+  if (!(stmt.is_select_stmt() || stmt.is_update_stmt() || stmt.is_delete_stmt())) {
+    // strict read check only applies to SELECT/UPDATE/DELETE
+  } else {
+    ObSEArray<ObAIStrictColRef, 4> strict_cols;
+    if (OB_FAIL(collect_ai_strict_cols_recursively(stmt, schema_guard, strict_cols))) {
+      LOG_WARN("collect ai strict cols failed", K(ret));
+    } else if (strict_cols.count() > 0 && OB_FAIL(phy_plan.set_ai_strict_cols(strict_cols))) {
+      LOG_WARN("set ai strict cols failed", K(ret));
+    }
+  }
+  return ret;
+}
+
 int ObSql::generate_plan(ParseResult &parse_result,
                         ObPlanCacheCtx *pc_ctx,
                         ObSqlCtx &sql_ctx,
@@ -2376,6 +2466,17 @@ int ObSql::generate_plan(ParseResult &parse_result,
         pctx->set_cur_time(ObTimeUtility::current_time(), *(sql_ctx.session_info_));
       }
       pctx->set_last_trace_id(sql_ctx.session_info_->get_last_trace_id());
+    }
+    if (OB_SUCC(ret)) {
+      int tmp_ret = OB_SUCCESS;
+      share::schema::ObSchemaGetterGuard schema_guard;
+      if (OB_ISNULL(GCTX.schema_service_)) {
+        // schema service not ready, skip strict read collection
+      } else if (OB_SUCCESS != (tmp_ret = GCTX.schema_service_->get_runtime_schema_guard(schema_guard))) {
+        LOG_WARN("get runtime schema guard failed", K(tmp_ret));
+      } else if (OB_SUCCESS != (tmp_ret = collect_ai_strict_cols(*stmt, schema_guard, *phy_plan))) {
+        LOG_WARN("collect ai strict cols failed", K(tmp_ret));
+      }
     }
 
     ObSQLSessionInfo *session_info = result.get_exec_context().get_my_session();
@@ -3491,6 +3592,13 @@ int ObSql::after_get_plan(ObPlanCacheCtx &pc_ctx,
       pctx->set_last_insert_id_session(session.get_local_last_insert_id());
     }
 
+    if (OB_SUCC(ret) && NULL != phy_plan && !phy_plan->is_inner_sql()
+        && phy_plan->has_ai_strict_cols()) {
+      if (OB_FAIL(check_ai_column_strict_read(session, *phy_plan))) {
+        LOG_WARN("check ai column strict read failed", K(ret));
+      }
+    }
+
     if (OB_SUCC(ret) && NULL != phy_plan) {
       if (from_plan_cache) {
         ObPhyPlanHint &phy_plan_hint = phy_plan->get_phy_plan_hint();
@@ -3511,6 +3619,82 @@ int ObSql::after_get_plan(ObPlanCacheCtx &pc_ctx,
     // not phy_plan, ignore
   }
 
+  return ret;
+}
+
+int ObSql::check_ai_column_strict_read(ObSQLSessionInfo &session, ObPhysicalPlan &phy_plan)
+{
+  int ret = OB_SUCCESS;
+  const common::ObIArray<ObAIStrictColRef> &strict_cols = phy_plan.get_ai_strict_cols();
+  if (strict_cols.empty()) {
+    // nothing to check
+  } else {
+    bool strict_read = false;
+    if (OB_FAIL(session.get_sys_variable(share::SYS_VAR_AI_COLUMN_STRICT_READ, strict_read))) {
+      LOG_WARN("get sys variable ai_column_strict_read failed", K(ret));
+    }
+    if (OB_SUCC(ret) && strict_read) {
+      share::schema::ObSchemaGetterGuard schema_guard;
+      if (OB_ISNULL(GCTX.schema_service_) || OB_ISNULL(GCTX.sql_proxy_)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("schema service or sql proxy is null", K(ret));
+      } else if (OB_FAIL(GCTX.schema_service_->get_runtime_schema_guard(schema_guard))) {
+        LOG_WARN("get runtime schema guard failed", K(ret));
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < strict_cols.count(); ++i) {
+        const ObAIStrictColRef &strict_col = strict_cols.at(i);
+        const share::schema::ObTableSchema *table_schema = NULL;
+        const share::schema::ObDatabaseSchema *db_schema = NULL;
+        if (OB_FAIL(schema_guard.get_table_schema(strict_col.table_id_, table_schema))) {
+          LOG_WARN("get table schema failed", K(ret), K(strict_col.table_id_));
+        } else if (OB_ISNULL(table_schema)
+                   || table_schema->is_in_recyclebin()
+                   || !table_schema->is_user_table()) {
+          // table dropped, skip
+        } else if (OB_FAIL(schema_guard.get_database_schema(table_schema->get_database_id(), db_schema))) {
+          LOG_WARN("get database schema failed", K(ret), K(table_schema->get_database_id()));
+        } else if (OB_ISNULL(db_schema)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("database schema is null", K(ret));
+        } else {
+          char state_col_name[OB_MAX_COLUMN_NAME_LENGTH + sizeof("__ai_state_")] = {0};
+          int64_t name_pos = 0;
+          ObSqlString sql;
+          common::ObMySQLProxy::MySQLResult sql_res;
+          if (OB_FAIL(databuff_printf(state_col_name, sizeof(state_col_name), name_pos,
+                                      "__ai_state_%.*s",
+                                      strict_col.column_name_.length(),
+                                      strict_col.column_name_.ptr()))) {
+            LOG_WARN("build ai state column name failed", K(ret), K(strict_col));
+          } else if (OB_FAIL(sql.assign_fmt("SELECT /*+OPT_PARAM('hidden_column_visible','true')*/ 1"
+                                            " FROM `%.*s`.`%.*s` WHERE `%.*s` != 'READY' LIMIT 1",
+                                            db_schema->get_database_name_str().length(),
+                                            db_schema->get_database_name_str().ptr(),
+                                            table_schema->get_table_name_str().length(),
+                                            table_schema->get_table_name_str().ptr(),
+                                            static_cast<int>(name_pos), state_col_name))) {
+            LOG_WARN("build ai column check sql failed", K(ret), K(strict_col));
+          } else if (OB_FAIL(GCTX.sql_proxy_->read(sql_res, sql.ptr()))) {
+            LOG_WARN("check ai column task state failed", K(ret), K(sql));
+          } else if (OB_ISNULL(sql_res.get_result())) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("get result failed", K(ret));
+          } else {
+            int tmp_ret = sql_res.get_result()->next();
+            if (OB_SUCCESS == tmp_ret) {
+              ret = OB_ERR_AI_COLUMN_TASKS_UNFINISHED;
+              LOG_USER_ERROR(OB_ERR_AI_COLUMN_TASKS_UNFINISHED,
+                             strict_col.table_id_, strict_col.column_id_);
+              LOG_WARN("ai column has unfinished tasks", K(ret), K(strict_col));
+            } else if (OB_ITER_END != tmp_ret) {
+              ret = tmp_ret;
+              LOG_WARN("iterate ai column check result failed", K(ret));
+            }
+          }
+        }
+      }
+    }
+  }
   return ret;
 }
 

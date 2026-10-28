@@ -95,6 +95,24 @@ public:
   obcall::ObAlterTriggerArg &get_tg_arg() { return tg_arg_; }
   const ObTableSchema &get_alter_table_schema() const { return alter_table_arg_.alter_table_schema_; }
   ObTableSchema &get_alter_table_schema() { return alter_table_arg_.alter_table_schema_; }
+
+  bool has_ai_column_retry() const { return has_ai_column_retry_; }
+  const common::ObString &get_ai_retry_column() const { return ai_retry_column_; }
+  const common::ObString &get_ai_retry_db() const { return ai_retry_db_; }
+  const common::ObString &get_ai_retry_table() const { return ai_retry_table_; }
+  const common::ObString &get_ai_retry_pred() const { return ai_retry_pred_; }
+  void set_ai_column_retry(const common::ObString &column,
+                           const common::ObString &db_name,
+                           const common::ObString &table_name,
+                           const common::ObString &pred)
+  {
+    has_ai_column_retry_ = true;
+    ai_retry_column_ = column;
+    ai_retry_db_ = db_name;
+    ai_retry_table_ = table_name;
+    ai_retry_pred_ = pred;
+  }
+
   obcall::ObExchangePartitionArg &get_exchange_partition_arg() { return exchange_partition_arg_;}
   int set_exchange_partition_arg(const obcall::ObExchangePartitionArg &exchange_partition_arg);
   inline void set_lock_session_info(const uint32_t session_id,
@@ -114,6 +132,11 @@ private:
   obcall::ObAlterTriggerArg tg_arg_;
   uint64_t alter_table_action_count_;
   obcall::ObExchangePartitionArg exchange_partition_arg_;
+  bool has_ai_column_retry_;
+  common::ObString ai_retry_column_;
+  common::ObString ai_retry_db_;
+  common::ObString ai_retry_table_;
+  common::ObString ai_retry_pred_;
 };
 
 inline int ObAlterTableStmt::set_tz_info_wrap(const common::ObTimeZoneInfoWrap &tz_info_wrap)

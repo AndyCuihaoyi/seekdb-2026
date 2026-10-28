@@ -43,6 +43,7 @@ ObPhysicalPlan::ObPhysicalPlan(MemoryContext &mem_context /* = CURRENT_CONTEXT *
     autoinc_params_(allocator_),
     stmt_need_privs_(allocator_),
     vars_(allocator_),
+    ai_strict_cols_(allocator_),
     sql_expression_factory_(allocator_),
     expr_op_factory_(allocator_),
     literal_stmt_type_(stmt::T_NONE),
@@ -132,6 +133,7 @@ void ObPhysicalPlan::reset()
   autoinc_params_.reset();
   stmt_need_privs_.reset();
   vars_.reset();
+  ai_strict_cols_.reset();
   sql_expression_factory_.destroy();
   expr_op_factory_.destroy();
   literal_stmt_type_ = stmt::T_NONE;
@@ -217,6 +219,26 @@ int ObPhysicalPlan::set_vars(const common::ObIArray<ObVarInfo> &vars)
     ObVarInfo clone_var_info;
     if (OB_FAIL(var_info.deep_copy(allocator_, clone_var_info))) {
     } else if (OB_FAIL(vars_.push_back(clone_var_info))) {
+    }
+  }
+  return ret;
+}
+
+int ObPhysicalPlan::set_ai_strict_cols(const common::ObIArray<ObAIStrictColRef> &cols)
+{
+  int ret = OB_SUCCESS;
+  int64_t N = cols.count();
+  if (N > 0 && OB_FAIL(ai_strict_cols_.reserve(N))) {
+    OB_LOG(WARN, "fail to reserve ai strict cols", K(ret));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < N; ++i) {
+    ObAIStrictColRef clone;
+    clone.table_id_ = cols.at(i).table_id_;
+    clone.column_id_ = cols.at(i).column_id_;
+    if (OB_FAIL(ob_write_string(allocator_, cols.at(i).column_name_, clone.column_name_))) {
+      OB_LOG(WARN, "fail to deep copy ai strict col name", K(ret));
+    } else if (OB_FAIL(ai_strict_cols_.push_back(clone))) {
+      OB_LOG(WARN, "fail to push ai strict col", K(ret));
     }
   }
   return ret;

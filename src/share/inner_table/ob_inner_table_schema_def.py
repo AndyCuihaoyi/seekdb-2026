@@ -2448,6 +2448,32 @@ all_ai_model_endpoint_def = dict(
 def_table_schema(**all_ai_model_endpoint_def)
 
 
+all_ai_column_def = dict(
+    owner = 'cuihaoyi',
+    table_name = '__all_ai_column',
+    table_id = '1131',
+    table_type = 'SYSTEM_TABLE',
+    gm_columns = ['gmt_create', 'gmt_modified'],
+    rowkey_columns = [
+      ('table_id', 'int'),
+      ('column_id', 'int')
+  ],
+
+    is_cluster_private = False,
+    meta_record_in_sys = False,
+    normal_columns = [
+        ('column_name', 'varchar:128', 'false'),
+        ('max_retries', 'int', 'false'),
+        ('state_column_id', 'int', 'false'),
+        ('request_column_id', 'int', 'false'),
+        ('result_spec_column_id', 'int', 'false'),
+        ('normalized_expr', 'varchar:65536', 'true')
+  ]
+)
+def_table_schema(**all_ai_column_def)
+def_table_schema(**gen_history_table_def(1132, all_ai_column_def))
+
+
 all_objauth_mysql_def = dict(
     owner = 'cjl476581',
     table_name     = '__all_objauth_mysql',
@@ -6384,6 +6410,25 @@ def_table_schema(
     ('fetch_lsn', 'int'),
     ('fetch_scn', 'int'),
   ],
+)
+
+def_table_schema(
+    owner = 'cuihaoyi',
+    table_name = '__all_ai_column_task',
+    table_id = '12565',
+    table_type = 'VIRTUAL_TABLE',
+    gm_columns = [],
+    rowkey_columns = [],
+    normal_columns = [
+        ('table_id', 'int'),
+        ('column_id', 'int'),
+        ('column_name', 'varchar:128'),
+        ('request_id', 'int'),
+        ('state', 'int'),
+        ('retry_count', 'int'),
+        ('eligible_ts', 'timestamp'),
+        ('rowkey_predicate', 'varchar:4096')
+  ]
 )
 
 # Reserved position (placeholder before this line)

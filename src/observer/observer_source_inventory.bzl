@@ -7,6 +7,7 @@ OBSERVER_UNITY_GROUPS = [
         srcs = [
             "src/observer/ai_service/ob_ai_service_proxy.cpp",
             "src/observer/ai_service/ob_ai_service_executor.cpp",
+            "src/observer/ai_service/ob_ai_column_worker.cpp",
             "src/observer/ob_system_package_load_service.cpp",
             "src/observer/ob_tablet_runtime_meta_updater.cpp",
         ],
@@ -197,6 +198,7 @@ OBSERVER_UNITY_GROUPS = [
         name = "ob_server_virtual_table_0",
         language = "c++",
         srcs = [
+            "src/observer/virtual_table/ob_ai_column_task_iterator.cpp",
             "src/observer/virtual_table/ob_all_concurrency_object_pool.cpp",
             "src/observer/virtual_table/ob_all_data_type_class_table.cpp",
             "src/observer/virtual_table/ob_all_data_type_table.cpp",

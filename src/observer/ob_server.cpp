@@ -626,9 +626,11 @@ ObServer::ObServer()
     server_gtimer_(),
     sql_mem_timer_(),
     ctas_clean_up_timer_(),
+    ai_column_worker_timer_(),
     duty_task_(),
     sql_mem_task_(),
     ctas_clean_up_task_(),
+    ai_column_worker_(),
     refresh_cpu_frequency_task_(),
     schema_status_proxy_(sql_proxy_),
     is_log_dir_empty_(false),
@@ -844,6 +846,8 @@ int ObServer::init(const ObServerOptions &opts, const ObPLogWriterCfg &log_cfg)
       LOG_ERROR("init server runtime failed", KR(ret));
     } else if (OB_FAIL(init_ctas_clean_up_task())) {
       LOG_ERROR("init ctas clean up task failed", KR(ret));
+    } else if (OB_FAIL(init_ai_column_worker())) {
+      LOG_ERROR("init ai column worker failed", KR(ret));
     } else if (OB_FAIL(init_ddl_heart_beat_task_container())) {
       LOG_ERROR("init ddl heart beat task container failed", KR(ret));
     } else if (OB_FAIL(init_redef_heart_beat_task())) {
@@ -983,6 +987,10 @@ void ObServer::destroy()
     FLOG_INFO("begin to destroy ctas clean up timer");
     ctas_clean_up_timer_.destroy();
     FLOG_INFO("ctas clean up timer destroyed");
+
+    FLOG_INFO("begin to destroy ai column worker timer");
+    ai_column_worker_timer_.destroy();
+    FLOG_INFO("ai column worker timer destroyed");
 
     FLOG_INFO("begin to destroy local management service");
     local_management_service_.destroy();
@@ -1613,6 +1621,10 @@ int ObServer::stop()
     ctas_clean_up_timer_.stop();
     FLOG_INFO("ctas clean up timer stopped");
 
+    FLOG_INFO("begin to stop ai column worker timer");
+    ai_column_worker_timer_.stop();
+    FLOG_INFO("ai column worker timer stopped");
+
     FLOG_INFO("begin to stop inner sql proxy");
     sql_proxy_.stop();
     ddl_sql_proxy_.stop();
@@ -1942,6 +1954,7 @@ int ObServer::init_config_module()
   } else if (OB_FAIL(server_gtimer_.init("ServerGTimer", ObMemAttr("ServerGTimer")))) {
   } else if (OB_FAIL(sql_mem_timer_.init("SqlMemTimer", ObMemAttr("SqlMemTimer")))) {
   } else if (OB_FAIL(ctas_clean_up_timer_.init("CTASCleanUp", ObMemAttr("CTASCleanUp")))) {
+  } else if (OB_FAIL(ai_column_worker_timer_.init("AiColumnWorker", ObMemAttr("AiColumnWorker")))) {
   }
 
   return ret;
@@ -2829,6 +2842,15 @@ int ObServer::init_ctas_clean_up_task()
 {
   int ret = OB_SUCCESS;
   if (OB_FAIL(ctas_clean_up_task_.init(this, ctas_clean_up_timer_))) {
+  }
+  return ret;
+}
+
+int ObServer::init_ai_column_worker()
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(ai_column_worker_.init(sql_proxy_, ai_column_worker_timer_))) {
+    LOG_WARN("init ai column worker failed", KR(ret));
   }
   return ret;
 }
