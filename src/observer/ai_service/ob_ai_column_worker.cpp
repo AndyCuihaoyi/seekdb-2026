@@ -21,7 +21,7 @@ namespace observer
 
 static const char *WORKER_STATE_PREFIX = "__ai_state_";
 static const char *WORKER_REQUEST_PREFIX = "__ai_request_";
-static const int64_t WORK_INTERVAL_US = 500L * 1000L;
+static const int64_t WORK_INTERVAL_US = 100L * 1000L;
 static const int64_t RETRY_DELAY_US = 500L * 1000L;
 static const int64_t CANDIDATE_LIMIT = 128;
 static const ObString AI_STATE_RETRY_WAIT("RETRY_WAIT");
@@ -396,90 +396,155 @@ int ObAIColumnWorker::process_table(share::schema::ObSchemaGetterGuard &guard,
     table_name = table_schema->get_table_name_str();
     table_ok = true;
   }
+  ObSEArray<const AiColumnMeta *, 4> cols;
+  ObSEArray<ObString, 4> state_cols;
+  ObSEArray<ObString, 4> request_cols;
+  ObSqlString select_list;
+  ObSqlString pending_pred;
+  ObArray<uint64_t> rowkey_ids;
   for (int64_t i = 0; OB_SUCC(ret) && table_ok && i < metas.count(); ++i) {
-    const AiColumnMeta &meta = metas.at(i);
-    if (meta.table_id_ != table_id) {
-      // not this table
+    if (metas.at(i).table_id_ == table_id && OB_FAIL(cols.push_back(&metas.at(i)))) {
+      LOG_WARN("push ai column meta failed", K(ret));
+    }
+  }
+  if (OB_FAIL(ret) || !table_ok || cols.empty()) {
+  } else if (OB_FAIL(table_schema->get_rowkey_info().get_column_ids(rowkey_ids))) {
+    LOG_WARN("get rowkey column ids failed", K(ret));
+  }
+  for (int64_t j = 0; OB_SUCC(ret) && table_ok && !cols.empty() && j < rowkey_ids.count(); ++j) {
+    const share::schema::ObColumnSchemaV2 *rk_col =
+        table_schema->get_column_schema(rowkey_ids.at(j));
+    if (OB_ISNULL(rk_col)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("rowkey column schema is null", K(ret), K(rowkey_ids.at(j)));
+    } else if (OB_FAIL(select_list.append_fmt("`%s`, ", rk_col->get_column_name()))) {
+      LOG_WARN("append rowkey column failed", K(ret));
+    }
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && table_ok && !cols.empty() && i < cols.count(); ++i) {
+    ObString state_col;
+    ObString request_col;
+    if (OB_FAIL(build_hidden_name(allocator_, WORKER_STATE_PREFIX,
+                                  cols.at(i)->column_name_, state_col))) {
+      LOG_WARN("build state column name failed", K(ret));
+    } else if (OB_FAIL(build_hidden_name(allocator_, WORKER_REQUEST_PREFIX,
+                                         cols.at(i)->column_name_, request_col))) {
+      LOG_WARN("build request column name failed", K(ret));
+    } else if (OB_FAIL(state_cols.push_back(state_col))) {
+      LOG_WARN("push state column failed", K(ret));
+    } else if (OB_FAIL(request_cols.push_back(request_col))) {
+      LOG_WARN("push request column failed", K(ret));
+    } else if (OB_FAIL(select_list.append_fmt(
+            "%s`%.*s` AS st_%ld, `%.*s` AS rq_%ld",
+            0 == i ? "" : ", ",
+            static_cast<int32_t>(state_col.length()), state_col.ptr(), i,
+            static_cast<int32_t>(request_col.length()), request_col.ptr(), i))) {
+      LOG_WARN("append state column failed", K(ret));
+    } else if (OB_FAIL(pending_pred.append_fmt(
+            "%s`%.*s` IN ('PENDING','RETRY_WAIT')",
+            0 == i ? "" : " OR ",
+            static_cast<int32_t>(state_col.length()), state_col.ptr()))) {
+      LOG_WARN("append pending predicate failed", K(ret));
+    }
+  }
+  if (OB_FAIL(ret) || !table_ok || cols.empty()) {
+  } else {
+    ObSqlString sql;
+    if (OB_FAIL(sql.assign_fmt(
+        "SELECT %.*s FROM `%.*s`.`%.*s` WHERE (%s) LIMIT %ld",
+        static_cast<int32_t>(select_list.length()), select_list.ptr(),
+        static_cast<int32_t>(db_name.length()), db_name.ptr(),
+        static_cast<int32_t>(table_name.length()), table_name.ptr(),
+        pending_pred.string().ptr(), CANDIDATE_LIMIT))) {
+      LOG_WARN("build candidate sql failed", K(ret));
     } else {
-      ObString state_col;
-      ObString request_col;
-      ObSqlString sql;
-      ObSqlString select_list;
-      ObArray<uint64_t> rowkey_ids;
-      if (OB_FAIL(build_hidden_name(allocator_, WORKER_STATE_PREFIX, meta.column_name_, state_col))) {
-      } else if (OB_FAIL(build_hidden_name(allocator_, WORKER_REQUEST_PREFIX, meta.column_name_, request_col))) {
-      } else if (OB_FAIL(table_schema->get_rowkey_info().get_column_ids(rowkey_ids))) {
-        LOG_WARN("get rowkey column ids failed", K(ret));
-      }
-      for (int64_t j = 0; OB_SUCC(ret) && j < rowkey_ids.count(); ++j) {
-        const share::schema::ObColumnSchemaV2 *rk_col =
-            table_schema->get_column_schema(rowkey_ids.at(j));
-        if (OB_ISNULL(rk_col)) {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("rowkey column schema is null", K(ret), K(rowkey_ids.at(j)));
-        } else if (OB_FAIL(select_list.append_fmt("`%s`, ", rk_col->get_column_name()))) {
-          LOG_WARN("append rowkey column failed", K(ret));
-        }
-      }
-      if (OB_FAIL(ret)) {
-      } else if (OB_FAIL(sql.assign_fmt(
-          "SELECT %.*s `%.*s` AS ai_state,"
-          " `%.*s` AS ai_request FROM `%.*s`.`%.*s`"
-          " WHERE `%.*s` IN ('PENDING','RETRY_WAIT') LIMIT %ld",
-          static_cast<int32_t>(select_list.length()), select_list.ptr(),
-          static_cast<int32_t>(state_col.length()), state_col.ptr(),
-          static_cast<int32_t>(request_col.length()), request_col.ptr(),
-          static_cast<int32_t>(db_name.length()), db_name.ptr(),
-          static_cast<int32_t>(table_name.length()), table_name.ptr(),
-          static_cast<int32_t>(state_col.length()), state_col.ptr(),
-          CANDIDATE_LIMIT))) {
-        LOG_WARN("build candidate sql failed", K(ret));
+      common::ObISQLClient::ReadResult read_res;
+      if (OB_FAIL(sql_proxy_->read(read_res, sql.ptr()))) {
+        LOG_WARN("select ai column candidates failed", K(ret), K(sql));
       } else {
-        common::ObISQLClient::ReadResult read_res;
-        if (OB_FAIL(sql_proxy_->read(read_res, sql.ptr()))) {
-          LOG_WARN("select ai column candidates failed", K(ret), K(sql));
+        sqlclient::ObMySQLResult *result = read_res.get_result();
+        if (OB_ISNULL(result)) {
+          ret = OB_ERR_UNEXPECTED;
         } else {
-          sqlclient::ObMySQLResult *result = read_res.get_result();
-          if (OB_ISNULL(result)) {
-            ret = OB_ERR_UNEXPECTED;
-          } else {
-            while (OB_SUCC(ret)) {
-              int tmp_ret = result->next();
-              if (OB_ITER_END == tmp_ret) {
-                break;
-              } else if (OB_SUCCESS != tmp_ret) {
-                ret = tmp_ret;
-              } else {
-                ObString state;
-                ObString request;
-                ObString rowkey_pred;
+          while (OB_SUCC(ret)) {
+            int tmp_ret = result->next();
+            if (OB_ITER_END == tmp_ret) {
+              break;
+            } else if (OB_SUCCESS != tmp_ret) {
+              ret = tmp_ret;
+            } else {
+              ObSEArray<ColumnTask, 4> tasks;
+              for (int64_t i = 0; OB_SUCC(ret) && i < cols.count(); ++i) {
                 ObObj state_obj;
                 ObObj request_obj;
-                // a row that was never claimed yet carries no request token
-                if (OB_FAIL(result->get_obj("ai_state", state_obj))
-                    || OB_FAIL(result->get_obj("ai_request", request_obj))) {
+                char st_alias[16] = {0};
+                char rq_alias[16] = {0};
+                snprintf(st_alias, sizeof(st_alias), "st_%ld", i);
+                snprintf(rq_alias, sizeof(rq_alias), "rq_%ld", i);
+                if (OB_FAIL(result->get_obj(st_alias, state_obj))
+                    || OB_FAIL(result->get_obj(rq_alias, request_obj))) {
                   LOG_WARN("get ai state row failed", K(ret));
+                } else if (state_obj.is_null()) {
+                  // no state for this column, nothing to do
                 } else {
-                  if (!state_obj.is_null()) {
-                    state = state_obj.get_varchar();
-                  }
-                  if (!request_obj.is_null()) {
-                    request = request_obj.get_varchar();
+                  const ObString state = state_obj.get_varchar();
+                  const bool pending = (0 == state.case_compare(ObString::make_string("PENDING"))
+                                        || 0 == state.case_compare(AI_STATE_RETRY_WAIT));
+                  if (!pending) {
+                    // column is not waiting for the worker
+                  } else {
+                    ColumnTask task;
+                    task.meta_ = cols.at(i);
+                    task.state_col_ = state_cols.at(i);
+                    task.request_col_ = request_cols.at(i);
+                    task.state_ = state;
+                    // a row that was never claimed yet carries no request token
+                    if (!request_obj.is_null()) {
+                      task.request_ = request_obj.get_varchar();
+                    }
+                    if (OB_FAIL(tasks.push_back(task))) {
+                      LOG_WARN("push column task failed", K(ret));
+                    }
                   }
                 }
+              }
+              // one DML stamps the same request id on every column it touched, so
+              // keep only the first task's request group and publish it atomically
+              if (OB_SUCC(ret) && !tasks.empty()) {
+                ObString group_rid;
+                int64_t unused_retry = 0;
+                int64_t unused_eligible = 0;
+                ObSEArray<ColumnTask, 4> group;
+                if (OB_FAIL(parse_request_column(tasks.at(0).request_, group_rid,
+                                                 unused_retry, unused_eligible))) {
+                  LOG_WARN("parse request column failed", K(ret));
+                } else if (OB_FAIL(group.push_back(tasks.at(0)))) {
+                  LOG_WARN("push group task failed", K(ret));
+                }
+                for (int64_t i = 1; OB_SUCC(ret) && i < tasks.count(); ++i) {
+                  ObString rid;
+                  int64_t retry = 0;
+                  int64_t eligible = 0;
+                  if (OB_FAIL(parse_request_column(tasks.at(i).request_, rid,
+                                                   retry, eligible))) {
+                    LOG_WARN("parse request column failed", K(ret));
+                  } else if (rid == group_rid && OB_FAIL(group.push_back(tasks.at(i)))) {
+                    LOG_WARN("push group task failed", K(ret));
+                  }
+                }
+                ObString rowkey_pred;
                 if (OB_FAIL(ret)) {
                 } else if (OB_FAIL(build_rowkey_pred(*table_schema, *result, rowkey_pred))) {
                   LOG_WARN("build rowkey predicate failed", K(ret));
-                } else if (OB_FAIL(process_row(*table_schema, db_name, table_name, meta,
-                                               state_col, request_col, rowkey_pred,
-                                               state, request))) {
+                } else if (OB_FAIL(process_row(db_name, table_name, rowkey_pred, group))) {
                   LOG_WARN("process ai column row failed", K(ret));
                 }
               }
+              tasks.reset();
             }
-            if (OB_ITER_END == ret) {
-              ret = OB_SUCCESS;
-            }
+          }
+          if (OB_ITER_END == ret) {
+            ret = OB_SUCCESS;
           }
         }
       }
@@ -528,68 +593,185 @@ int ObAIColumnWorker::build_rowkey_pred(const share::schema::ObTableSchema &tabl
   return ret;
 }
 
-int ObAIColumnWorker::process_row(const share::schema::ObTableSchema &table_schema,
-                                  const ObString &db_name,
+int ObAIColumnWorker::process_row(const ObString &db_name,
                                   const ObString &table_name,
-                                  const AiColumnMeta &meta,
-                                  const ObString &state_col,
-                                  const ObString &request_col,
                                   const ObString &rowkey_pred,
-                                  const ObString &state,
-                                  const ObString &request)
+                                  const ObIArray<ColumnTask> &tasks)
 {
   int ret = OB_SUCCESS;
-  UNUSED(table_schema);
-  ObString rid;
-  int64_t retry = 0;
-  int64_t eligible_us = 0;
-  if (OB_FAIL(parse_request_column(request, rid, retry, eligible_us))) {
-    LOG_WARN("parse request column failed", K(ret), K(request));
-  } else if (0 == state.case_compare(AI_STATE_RETRY_WAIT)
-             && eligible_us > ObTimeUtility::current_time()) {
-    // not eligible yet
+  const int64_t now = ObTimeUtility::current_time();
+  bool not_eligible = false;
+  for (int64_t i = 0; OB_SUCC(ret) && !not_eligible && i < tasks.count(); ++i) {
+    ObString rid;
+    int64_t retry = 0;
+    int64_t eligible_us = 0;
+    if (OB_FAIL(parse_request_column(tasks.at(i).request_, rid, retry, eligible_us))) {
+      LOG_WARN("parse request column failed", K(ret), K(tasks.at(i).request_));
+    } else if (0 == tasks.at(i).state_.case_compare(AI_STATE_RETRY_WAIT)
+               && eligible_us > now) {
+      not_eligible = true;
+    }
+  }
+  if (OB_FAIL(ret) || not_eligible || tasks.empty()) {
   } else {
-    // CAS claim: PENDING/RETRY_WAIT -> RUNNING, keep the attempt counter
-    const int64_t rid_new = ObTimeUtility::current_time();
-    ObSqlString claimed_request;
+    // claim the whole request group with one CAS statement: a group is only ever
+    // published with one UPDATE, so no column of the group can become visible
+    // while another column of the same request is still mid-flight
     ObSqlString claim_sql;
-    int64_t affected = 0;
-    if (OB_FAIL(claimed_request.assign_fmt("%ld|%ld|0", rid_new, retry))) {
-    } else if (OB_FAIL(claim_sql.assign_fmt(
-        "UPDATE `%.*s`.`%.*s` SET"
-        " `%.*s` = 'RUNNING', `%.*s` = '%.*s' WHERE %.*s AND `%.*s` IN ('PENDING','RETRY_WAIT')",
+    ObSEArray<ObString, 4> claimed;
+    if (OB_FAIL(claim_sql.assign_fmt(
+        "UPDATE `%.*s`.`%.*s` SET",
         static_cast<int32_t>(db_name.length()), db_name.ptr(),
-        static_cast<int32_t>(table_name.length()), table_name.ptr(),
-        static_cast<int32_t>(state_col.length()), state_col.ptr(),
-        static_cast<int32_t>(request_col.length()), request_col.ptr(),
-        static_cast<int32_t>(claimed_request.length()), claimed_request.ptr(),
-        static_cast<int32_t>(rowkey_pred.length()), rowkey_pred.ptr(),
-        static_cast<int32_t>(state_col.length()), state_col.ptr()))) {
+        static_cast<int32_t>(table_name.length()), table_name.ptr()))) {
       LOG_WARN("build claim sql failed", K(ret));
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < tasks.count(); ++i) {
+      ObString rid;
+      int64_t retry = 0;
+      int64_t eligible_us = 0;
+      ObSqlString token;
+      ObString token_copy;
+      if (OB_FAIL(parse_request_column(tasks.at(i).request_, rid, retry, eligible_us))) {
+        LOG_WARN("parse request column failed", K(ret));
+      } else if (OB_FAIL(token.assign_fmt("%ld|%ld|0", now, retry))) {
+        LOG_WARN("format claim token failed", K(ret));
+      } else if (OB_FAIL(deep_copy_str(allocator_, token.string(), token_copy))) {
+        LOG_WARN("copy claim token failed", K(ret));
+      } else if (OB_FAIL(claimed.push_back(token_copy))) {
+        LOG_WARN("push claim token failed", K(ret));
+      } else if (OB_FAIL(claim_sql.append_fmt(
+              "%s `%.*s` = 'RUNNING', `%.*s` = ",
+              0 == i ? "" : ",",
+              static_cast<int32_t>(tasks.at(i).state_col_.length()), tasks.at(i).state_col_.ptr(),
+              static_cast<int32_t>(tasks.at(i).request_col_.length()), tasks.at(i).request_col_.ptr()))) {
+        LOG_WARN("append claim set failed", K(ret));
+      } else if (OB_FAIL(append_str_literal(allocator_, claim_sql, token_copy))) {
+        LOG_WARN("append claim token failed", K(ret));
+      }
+    }
+    int64_t affected = 0;
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(claim_sql.append_fmt(" WHERE %.*s",
+               static_cast<int32_t>(rowkey_pred.length()), rowkey_pred.ptr()))) {
+      LOG_WARN("append claim where failed", K(ret));
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < tasks.count(); ++i) {
+      if (OB_FAIL(claim_sql.append_fmt(
+              " AND `%.*s` IN ('PENDING','RETRY_WAIT')",
+              static_cast<int32_t>(tasks.at(i).state_col_.length()), tasks.at(i).state_col_.ptr()))) {
+        LOG_WARN("append claim guard failed", K(ret));
+      }
+    }
+    if (OB_FAIL(ret)) {
     } else if (OB_FAIL(sql_proxy_->write(claim_sql.ptr(), affected))) {
-      LOG_WARN("claim ai column row failed", K(ret));
+      LOG_WARN("claim ai column row failed", K(ret), K(claim_sql));
     } else if (1 != affected) {
-      // lost the race or state changed concurrently, skip this row
+      // lost the race or the row changed concurrently, skip the whole group
     } else {
-      bool is_null_content = false;
-      bool call_ok = false;
-      ObString content;
-      ObString result;
-      int eval_ret = eval_user_expr(db_name, table_name, meta, rowkey_pred,
-                                    is_null_content, content);
-      if (OB_SUCCESS != eval_ret) {
-        // a row stuck in RUNNING would block every later strict read, fold the
-        // internal failure into the retry/failure path instead of propagating it
-        LOG_WARN("eval ai column user expr failed", K(eval_ret));
-      } else {
-        call_ok = is_null_content || (OB_SUCCESS == call_ai(meta, content, result));
+      ObSEArray<bool, 4> call_oks;
+      ObSEArray<ObString, 4> results;
+      for (int64_t i = 0; OB_SUCC(ret) && i < tasks.count(); ++i) {
+        bool is_null_content = false;
+        bool call_ok = false;
+        ObString content;
+        ObString result;
+        int eval_ret = eval_user_expr(db_name, table_name, *tasks.at(i).meta_,
+                                      rowkey_pred, is_null_content, content);
+        if (OB_SUCCESS != eval_ret) {
+          // a row stuck in RUNNING would block every later strict read, fold the
+          // internal failure into the retry/failure path instead of propagating it
+          LOG_WARN("eval ai column user expr failed", K(eval_ret));
+        } else if (is_null_content) {
+          call_ok = true;
+        } else {
+          const int call_ret = call_ai(*tasks.at(i).meta_, content, result);
+          if (OB_SUCCESS != call_ret) {
+            LOG_WARN("call ai failed", K(call_ret), K(tasks.at(i).meta_->column_name_));
+          } else {
+            call_ok = true;
+          }
+        }
+        if (OB_FAIL(ret)) {
+        } else if (OB_FAIL(call_oks.push_back(call_ok))) {
+          LOG_WARN("push call ok failed", K(ret));
+        } else if (OB_FAIL(results.push_back(result))) {
+          LOG_WARN("push result failed", K(ret));
+        }
       }
-      if (OB_FAIL(publish_result(db_name, table_name, meta, state_col, request_col,
-                                 rowkey_pred, claimed_request.string(), retry,
-                                 call_ok, result))) {
-        LOG_WARN("publish ai result failed", K(ret));
+      if (OB_SUCC(ret)) {
+        // one publish statement for the whole group, guarded by every claimed token
+        ObSqlString sql;
+        if (OB_FAIL(sql.assign_fmt(
+            "UPDATE `%.*s`.`%.*s` SET",
+            static_cast<int32_t>(db_name.length()), db_name.ptr(),
+            static_cast<int32_t>(table_name.length()), table_name.ptr()))) {
+          LOG_WARN("build publish sql failed", K(ret));
+        }
+        for (int64_t i = 0; OB_SUCC(ret) && i < tasks.count(); ++i) {
+          const AiColumnMeta &meta = *tasks.at(i).meta_;
+          ObString rid;
+          int64_t retry = 0;
+          int64_t eligible_us = 0;
+          if (OB_FAIL(parse_request_column(claimed.at(i), rid, retry, eligible_us))) {
+            LOG_WARN("parse claimed token failed", K(ret));
+          } else if (call_oks.at(i)) {
+            if (OB_FAIL(sql.append_fmt(
+                    "%s `%.*s` = ",
+                    0 == i ? "" : ",",
+                    static_cast<int32_t>(meta.column_name_.length()), meta.column_name_.ptr()))) {
+              LOG_WARN("append result set failed", K(ret));
+            } else if (OB_FAIL(append_str_literal(allocator_, sql, results.at(i)))) {
+              LOG_WARN("append result literal failed", K(ret));
+            } else if (OB_FAIL(sql.append_fmt(
+                    ", `%.*s` = 'READY'",
+                    static_cast<int32_t>(tasks.at(i).state_col_.length()), tasks.at(i).state_col_.ptr()))) {
+              LOG_WARN("append ready set failed", K(ret));
+            }
+          } else if (retry + 1 > meta.max_retries_) {
+            if (OB_FAIL(sql.append_fmt(
+                    "%s `%.*s` = 'FAILED'",
+                    0 == i ? "" : ",",
+                    static_cast<int32_t>(tasks.at(i).state_col_.length()), tasks.at(i).state_col_.ptr()))) {
+              LOG_WARN("append failed set failed", K(ret));
+            }
+          } else {
+            const int64_t eligible = now + RETRY_DELAY_US;
+            ObSqlString new_token;
+            if (OB_FAIL(new_token.assign_fmt("%.*s|%ld|%ld",
+                    static_cast<int32_t>(rid.length()), rid.ptr(), retry + 1, eligible))) {
+              LOG_WARN("format retry token failed", K(ret));
+            } else if (OB_FAIL(sql.append_fmt(
+                    "%s `%.*s` = 'RETRY_WAIT', `%.*s` = ",
+                    0 == i ? "" : ",",
+                    static_cast<int32_t>(tasks.at(i).state_col_.length()), tasks.at(i).state_col_.ptr(),
+                    static_cast<int32_t>(tasks.at(i).request_col_.length()), tasks.at(i).request_col_.ptr()))) {
+              LOG_WARN("append retry set failed", K(ret));
+            } else if (OB_FAIL(append_str_literal(allocator_, sql, new_token.string()))) {
+              LOG_WARN("append retry token failed", K(ret));
+            }
+          }
+        }
+        for (int64_t i = 0; OB_SUCC(ret) && i < tasks.count(); ++i) {
+          if (OB_FAIL(sql.append_fmt(
+                  "%s `%.*s` = ",
+                  0 == i ? " WHERE" : " AND",
+                  static_cast<int32_t>(tasks.at(i).request_col_.length()), tasks.at(i).request_col_.ptr()))) {
+            LOG_WARN("append publish guard failed", K(ret));
+          } else if (OB_FAIL(append_str_literal(allocator_, sql, claimed.at(i)))) {
+            LOG_WARN("append publish token failed", K(ret));
+          }
+        }
+        if (OB_FAIL(ret)) {
+        } else if (OB_FAIL(sql.append_fmt(" AND %.*s",
+                   static_cast<int32_t>(rowkey_pred.length()), rowkey_pred.ptr()))) {
+          LOG_WARN("append publish where failed", K(ret));
+        } else if (OB_FAIL(sql_proxy_->write(sql.ptr(), affected))) {
+          LOG_WARN("publish ai result write failed", K(ret), K(sql));
+        }
+        // a publish that guards out means the row changed concurrently; the new
+        // request tokens will be picked up on a later cycle
       }
-      // the AI call error has been folded into RETRY_WAIT/FAILED, do not propagate
+      // AI call errors have been folded into RETRY_WAIT/FAILED, do not propagate
       ret = OB_SUCCESS;
     }
   }
@@ -710,83 +892,6 @@ int ObAIColumnWorker::call_ai(const AiColumnMeta &meta, const ObString &content,
       } else if (OB_FAIL(ObAIFuncJsonUtils::print_json_to_str(allocator_, result_base, result))) {
         LOG_WARN("print ai complete result failed", K(ret));
       }
-    }
-  }
-  return ret;
-}
-
-int ObAIColumnWorker::publish_result(const ObString &db_name,
-                                     const ObString &table_name,
-                                     const AiColumnMeta &meta,
-                                     const ObString &state_col,
-                                     const ObString &request_col,
-                                     const ObString &rowkey_pred,
-                                     const ObString &claimed_request,
-                                     const int64_t retry,
-                                     bool call_ok,
-                                     const ObString &result)
-{
-  int ret = OB_SUCCESS;
-  ObSqlString sql;
-  if (call_ok) {
-    if (OB_FAIL(sql.assign_fmt(
-        "UPDATE `%.*s`.`%.*s` SET `%.*s` = ",
-        static_cast<int32_t>(db_name.length()), db_name.ptr(),
-        static_cast<int32_t>(table_name.length()), table_name.ptr(),
-        static_cast<int32_t>(meta.column_name_.length()), meta.column_name_.ptr()))) {
-    } else if (OB_FAIL(append_str_literal(allocator_, sql, result))) {
-    } else if (OB_FAIL(sql.append_fmt(", `%.*s` = 'READY' WHERE %.*s AND `%.*s` = '%.*s'",
-        static_cast<int32_t>(state_col.length()), state_col.ptr(),
-        static_cast<int32_t>(rowkey_pred.length()), rowkey_pred.ptr(),
-        static_cast<int32_t>(request_col.length()), request_col.ptr(),
-        static_cast<int32_t>(claimed_request.length()), claimed_request.ptr()))) {
-      LOG_WARN("build publish sql failed", K(ret));
-    }
-  } else {
-    const int64_t new_retry = retry + 1;
-    if (new_retry > meta.max_retries_) {
-      if (OB_FAIL(sql.assign_fmt(
-          "UPDATE `%.*s`.`%.*s` SET"
-          " `%.*s` = 'FAILED' WHERE %.*s AND `%.*s` = '%.*s'",
-          static_cast<int32_t>(db_name.length()), db_name.ptr(),
-          static_cast<int32_t>(table_name.length()), table_name.ptr(),
-          static_cast<int32_t>(state_col.length()), state_col.ptr(),
-          static_cast<int32_t>(rowkey_pred.length()), rowkey_pred.ptr(),
-          static_cast<int32_t>(request_col.length()), request_col.ptr(),
-          static_cast<int32_t>(claimed_request.length()), claimed_request.ptr()))) {
-        LOG_WARN("build fail sql failed", K(ret));
-      }
-    } else {
-      const int64_t eligible_us = ObTimeUtility::current_time() + RETRY_DELAY_US;
-      ObString rid;
-      int64_t tmp_retry = 0;
-      int64_t tmp_eligible = 0;
-      ObSqlString new_request;
-      if (OB_FAIL(parse_request_column(claimed_request, rid, tmp_retry, tmp_eligible))) {
-      } else if (OB_FAIL(new_request.assign_fmt("%.*s|%ld|%ld",
-          static_cast<int32_t>(rid.length()), rid.ptr(), new_retry, eligible_us))) {
-      }
-      if (OB_FAIL(ret)) {
-        LOG_WARN("build new request failed", K(ret));
-      } else if (OB_FAIL(sql.assign_fmt(
-          "UPDATE `%.*s`.`%.*s` SET"
-          " `%.*s` = 'RETRY_WAIT', `%.*s` = '%.*s' WHERE %.*s AND `%.*s` = '%.*s'",
-          static_cast<int32_t>(db_name.length()), db_name.ptr(),
-          static_cast<int32_t>(table_name.length()), table_name.ptr(),
-          static_cast<int32_t>(state_col.length()), state_col.ptr(),
-          static_cast<int32_t>(request_col.length()), request_col.ptr(),
-          static_cast<int32_t>(new_request.length()), new_request.ptr(),
-          static_cast<int32_t>(rowkey_pred.length()), rowkey_pred.ptr(),
-          static_cast<int32_t>(request_col.length()), request_col.ptr(),
-          static_cast<int32_t>(claimed_request.length()), claimed_request.ptr()))) {
-        LOG_WARN("build retry sql failed", K(ret));
-      }
-    }
-  }
-  if (OB_SUCC(ret)) {
-    int64_t affected = 0;
-    if (OB_FAIL(sql_proxy_->write(sql.ptr(), affected))) {
-      LOG_WARN("publish ai result write failed", K(ret), K(sql));
     }
   }
   return ret;

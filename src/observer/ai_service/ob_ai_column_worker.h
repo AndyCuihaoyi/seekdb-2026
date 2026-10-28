@@ -53,6 +53,17 @@ private:
     }
   };
 
+  // one AI column of a row that the worker has picked up for processing
+  struct ColumnTask
+  {
+    const AiColumnMeta *meta_;
+    common::ObString state_col_;
+    common::ObString request_col_;
+    common::ObString state_;
+    common::ObString request_;
+    ColumnTask() : meta_(NULL) {}
+  };
+
   int process();
   int load_ai_columns(share::schema::ObSchemaGetterGuard &guard,
                       common::ObIArray<AiColumnMeta> &metas);
@@ -60,15 +71,10 @@ private:
   int process_table(share::schema::ObSchemaGetterGuard &guard,
                     const uint64_t table_id,
                     const common::ObIArray<AiColumnMeta> &metas);
-  int process_row(const share::schema::ObTableSchema &table_schema,
-                  const common::ObString &db_name,
+  int process_row(const common::ObString &db_name,
                   const common::ObString &table_name,
-                  const AiColumnMeta &meta,
-                  const common::ObString &state_col,
-                  const common::ObString &request_col,
                   const common::ObString &rowkey_pred,
-                  const common::ObString &state,
-                  const common::ObString &request);
+                  const common::ObIArray<ColumnTask> &tasks);
   int build_rowkey_pred(const share::schema::ObTableSchema &table_schema,
                         sqlclient::ObMySQLResult &result,
                         common::ObString &rowkey_pred);
@@ -80,16 +86,6 @@ private:
                      common::ObString &content);
   int call_ai(const AiColumnMeta &meta, const common::ObString &content,
               common::ObString &result);
-  int publish_result(const common::ObString &db_name,
-                     const common::ObString &table_name,
-                     const AiColumnMeta &meta,
-                     const common::ObString &state_col,
-                     const common::ObString &request_col,
-                     const common::ObString &rowkey_pred,
-                     const common::ObString &claimed_request,
-                     const int64_t retry,
-                     bool call_ok,
-                     const common::ObString &result);
 
   common::ObMySQLProxy *sql_proxy_;
   common::ObArenaAllocator allocator_;
