@@ -55,6 +55,7 @@ ObDASLegacyTRMergeIter::ObDASLegacyTRMergeIter()
     flags_(0),
     check_rangekey_inited_(false),
     inv_idx_tablet_switched_(false),
+    skip_relevance_eval_(false),
     is_inited_(false)
 {
 }
@@ -92,6 +93,15 @@ int ObDASLegacyTRMergeIter::inner_init(ObDASIterParam &param)
       lib::ContextParam mem_param;
       mem_param.set_mem_attr("TextMergeIter", ObCtxIds::DEFAULT_CTX_ID);
       if (OB_FAIL(CURRENT_CONTEXT->CREATE_CONTEXT(mem_context_, mem_param))) {
+      }
+    }
+    // The optimizer marks scans whose score is provably unobserved. Treating the
+    // pushed-down score filter as always-true additionally requires every per-token
+    // weight to be positive, otherwise a non-positive weight could zero the score.
+    skip_relevance_eval_ = ir_ctdef_->skip_relevance_eval();
+    for (int64_t i = 0; skip_relevance_eval_ && i < dim_weights_.count(); ++i) {
+      if (dim_weights_.at(i) <= 0.0) {
+        skip_relevance_eval_ = false;
       }
     }
     sr_iter_param_.max_batch_size_ = merge_param.max_batch_size_; // may be greater than ir_rtdef_->eval_ctx_->max_batch_size_
@@ -364,6 +374,7 @@ int ObDASLegacyTRMergeIter::init_dim_iter_param(ObTextRetrievalScanIterParam &it
     iter_param.mem_context_ = mem_context_;
     iter_param.eval_ctx_ = ir_rtdef_->eval_ctx_;
     iter_param.relevance_expr_ = ir_ctdef_->relevance_expr_;
+    iter_param.skip_relevance_eval_ = skip_relevance_eval_;
     iter_param.inv_scan_doc_length_col_ = ir_ctdef_->inv_scan_doc_length_col_;
     iter_param.inv_scan_domain_id_col_ = ir_ctdef_->inv_scan_domain_id_col_;
     iter_param.inv_idx_agg_cache_mode_ = function_lookup_mode_ && !taat_mode_;
@@ -379,6 +390,7 @@ int ObDASLegacyTRMergeIter::create_sparse_retrieval_iter()
   sr_iter_param_.eval_ctx_ = ir_rtdef_->eval_ctx_;
   sr_iter_param_.id_proj_expr_ = ir_ctdef_->inv_scan_domain_id_col_;
   sr_iter_param_.relevance_expr_ = ir_ctdef_->relevance_expr_;
+  sr_iter_param_.skip_relevance_eval_ = skip_relevance_eval_;
   sr_iter_param_.relevance_proj_expr_ = ir_ctdef_->relevance_proj_col_;
   sr_iter_param_.filter_expr_ = ir_ctdef_->match_filter_;
   sr_iter_param_.topk_limit_ = topk_limit_;

@@ -257,7 +257,7 @@ int ObSRTaaTIterImpl::fill_chunk_stores()
   } else {
     ObSEArray<ObExpr *, 2> exprs;
     if (OB_FAIL(exprs.push_back(iter_param_->id_proj_expr_))) {
-    } else if (iter_param_->need_project_relevance()
+    } else if (iter_param_->need_project_relevance() && iter_param_->need_calc_relevance()
         && OB_FAIL(exprs.push_back(iter_param_->relevance_expr_))) {
     }
     ObEvalCtx *eval_ctx = iter_param_->eval_ctx_;
@@ -377,7 +377,7 @@ int ObSRTaaTIterImpl::load_next_hash_map()
 
     ObSEArray<ObExpr *, 2> exprs;
     if (OB_FAIL(exprs.push_back(iter_param_->id_proj_expr_))) {
-    } else if (iter_param_->need_project_relevance()
+    } else if (iter_param_->need_project_relevance() && iter_param_->need_calc_relevance()
         && OB_FAIL(exprs.push_back(iter_param_->relevance_expr_))) {
     }
     ObEvalCtx *eval_ctx = iter_param_->eval_ctx_;
@@ -395,7 +395,7 @@ int ObSRTaaTIterImpl::load_next_hash_map()
       } else {
         ObDatum &id_datum = iter_param_->id_proj_expr_->locate_expr_datum(*eval_ctx);
         if (OB_FAIL(id.from_datum(id_datum))) {
-        } else if (iter_param_->need_project_relevance()) {
+        } else if (iter_param_->need_project_relevance() && iter_param_->need_calc_relevance()) {
           ObDatum &relevance_datum = iter_param_->relevance_expr_->locate_expr_datum(*eval_ctx);
           cur_relevance = relevance_datum.get_double();
           if (OB_FAIL(map->get_refactored(id, last_relevance))) {
@@ -458,7 +458,8 @@ int ObSRTaaTIterImpl::project_results(const int64_t safe_capacity, int64_t &coun
 
     bool need_project = false;
     ObDatum *filter_res = nullptr;
-    if (!iter_param_->need_filter()) {
+    if (!iter_param_->need_filter() || !iter_param_->need_calc_relevance()) {
+      // relevance skipped: the BOOL(score) filter is provably always-true
       need_project = true;
     } else {
       filter_expr->clear_evaluated_flag(*eval_ctx);
