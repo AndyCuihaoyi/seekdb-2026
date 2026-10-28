@@ -24,7 +24,6 @@
 #include "query/command/ob_root_service_serialization.h"
 #include "query/runtime/ob_query_runtime_environment.h"
 #include "query/session/ob_inner_sql_connection_access.h"
-#include "query/session/ob_session_inner_sql.h"
 #include "sql/engine/expr/ob_expr_regexp_context.h"  // ObExprRegexpSessionVariables (unity regroup)
 #include "sql/engine/cmd/ob_index_executor.h"
 #include "sql/engine/cmd/ob_ddl_executor_util.h"
@@ -766,7 +765,7 @@ int ObAlterTableExecutor::execute_ai_column_retry(ObExecContext &ctx, ObAlterTab
     ret = OB_ERR_UNEXPECTED;
     SQL_EXE_LOG(WARN, "no session for ai column retry", K(ret));
   } else if (OB_FAIL(sql.assign_fmt(
-      "UPDATE /*+OPT_PARAM('hidden_column_visible','true')*/ `%.*s`.`%.*s` SET"
+      "UPDATE `%.*s`.`%.*s` SET"
       " `%.*s` = NULL, `__ai_state_%.*s` = 'PENDING', `__ai_request_%.*s` = NULL",
       static_cast<int32_t>(db_name.length()), db_name.ptr(),
       static_cast<int32_t>(table_name.length()), table_name.ptr(),
@@ -778,25 +777,13 @@ int ObAlterTableExecutor::execute_ai_column_retry(ObExecContext &ctx, ObAlterTab
              && OB_FAIL(sql.append_fmt(" WHERE %.*s",
                   static_cast<int32_t>(pred.length()), pred.ptr()))) {
     SQL_EXE_LOG(WARN, "append ai column retry pred failed", K(ret));
+  } else if (OB_ISNULL(GCTX.sql_proxy_)) {
+    ret = OB_ERR_UNEXPECTED;
+    SQL_EXE_LOG(WARN, "sql proxy is null for ai column retry", K(ret));
+  } else if (OB_FAIL(GCTX.sql_proxy_->write(sql.ptr(), affected_rows))) {
+    SQL_EXE_LOG(WARN, "execute ai column retry failed", K(ret), K(sql));
   } else {
-    query::ObSessionInnerSql inner_sql(static_cast<void *>(my_session));
-    // the AI state/request columns are schema-hidden; resolve them through the
-    // inner-session path like the background worker does
-    const bool was_inner = my_session->is_inner();
-    if (!was_inner) {
-      my_session->set_inner_session();
-    }
-    int tmp_ret = OB_SUCCESS;
-    tmp_ret = inner_sql.execute_write(sql, affected_rows);
-    if (!was_inner) {
-      my_session->set_user_session();
-    }
-    if (OB_SUCCESS != tmp_ret) {
-      ret = tmp_ret;
-      SQL_EXE_LOG(WARN, "execute ai column retry failed", K(ret), K(sql));
-    } else {
-      SQL_EXE_LOG(INFO, "ai column retry executed", K(affected_rows), K(sql));
-    }
+    SQL_EXE_LOG(INFO, "ai column retry executed", K(affected_rows), K(sql));
   }
   return ret;
 }

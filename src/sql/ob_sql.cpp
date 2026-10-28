@@ -3666,8 +3666,9 @@ int ObSql::check_ai_column_strict_read(ObSQLSessionInfo &session, ObPhysicalPlan
                                       strict_col.column_name_.length(),
                                       strict_col.column_name_.ptr()))) {
             LOG_WARN("build ai state column name failed", K(ret), K(strict_col));
-          } else if (OB_FAIL(sql.assign_fmt("SELECT /*+OPT_PARAM('hidden_column_visible','true')*/ 1"
+          } else if (OB_FAIL(sql.assign_fmt("SELECT `%.*s` AS bad_state"
                                             " FROM `%.*s`.`%.*s` WHERE `%.*s` != 'READY' LIMIT 1",
+                                            static_cast<int>(name_pos), state_col_name,
                                             db_schema->get_database_name_str().length(),
                                             db_schema->get_database_name_str().ptr(),
                                             table_schema->get_table_name_str().length(),
@@ -3682,10 +3683,16 @@ int ObSql::check_ai_column_strict_read(ObSQLSessionInfo &session, ObPhysicalPlan
           } else {
             int tmp_ret = sql_res.get_result()->next();
             if (OB_SUCCESS == tmp_ret) {
+              common::ObObj state_obj;
+              common::ObString bad_state("<null>");
+              if (OB_SUCCESS == sql_res.get_result()->get_obj("bad_state", state_obj)
+                  && !state_obj.is_null() && state_obj.is_string_type()) {
+                bad_state = state_obj.get_varchar();
+              }
               ret = OB_ERR_AI_COLUMN_TASKS_UNFINISHED;
               LOG_USER_ERROR(OB_ERR_AI_COLUMN_TASKS_UNFINISHED,
                              strict_col.table_id_, strict_col.column_id_);
-              LOG_WARN("ai column has unfinished tasks", K(ret), K(strict_col));
+              LOG_WARN("ai column has unfinished tasks", K(ret), K(strict_col), K(bad_state), K(sql));
             } else if (OB_ITER_END != tmp_ret) {
               ret = tmp_ret;
               LOG_WARN("iterate ai column check result failed", K(ret));

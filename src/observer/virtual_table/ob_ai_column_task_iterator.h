@@ -21,15 +21,13 @@
 
 namespace oceanbase
 {
-namespace query
-{
-class ObSessionInnerSql;
-}
 namespace observer
 {
 // __all_ai_column_task derives its rows from the per-row hidden state/request
-// columns of user tables that own AI columns, so it must read through the
-// querying session's inner connection to keep in-transaction visibility.
+// columns of user tables that own AI columns.  The rows are read on the querying
+// session's own inner SQL connection so that a task written by an uncommitted
+// transaction is visible inside that same transaction; the hidden columns are
+// addressed through the opt_param('hidden_column_visible','true') channel.
 class ObAIColumnTaskIterator : public common::ObVirtualTableScannerIterator
 {
 public:
@@ -48,10 +46,8 @@ private:
     AiColMeta() : table_id_(0), column_id_(0), state_column_id_(0), request_column_id_(0) {}
   };
   int fill_scanner_();
-  int load_ai_columns_(query::ObSessionInnerSql &inner_sql,
-                       common::ObIArray<AiColMeta> &ai_cols);
-  int fill_tasks_for_column_(query::ObSessionInnerSql &inner_sql,
-                             const AiColMeta &ai_col);
+  int load_ai_columns_(common::ObIArray<AiColMeta> &ai_cols);
+  int fill_tasks_for_column_(const AiColMeta &ai_col);
 
 private:
   DISALLOW_COPY_AND_ASSIGN(ObAIColumnTaskIterator);

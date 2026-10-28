@@ -18,8 +18,9 @@
 
 #include "observer/virtual_table/ob_ai_column_task_iterator.h"
 
-#include "query/session/ob_session_inner_sql.h"
 #include "sql/session/ob_sql_session_info.h"
+#include "query/session/ob_session_inner_sql.h"
+#include "common/mysqlclient/ob_mysql_proxy.h"
 #include "share/schema/ob_schema_struct.h"
 #include "common/mysqlclient/ob_mysql_result.h"
 
@@ -78,6 +79,34 @@ static int64_t ai_state_to_int(const ObString &state)
   return val;
 }
 
+// A session-bound nested read runs begin_stmt/end_stmt on the querying session as
+// if it were a top-level statement, so its end_stmt would reset the outer
+// statement's nested session counter and make the outer teardown fail.  Hide the
+// active outer statement from the nested read (same technique as ObDynamicSampling)
+// and restore it once the nested read has finished.
+class AIColumnNestedReadGuard
+{
+public:
+  explicit AIColumnNestedReadGuard(sql::ObSQLSessionInfo *session)
+    : session_(session), saved_nested_(-1)
+  {
+    if (OB_NOT_NULL(session_)) {
+      saved_nested_ = session_->get_nested_count();
+      session_->set_nested_count(-1);
+    }
+  }
+  ~AIColumnNestedReadGuard()
+  {
+    if (OB_NOT_NULL(session_)) {
+      session_->set_nested_count(saved_nested_);
+    }
+  }
+private:
+  sql::ObSQLSessionInfo *session_;
+  int64_t saved_nested_;
+  DISALLOW_COPY_AND_ASSIGN(AIColumnNestedReadGuard);
+};
+
 // request column format: "<rid>|<retry>|<eligible_us>"
 static void parse_request_column(const ObString &req, int64_t &rid, int64_t &retry, int64_t &eligible_us)
 {
@@ -134,24 +163,19 @@ int ObAIColumnTaskIterator::fill_scanner_()
     ret = OB_NOT_INIT;
     LOG_WARN("ai column task iterator not inited", K(ret));
   } else {
-    query::ObSessionInnerSql inner_sql(static_cast<void *>(session_));
     ObSEArray<AiColMeta, 8> ai_cols;
-    // the per-row state/request columns are schema-hidden; resolve them through
-    // the inner-session path like the background worker does
-    const bool was_inner = session_->is_inner();
-    if (!was_inner) {
-      session_->set_inner_session();
-    }
-    if (OB_FAIL(load_ai_columns_(inner_sql, ai_cols))) {
+    // read on the querying session's inner connection so that tasks created by an
+    // uncommitted transaction are visible to that same transaction
+    if (OB_FAIL(load_ai_columns_(ai_cols))) {
       LOG_WARN("load ai columns failed", K(ret));
     }
     for (int64_t i = 0; OB_SUCC(ret) && i < ai_cols.count(); ++i) {
-      if (OB_FAIL(fill_tasks_for_column_(inner_sql, ai_cols.at(i)))) {
-        LOG_WARN("fill tasks for ai column failed", K(ret), K(i));
+      int tmp_ret = fill_tasks_for_column_(ai_cols.at(i));
+      if (OB_SUCCESS != tmp_ret) {
+        // one unreadable table must not hide the tasks of every other ai column
+        LOG_WARN("fill tasks for ai column failed", K(tmp_ret),
+                 "table_id", ai_cols.at(i).table_id_);
       }
-    }
-    if (!was_inner) {
-      session_->set_user_session();
     }
   }
   if (OB_SUCC(ret)) {
@@ -161,10 +185,11 @@ int ObAIColumnTaskIterator::fill_scanner_()
   return ret;
 }
 
-int ObAIColumnTaskIterator::load_ai_columns_(query::ObSessionInnerSql &inner_sql,
-                                             ObIArray<AiColMeta> &ai_cols)
+int ObAIColumnTaskIterator::load_ai_columns_(ObIArray<AiColMeta> &ai_cols)
 {
   int ret = OB_SUCCESS;
+  query::ObSessionInnerSql inner_sql(session_);
+  AIColumnNestedReadGuard nested_guard(session_);
   ObSqlString sql;
   ObISQLClient::ReadResult read_res;
   sqlclient::ObMySQLResult *result = NULL;
@@ -172,7 +197,7 @@ int ObAIColumnTaskIterator::load_ai_columns_(query::ObSessionInnerSql &inner_sql
                          "state_column_id, request_column_id FROM oceanbase.__all_ai_column"))) {
     LOG_WARN("build ai column meta sql failed", K(ret));
   } else if (OB_FAIL(inner_sql.execute_read(sql, read_res))) {
-    LOG_WARN("read __all_ai_column failed", K(ret), K(sql));
+    LOG_WARN("read __all_ai_column failed", K(ret));
   } else if (OB_ISNULL(result = read_res.get_result())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("empty result for __all_ai_column", K(ret));
@@ -211,10 +236,12 @@ int ObAIColumnTaskIterator::load_ai_columns_(query::ObSessionInnerSql &inner_sql
   return ret;
 }
 
-int ObAIColumnTaskIterator::fill_tasks_for_column_(query::ObSessionInnerSql &inner_sql,
-                                                   const AiColMeta &ai_col)
+int ObAIColumnTaskIterator::fill_tasks_for_column_(const AiColMeta &ai_col)
 {
   int ret = OB_SUCCESS;
+  // declared before read_res so that the connection outlives the result it owns
+  query::ObSessionInnerSql inner_sql(session_);
+  AIColumnNestedReadGuard nested_guard(session_);
   const ObTableSchema *table_schema = NULL;
   const ObDatabaseSchema *db_schema = NULL;
   ObSEArray<uint64_t, 4> pk_ids;
@@ -290,11 +317,23 @@ int ObAIColumnTaskIterator::fill_tasks_for_column_(query::ObSessionInnerSql &inn
       }
       break;
     }
+    // a retried or not-yet-scheduled row has no request token yet
+    ObObj state_obj;
+    ObObj req_obj;
     ObString state;
     ObString req;
-    if (OB_FAIL(result->get_varchar("ai_state", state))
-        || OB_FAIL(result->get_varchar("ai_req", req))) {
+    if (OB_FAIL(result->get_obj("ai_state", state_obj))
+        || OB_FAIL(result->get_obj("ai_req", req_obj))) {
       LOG_WARN("get ai hidden column values failed", K(ret));
+    } else {
+      if (!state_obj.is_null()) {
+        state = state_obj.get_varchar();
+      }
+      if (!req_obj.is_null()) {
+        req = req_obj.get_varchar();
+      }
+    }
+    if (OB_FAIL(ret)) {
     } else {
       int64_t rid = 0;
       int64_t retry = 0;

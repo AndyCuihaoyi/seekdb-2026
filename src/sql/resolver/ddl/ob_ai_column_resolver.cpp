@@ -210,6 +210,10 @@ static int extract_second_arg_text(const ObString &raw, ObString &out)
         break;
       }
       --paren_depth;
+      if (0 == paren_depth && end < 0) {
+        // this paren closes the ai function call itself, it is not part of the argument
+        end = i;
+      }
     } else if (c == ',' && 1 == paren_depth) {
       ++top_commas;
       if (1 == top_commas) {

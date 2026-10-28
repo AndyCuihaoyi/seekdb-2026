@@ -173,15 +173,32 @@ static int append_obj_literal(ObIAllocator &allocator, ObSqlString &sql, const O
     if (OB_FAIL(append_str_literal(allocator, sql, obj.get_string()))) {
       LOG_WARN("append string literal failed", K(ret));
     }
-  } else {
-    char buf[256] = {0};
-    const int64_t pos = obj.to_string(buf, sizeof(buf));
+  } else if (ob_is_int_tc(obj.get_type())) {
+    if (OB_FAIL(sql.append_fmt("%ld", obj.get_int()))) {
+      LOG_WARN("append integer literal failed", K(ret));
+    }
+  } else if (ob_is_uint_tc(obj.get_type())) {
+    if (OB_FAIL(sql.append_fmt("%lu", obj.get_uint64()))) {
+      LOG_WARN("append unsigned literal failed", K(ret));
+    }
+  } else if (ob_is_float_tc(obj.get_type()) || ob_is_double_tc(obj.get_type())) {
+    if (OB_FAIL(sql.append_fmt("%g", obj.get_double()))) {
+      LOG_WARN("append double literal failed", K(ret));
+    }
+  } else if (ob_is_number_tc(obj.get_type())) {
+    char buf[128] = {0};
+    const number::ObNumber &num = obj.get_number();
+    const int64_t pos = num.to_string(buf, sizeof(buf));
     if (pos <= 0 || pos >= static_cast<int64_t>(sizeof(buf))) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("obj to string for rowkey failed", K(ret));
-    } else if (OB_FAIL(sql.append_fmt("%.*s", static_cast<int32_t>(pos), buf))) {
+      ret = OB_SIZE_OVERFLOW;
+      LOG_WARN("number to string failed", K(ret), K(pos));
+    } else if (OB_FAIL(sql.append_fmt("%.*s", static_cast<int>(pos), buf))) {
       LOG_WARN("append number literal failed", K(ret));
     }
+  } else {
+    // ObObj::to_string prints the JSON form {"BIGINT":1}, which is not a SQL literal
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "AI COLUMN on rowkey of this data type is");
   }
   return ret;
 }
@@ -264,8 +281,12 @@ int ObAIColumnWorker::process()
     for (int64_t j = 0; !processed && j < i; ++j) {
       processed = (metas.at(j).table_id_ == metas.at(i).table_id_);
     }
-    if (OB_SUCC(ret) && !processed && OB_FAIL(process_table(guard, metas.at(i).table_id_, metas))) {
-      LOG_WARN("process ai column table failed", K(ret), K(metas.at(i).table_id_));
+    if (OB_SUCC(ret) && !processed) {
+      int tmp_ret = process_table(guard, metas.at(i).table_id_, metas);
+      if (OB_SUCCESS != tmp_ret) {
+        // a stale ai column entry must not block every other table's tasks
+        LOG_WARN("process ai column table failed", K(tmp_ret), K(metas.at(i).table_id_));
+      }
     }
   }
   return ret;
@@ -398,7 +419,7 @@ int ObAIColumnWorker::process_table(share::schema::ObSchemaGetterGuard &guard,
       }
       if (OB_FAIL(ret)) {
       } else if (OB_FAIL(sql.assign_fmt(
-          "SELECT /*+OPT_PARAM('hidden_column_visible','true')*/ %.*s `%.*s` AS ai_state,"
+          "SELECT %.*s `%.*s` AS ai_state,"
           " `%.*s` AS ai_request FROM `%.*s`.`%.*s`"
           " WHERE `%.*s` IN ('PENDING','RETRY_WAIT') LIMIT %ld",
           static_cast<int32_t>(select_list.length()), select_list.ptr(),
@@ -428,9 +449,21 @@ int ObAIColumnWorker::process_table(share::schema::ObSchemaGetterGuard &guard,
                 ObString state;
                 ObString request;
                 ObString rowkey_pred;
-                if (OB_FAIL(result->get_varchar("ai_state", state))
-                    || OB_FAIL(result->get_varchar("ai_request", request))) {
+                ObObj state_obj;
+                ObObj request_obj;
+                // a row that was never claimed yet carries no request token
+                if (OB_FAIL(result->get_obj("ai_state", state_obj))
+                    || OB_FAIL(result->get_obj("ai_request", request_obj))) {
                   LOG_WARN("get ai state row failed", K(ret));
+                } else {
+                  if (!state_obj.is_null()) {
+                    state = state_obj.get_varchar();
+                  }
+                  if (!request_obj.is_null()) {
+                    request = request_obj.get_varchar();
+                  }
+                }
+                if (OB_FAIL(ret)) {
                 } else if (OB_FAIL(build_rowkey_pred(*table_schema, *result, rowkey_pred))) {
                   LOG_WARN("build rowkey predicate failed", K(ret));
                 } else if (OB_FAIL(process_row(*table_schema, db_name, table_name, meta,
@@ -480,7 +513,13 @@ int ObAIColumnWorker::build_rowkey_pred(const share::schema::ObTableSchema &tabl
     }
   }
   if (OB_SUCC(ret)) {
-    rowkey_pred = pred.string();
+    // pred's buffer is a stack temporary, the predicate has to outlive this call
+    ObString copied;
+    if (OB_FAIL(deep_copy_str(allocator_, pred.string(), copied))) {
+      LOG_WARN("copy rowkey predicate failed", K(ret));
+    } else {
+      rowkey_pred = copied;
+    }
   }
   return ret;
 }
@@ -513,7 +552,7 @@ int ObAIColumnWorker::process_row(const share::schema::ObTableSchema &table_sche
     int64_t affected = 0;
     if (OB_FAIL(claimed_request.assign_fmt("%ld|%ld|0", rid_new, retry))) {
     } else if (OB_FAIL(claim_sql.assign_fmt(
-        "UPDATE /*+OPT_PARAM('hidden_column_visible','true')*/ `%.*s`.`%.*s` SET"
+        "UPDATE `%.*s`.`%.*s` SET"
         " `%.*s` = 'RUNNING', `%.*s` = '%.*s' WHERE %.*s AND `%.*s` IN ('PENDING','RETRY_WAIT')",
         static_cast<int32_t>(db_name.length()), db_name.ptr(),
         static_cast<int32_t>(table_name.length()), table_name.ptr(),
@@ -529,21 +568,25 @@ int ObAIColumnWorker::process_row(const share::schema::ObTableSchema &table_sche
       // lost the race or state changed concurrently, skip this row
     } else {
       bool is_null_content = false;
+      bool call_ok = false;
       ObString content;
-      if (OB_FAIL(eval_user_expr(db_name, table_name, meta, rowkey_pred, is_null_content, content))) {
-        LOG_WARN("eval ai column user expr failed", K(ret));
+      ObString result;
+      int eval_ret = eval_user_expr(db_name, table_name, meta, rowkey_pred,
+                                    is_null_content, content);
+      if (OB_SUCCESS != eval_ret) {
+        // a row stuck in RUNNING would block every later strict read, fold the
+        // internal failure into the retry/failure path instead of propagating it
+        LOG_WARN("eval ai column user expr failed", K(eval_ret));
       } else {
-        ObString result;
-        const bool call_ok = is_null_content
-            || (OB_SUCCESS == call_ai(meta, content, result));
-        if (OB_FAIL(publish_result(db_name, table_name, meta, state_col, request_col,
-                                   rowkey_pred, claimed_request.string(), retry,
-                                   call_ok, result))) {
-          LOG_WARN("publish ai result failed", K(ret));
-        }
-        // the AI call error has been folded into RETRY_WAIT/FAILED, do not propagate
-        ret = OB_SUCCESS;
+        call_ok = is_null_content || (OB_SUCCESS == call_ai(meta, content, result));
       }
+      if (OB_FAIL(publish_result(db_name, table_name, meta, state_col, request_col,
+                                 rowkey_pred, claimed_request.string(), retry,
+                                 call_ok, result))) {
+        LOG_WARN("publish ai result failed", K(ret));
+      }
+      // the AI call error has been folded into RETRY_WAIT/FAILED, do not propagate
+      ret = OB_SUCCESS;
     }
   }
   return ret;
@@ -683,7 +726,7 @@ int ObAIColumnWorker::publish_result(const ObString &db_name,
   ObSqlString sql;
   if (call_ok) {
     if (OB_FAIL(sql.assign_fmt(
-        "UPDATE /*+OPT_PARAM('hidden_column_visible','true')*/ `%.*s`.`%.*s` SET `%.*s` = ",
+        "UPDATE `%.*s`.`%.*s` SET `%.*s` = ",
         static_cast<int32_t>(db_name.length()), db_name.ptr(),
         static_cast<int32_t>(table_name.length()), table_name.ptr(),
         static_cast<int32_t>(meta.column_name_.length()), meta.column_name_.ptr()))) {
@@ -699,7 +742,7 @@ int ObAIColumnWorker::publish_result(const ObString &db_name,
     const int64_t new_retry = retry + 1;
     if (new_retry > meta.max_retries_) {
       if (OB_FAIL(sql.assign_fmt(
-          "UPDATE /*+OPT_PARAM('hidden_column_visible','true')*/ `%.*s`.`%.*s` SET"
+          "UPDATE `%.*s`.`%.*s` SET"
           " `%.*s` = 'FAILED' WHERE %.*s AND `%.*s` = '%.*s'",
           static_cast<int32_t>(db_name.length()), db_name.ptr(),
           static_cast<int32_t>(table_name.length()), table_name.ptr(),
@@ -722,7 +765,7 @@ int ObAIColumnWorker::publish_result(const ObString &db_name,
       if (OB_FAIL(ret)) {
         LOG_WARN("build new request failed", K(ret));
       } else if (OB_FAIL(sql.assign_fmt(
-          "UPDATE /*+OPT_PARAM('hidden_column_visible','true')*/ `%.*s`.`%.*s` SET"
+          "UPDATE `%.*s`.`%.*s` SET"
           " `%.*s` = 'RETRY_WAIT', `%.*s` = '%.*s' WHERE %.*s AND `%.*s` = '%.*s'",
           static_cast<int32_t>(db_name.length()), db_name.ptr(),
           static_cast<int32_t>(table_name.length()), table_name.ptr(),

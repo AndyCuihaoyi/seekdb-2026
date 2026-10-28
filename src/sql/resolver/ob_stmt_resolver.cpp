@@ -26,6 +26,22 @@ using namespace share::schema;
 namespace sql
 {
 
+// opt_param('hidden_column_visible','true') is the supported channel for internal SQL that
+// must address hidden columns without running on an inner session, e.g. the AI column task
+// view which has to read the querying transaction's own uncommitted rows.
+static bool hint_enables_hidden_column_visible(const ObResolverParams &params)
+{
+  bool enabled = false;
+  bool has_param = false;
+  if (OB_NOT_NULL(params.query_ctx_)
+      && OB_SUCCESS == params.query_ctx_->get_query_hint().get_global_hint().opt_params_.
+                       has_enable_opt_param(ObOptParamHint::OptParamType::HIDDEN_COLUMN_VISIBLE,
+                                            has_param)) {
+    enabled = has_param;
+  }
+  return enabled;
+}
+
 uint64_t ObStmtResolver::generate_table_id()
 {
   if (NULL != params_.query_ctx_) {
@@ -215,7 +231,8 @@ int ObStmtResolver::get_column_schema(const uint64_t table_id,
     ret = OB_NOT_INIT;
     SQL_RESV_LOG(WARN, "not init", K(ret), KP(schema_checker_), KP(session_info_));
   } else {
-    const bool hidden = get_hidden || session_info_->is_inner();
+    const bool hidden = get_hidden || session_info_->is_inner()
+                        || hint_enables_hidden_column_visible(params_);
 
     // Generated columns added by function-based indexes are hidden but may
     // still be selected through this path.
