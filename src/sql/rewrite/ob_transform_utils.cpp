@@ -12798,15 +12798,110 @@ int ObTransformUtils::check_table_with_fts_or_multivalue_recursively(TableItem *
   return ret;
 }
 
-// if sql is only one row, is_full_group_by skipped checking orderby in resolver. 
+// if sql is only one row, is_full_group_by skipped checking orderby in resolver.
 bool ObTransformUtils::is_full_group_by(ObSelectStmt& stmt, ObSQLMode mode)
 {
   return !stmt.has_order_by() && is_only_full_group_by_on(mode);
 }
 
+int ObTransformUtils::check_need_calc_match_score(ObExecContext *exec_ctx,
+                                                  const ObDMLStmt *stmt,
+                                                  ObRawExpr *match_expr,
+                                                  bool &need_calc,
+                                                  ObIArray<ObExprConstraint> &constraints)
+{
+  int ret = OB_SUCCESS;
+  need_calc = false;
+  if (OB_ISNULL(stmt) || OB_ISNULL(match_expr)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_ISNULL(exec_ctx) || !stmt->is_select_stmt()) {
+    // conservative: unknown context or non-select stmt, always calc
+    need_calc = true;
+  } else {
+    const ObSelectStmt *select_stmt = static_cast<const ObSelectStmt *>(stmt);
+    for (int64_t i = 0; OB_SUCC(ret) && !need_calc && i < select_stmt->get_condition_exprs().count(); ++i) {
+      if (OB_FAIL(inner_check_need_calc_match_score(exec_ctx,
+                                                    select_stmt->get_condition_exprs().at(i),
+                                                    match_expr,
+                                                    need_calc,
+                                                    constraints))) {
+        LOG_WARN("failed to check need calc match score", K(ret));
+      }
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && !need_calc && i < select_stmt->get_select_items().count(); ++i) {
+      if (OB_ISNULL(select_stmt->get_select_items().at(i).expr_)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(inner_check_need_calc_match_score(exec_ctx,
+                                                           select_stmt->get_select_items().at(i).expr_,
+                                                           match_expr,
+                                                           need_calc,
+                                                           constraints))) {
+        LOG_WARN("failed to check need calc match score", K(ret));
+      }
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && !need_calc && i < select_stmt->get_order_items().count(); ++i) {
+      if (OB_ISNULL(select_stmt->get_order_items().at(i).expr_)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(inner_check_need_calc_match_score(exec_ctx,
+                                                           select_stmt->get_order_items().at(i).expr_,
+                                                           match_expr,
+                                                           need_calc,
+                                                           constraints))) {
+        LOG_WARN("failed to check need calc match score", K(ret));
+      }
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && !need_calc && i < select_stmt->get_having_exprs().count(); ++i) {
+      if (OB_FAIL(inner_check_need_calc_match_score(exec_ctx,
+                                                    select_stmt->get_having_exprs().at(i),
+                                                    match_expr,
+                                                    need_calc,
+                                                    constraints))) {
+        LOG_WARN("failed to check need calc match score", K(ret));
+      }
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && !need_calc && i < select_stmt->get_group_exprs().count(); ++i) {
+      if (OB_FAIL(inner_check_need_calc_match_score(exec_ctx,
+                                                    select_stmt->get_group_exprs().at(i),
+                                                    match_expr,
+                                                    need_calc,
+                                                    constraints))) {
+        LOG_WARN("failed to check need calc match score", K(ret));
+      }
+    }
+    if (OB_SUCC(ret) && !need_calc && OB_NOT_NULL(select_stmt->get_limit_expr())) {
+      if (OB_FAIL(inner_check_need_calc_match_score(exec_ctx,
+                                                    select_stmt->get_limit_expr(),
+                                                    match_expr,
+                                                    need_calc,
+                                                    constraints))) {
+        LOG_WARN("failed to check need calc match score", K(ret));
+      }
+    }
+    if (OB_SUCC(ret) && !need_calc && OB_NOT_NULL(select_stmt->get_offset_expr())) {
+      if (OB_FAIL(inner_check_need_calc_match_score(exec_ctx,
+                                                    select_stmt->get_offset_expr(),
+                                                    match_expr,
+                                                    need_calc,
+                                                    constraints))) {
+        LOG_WARN("failed to check need calc match score", K(ret));
+      }
+    }
+    if (OB_SUCC(ret) && !need_calc && OB_NOT_NULL(select_stmt->get_limit_percent_expr())) {
+      if (OB_FAIL(inner_check_need_calc_match_score(exec_ctx,
+                                                    select_stmt->get_limit_percent_expr(),
+                                                    match_expr,
+                                                    need_calc,
+                                                    constraints))) {
+        LOG_WARN("failed to check need calc match score", K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
 int ObTransformUtils::inner_check_need_calc_match_score(ObExecContext *exec_ctx,
-                                                        ObRawExpr* expr, 
-                                                        ObRawExpr* match_expr, 
+                                                        ObRawExpr* expr,
+                                                        ObRawExpr* match_expr,
                                                         bool &need_calc,
                                                         ObIArray<ObExprConstraint> &constraints)
 {

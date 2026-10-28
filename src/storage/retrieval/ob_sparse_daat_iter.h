@@ -132,6 +132,8 @@ protected:
   // register-based merge state; used when use_fast_merge_ is set, otherwise merge_heap_
   ObSRDimState *dim_states_;
   bool use_fast_merge_;
+  // BOOL(relevance) filter with relevance skipped by optimizer: always true
+  bool relevance_keep_all_;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObSRDaaTIterImpl);
 };

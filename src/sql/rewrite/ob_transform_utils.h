@@ -2000,10 +2000,15 @@ private:
                             ObIArray<ObRawExpr*> &view_exprs);
 
 public:
-  static int extract_shared_exprs(ObDMLStmt *parent, 
+  static int extract_shared_exprs(ObDMLStmt *parent,
                                   ObSelectStmt *view_stmt,
                                   ObIArray<ObRawExpr *> &common_exprs,
                                   const ObIArray<ObRawExpr *> *extra_view_exprs = NULL);
+  static int check_need_calc_match_score(ObExecContext *exec_ctx,
+                                         const ObDMLStmt *stmt,
+                                         ObRawExpr *match_expr,
+                                         bool &need_calc,
+                                         ObIArray<ObExprConstraint> &constraints);
 private:
   static int is_scalar_expr(ObRawExpr* expr, bool &is_scalar);
 
@@ -2041,8 +2046,8 @@ private:
                                        ObIArray<TableItem*> &right_tables,
                                        ObIArray<ObSEArray<ObRawExpr*, 4>> &new_outer_conds);
   static int inner_check_need_calc_match_score(ObExecContext *exec_ctx,
-                                              ObRawExpr* expr, 
-                                              ObRawExpr* match_expr, 
+                                              ObRawExpr* expr,
+                                              ObRawExpr* match_expr,
                                               bool &need_calc,
                                               ObIArray<ObExprConstraint> &constraints);
   static int check_stmt_can_trans_as_exists(ObSelectStmt *stmt,

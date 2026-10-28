@@ -45,7 +45,8 @@ struct ObTextRetrievalScanIterParam
       relevance_expr_(nullptr),
       inv_scan_doc_length_col_(nullptr),
       inv_scan_domain_id_col_(nullptr),
-      inv_idx_agg_cache_mode_(false)
+      inv_idx_agg_cache_mode_(false),
+      skip_relevance_eval_(false)
   {}
 
   ObArenaAllocator *allocator_;
@@ -60,6 +61,7 @@ struct ObTextRetrievalScanIterParam
   sql::ObExpr *inv_scan_doc_length_col_;
   sql::ObExpr *inv_scan_domain_id_col_;
   bool inv_idx_agg_cache_mode_;
+  bool skip_relevance_eval_; // score provably unobserved: skip BM25 expr evaluation
 };
 
 class ObTextRetrievalTokenIter final : public ObISparseRetrievalDimIter
@@ -91,7 +93,7 @@ private:
   int batch_eval_relevance_expr(const int64_t count);
   int estimate_token_doc_cnt();
   inline bool need_inv_idx_agg() { return inv_idx_agg_iter_ != nullptr; }
-  inline bool need_calc_relevance() { return inv_idx_agg_iter_ != nullptr; }
+  inline bool need_calc_relevance() { return !skip_relevance_eval_ && inv_idx_agg_iter_ != nullptr; }
 public:
   static const int64_t INV_IDX_ROWKEY_COL_CNT = 2;
 private:
@@ -115,6 +117,7 @@ private:
   ObDocIdExt advance_doc_id_;
   bool token_doc_cnt_calculated_;
   bool inv_idx_agg_cache_mode_;
+  bool skip_relevance_eval_;
   bool is_inited_;
   DISALLOW_COPY_AND_ASSIGN(ObTextRetrievalTokenIter);
 };
@@ -156,6 +159,7 @@ private:
   ObFixedArray<double, ObIAllocator> relevance_; // when ~ObFixedArray(), wikll destory itself
   ObFixedArray<ObDocIdExt, ObIAllocator> doc_id_;
   common::ObDatumCmpFuncType cmp_func_;
+  bool skip_relevance_eval_;
   bool is_inited_;
   DISALLOW_COPY_AND_ASSIGN(ObTextRetrievalDaaTTokenIter);
 };

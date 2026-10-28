@@ -12003,6 +12003,77 @@ int ObLogPlan::construct_startup_filter_for_limit(ObRawExpr *limit_expr, ObLogic
   return ret;
 }
 
+// A comparison such as `MATCH(...) > 0` in a value-consuming clause is still evaluated at
+// runtime, so the BM25 score can only be elided when no such clause refers to the match
+// expression at all.
+static int check_match_expr_observed(const ObRawExpr *expr,
+                                     const ObRawExpr *match_expr,
+                                     bool &observed)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(expr) || OB_ISNULL(match_expr)) {
+    // a null expression cannot observe the score
+  } else if (expr == match_expr) {
+    observed = true;
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && !observed && i < expr->get_param_count(); ++i) {
+      if (OB_FAIL(SMART_CALL(check_match_expr_observed(expr->get_param_expr(i),
+                                                       match_expr,
+                                                       observed)))) {
+        LOG_WARN("failed to walk expr tree", K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
+static int check_score_observed_in_stmt(const ObSelectStmt &stmt,
+                                        const ObRawExpr *match_expr,
+                                        const ObRawExpr *match_pred,
+                                        bool &observed)
+{
+  int ret = OB_SUCCESS;
+  observed = false;
+  for (int64_t i = 0; OB_SUCC(ret) && !observed && i < stmt.get_condition_exprs().count(); ++i) {
+    const ObRawExpr *cond = stmt.get_condition_exprs().at(i);
+    if (cond == match_pred) {
+      // the pushed-down match filter is the only condition allowed to read the score,
+      // and only as a boolean test which BM25 makes always true
+    } else if (OB_FAIL(check_match_expr_observed(cond, match_expr, observed))) {
+      LOG_WARN("failed to check condition expr", K(ret));
+    }
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && !observed && i < stmt.get_select_items().count(); ++i) {
+    if (OB_FAIL(check_match_expr_observed(stmt.get_select_items().at(i).expr_, match_expr, observed))) {
+      LOG_WARN("failed to check select item", K(ret));
+    }
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && !observed && i < stmt.get_order_items().count(); ++i) {
+    if (OB_FAIL(check_match_expr_observed(stmt.get_order_items().at(i).expr_, match_expr, observed))) {
+      LOG_WARN("failed to check order item", K(ret));
+    }
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && !observed && i < stmt.get_having_exprs().count(); ++i) {
+    if (OB_FAIL(check_match_expr_observed(stmt.get_having_exprs().at(i), match_expr, observed))) {
+      LOG_WARN("failed to check having expr", K(ret));
+    }
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && !observed && i < stmt.get_group_exprs().count(); ++i) {
+    if (OB_FAIL(check_match_expr_observed(stmt.get_group_exprs().at(i), match_expr, observed))) {
+      LOG_WARN("failed to check group expr", K(ret));
+    }
+  }
+  const ObRawExpr *extras[] = {stmt.get_limit_expr(),
+                               stmt.get_offset_expr(),
+                               stmt.get_limit_percent_expr()};
+  for (int64_t i = 0; OB_SUCC(ret) && !observed && i < 3; ++i) {
+    if (OB_FAIL(check_match_expr_observed(extras[i], match_expr, observed))) {
+      LOG_WARN("failed to check limit expr", K(ret));
+    }
+  }
+  return ret;
+}
+
 int ObLogPlan::prepare_text_retrieval_scan(const ObIArray<ObRawExpr *> &scan_match_exprs,
                                            const ObIArray<ObRawExpr *> &scan_match_filters,
                                            const ObIArray<ObRawExpr *> &all_match_filters,
@@ -12055,6 +12126,40 @@ int ObLogPlan::prepare_text_retrieval_scan(const ObIArray<ObRawExpr *> &scan_mat
     ObTextRetrievalInfo &tr_info = table_scan->get_text_retrieval_info();
     tr_info.match_expr_ = match_against;
     tr_info.pushdown_match_filter_ = match_pred;
+    // In natural language mode BM25 score is strictly positive, so a pushed-down
+    // filter that only tests the score (bare MATCH or BOOL(MATCH)) is always true;
+    // if the score is provably unobserved in the statement, the relevance evaluation
+    // can be skipped at scan time. The plan keeps the retrieval auxiliary structures,
+    // only the per-row score computation is elided.
+    if (NATURAL_LANGUAGE_MODE == match_against->get_mode_flag()) {
+      bool need_calc_relevance = true;
+      ObSEArray<ObExprConstraint, 2> constraints;
+      if (OB_FAIL(ObTransformUtils::check_need_calc_match_score(get_optimizer_context().get_exec_ctx(),
+                                                                get_stmt(),
+                                                                match_against,
+                                                                need_calc_relevance,
+                                                                constraints))) {
+        LOG_WARN("failed to check need calc relevance", K(ret));
+      } else if (!need_calc_relevance && match_pred != match_against &&
+                 !(T_OP_BOOL == match_pred->get_expr_type() && 1 == match_pred->get_param_count() &&
+                   match_pred->get_param_expr(0) == match_against)) {
+        // filter has other semantics (e.g. MATCH(...) > 0 mixed with other conditions):
+        // keep calculating relevance conservatively
+        need_calc_relevance = true;
+      } else if (!need_calc_relevance) {
+        bool observed = true;
+        if (OB_FAIL(check_score_observed_in_stmt(*static_cast<const ObSelectStmt *>(get_stmt()),
+                                                 match_against,
+                                                 match_pred,
+                                                 observed))) {
+          LOG_WARN("failed to check score observed in stmt", K(ret));
+        } else if (observed) {
+          need_calc_relevance = true;
+        } else {
+          tr_info.skip_relevance_eval_ = true;
+        }
+      }
+    }
     // The mapping table is absent when the data-table rowkey is used as the document ID.
     table_scan->set_doc_id_index_table_id(tr_info.doc_id_idx_tid_);
     if (table_scan->is_vec_adaptive_scan() || table_scan->is_vec_idx_scan_post_filter()) {
@@ -12200,7 +12305,6 @@ int ObLogPlan::prepare_text_retrieval_info(const uint64_t ref_table_id,
   uint64_t inv_idx_tid = OB_INVALID_ID;
   ObSEArray<ObAuxTableMetaInfo, 4> index_infos;
   bool need_calc_relevance = true;
-  ObSEArray<ObExprConstraint, 2> constraints;
   uint64_t docid_col_id = OB_INVALID_ID;
   if (OB_ISNULL(match_against) || OB_ISNULL(get_stmt()) || OB_ISNULL(get_optimizer_context().get_query_ctx())) {
     ret = OB_INVALID_ARGUMENT;
@@ -12267,18 +12371,6 @@ int ObLogPlan::prepare_text_retrieval_info(const uint64_t ref_table_id,
     }
   }
   if (OB_SUCC(ret)) {
-    /*
-    if (OB_FAIL(ObTransformUtils::check_need_calc_match_score(get_optimizer_context().get_exec_ctx(),
-                                                              get_stmt(),
-                                                              match_against,
-                                                              need_calc_relevance,
-                                                              constraints))) {
-      LOG_WARN("failed to check need calc relevance", K(ret));
-    } else if (!need_calc_relevance &&
-               OB_FAIL(append_array_no_dup(get_optimizer_context().get_query_ctx()->all_expr_constraints_, constraints))) {
-      LOG_WARN("failed to append array no dup", K(ret));
-    }
-    */
     tr_info.match_expr_ = match_against;
     tr_info.inv_idx_tid_ = inv_idx_tid;
     tr_info.fwd_idx_tid_ = fwd_idx_tid;
