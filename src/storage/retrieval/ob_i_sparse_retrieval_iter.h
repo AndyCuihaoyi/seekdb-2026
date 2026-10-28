@@ -112,10 +112,12 @@ struct ObSparseRetrievalMergeParam
       filter_expr_(nullptr),
       topk_limit_(0),
       field_boost_(1.0),
+      skip_relevance_eval_(false),
       max_batch_size_(1)
   {}
   ~ObSparseRetrievalMergeParam() {}
   bool need_project_relevance() const { return relevance_proj_expr_ != nullptr; }
+  bool need_calc_relevance() const { return !skip_relevance_eval_ && relevance_expr_ != nullptr; }
   bool need_filter() const { return filter_expr_ != nullptr; }
   bool need_pushdown_topk() const { return topk_limit_ > 0; }
   TO_STRING_KV(KPC_(dim_weights), KPC(limit_param_), KP_(eval_ctx),
@@ -130,6 +132,7 @@ struct ObSparseRetrievalMergeParam
   sql::ObExpr *filter_expr_; // filter expr on score
   int64_t topk_limit_;
   double field_boost_;
+  bool skip_relevance_eval_; // score provably unobserved: never evaluate the BM25 expr
   int64_t max_batch_size_;
 };
 

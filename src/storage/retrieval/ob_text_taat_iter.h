@@ -57,7 +57,8 @@ public:
       query_tokens_(nullptr),
       bm25_param_estimator_(),
       mode_flag_(sql::ObMatchAgainstMode::NATURAL_LANGUAGE_MODE),
-      function_lookup_mode_(false) {}
+      function_lookup_mode_(false),
+      estimated_total_doc_cnt_(0) {}
   virtual ~ObTextTaaTIter() {}
 
   int init(const ObTextTaaTParam &param);
@@ -72,6 +73,7 @@ protected:
   ObBM25ParamEstimator bm25_param_estimator_;
   sql::ObMatchAgainstMode mode_flag_;
   bool function_lookup_mode_;
+  int64_t estimated_total_doc_cnt_;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObTextTaaTIter);
 };

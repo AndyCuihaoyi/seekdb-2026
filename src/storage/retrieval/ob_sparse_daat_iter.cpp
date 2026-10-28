@@ -109,7 +109,8 @@ ObSRDaaTIterImpl::ObSRDaaTIterImpl()
     filter_skip_(nullptr),
     set_datum_func_(nullptr),
     dim_states_(nullptr),
-    use_fast_merge_(false)
+    use_fast_merge_(false),
+    relevance_keep_all_(false)
 {
 }
 
@@ -184,6 +185,18 @@ int ObSRDaaTIterImpl::init(
                                  && T_OP_BOOL == filter_expr->type_
                                  && 1 == filter_expr->arg_cnt_
                                  && filter_expr->args_[0] == relevance_proj_expr;
+        // relevance skipped by optimizer (score provably unobserved): BM25 score is
+        // strictly positive with positive field boost / dim weights (validated by the
+        // caller), so the BOOL(relevance) filter is always true. For a bare
+        // WHERE MATCH(...) predicate the filter shares the same rt expr as the
+        // projection column (cg caches rt exprs by raw expr), so it is also
+        // always-true and evaluated as keep-all.
+        relevance_keep_all_ = !iter_param_->need_calc_relevance()
+                              && OB_NOT_NULL(filter_expr) && OB_NOT_NULL(relevance_proj_expr)
+                              && (filter_expr == relevance_proj_expr
+                                  || (T_OP_BOOL == filter_expr->type_
+                                      && 1 == filter_expr->arg_cnt_
+                                      && filter_expr->args_[0] == relevance_proj_expr));
       }
     }
 
@@ -217,6 +230,7 @@ void ObSRDaaTIterImpl::reset()
   }
   dim_states_ = nullptr;
   use_fast_merge_ = false;
+  relevance_keep_all_ = false;
   domain_id_ptrs_ = nullptr;
   dim_cnt_ = 0;
   relevance_bool_filter_ = false;
@@ -530,6 +544,35 @@ int ObSRDaaTIterImpl::apply_batch_filter(const int64_t raw_count, int64_t &count
   const int64_t limit = limit_param->limit_;
   const int64_t offset = limit_param->offset_;
   count = 0;
+  if (relevance_keep_all_) {
+    // BOOL(relevance) filter is provably always-true (relevance skipped by optimizer);
+    // rows are kept without evaluating the filter, zero scores are written to keep
+    // the projection machinery consistent
+    for (int64_t i = 0; OB_SUCC(ret) && i < raw_count; ++i) {
+      ++input_row_cnt_;
+      if (limit_param->is_valid() && input_row_cnt_ <= offset) {
+        continue;
+      }
+      if (count != i) {
+        buffered_domain_ids_[count] = buffered_domain_ids_[i];
+        buffered_relevances_[count] = buffered_relevances_[i];
+      }
+      ++count;
+      ++output_row_cnt_;
+      if (limit_param->is_valid() && output_row_cnt_ >= limit) {
+        ret = OB_ITER_END;
+      }
+    }
+    ObEvalCtx::BatchInfoScopeGuard guard(*eval_ctx);
+    relevance_proj_expr->set_evaluated_projected(*eval_ctx);
+    for (int64_t i = 0; OB_SUCC(ret) && i < count; ++i) {
+      guard.set_batch_idx(i);
+      ObDatum &relevance_proj_datum = relevance_proj_expr->locate_datum_for_write(*eval_ctx);
+      relevance_proj_datum.set_double(buffered_relevances_[i]);
+      relevance_proj_expr->get_evaluated_flags(*eval_ctx).set(i);
+    }
+    return ret;
+  }
   if (relevance_bool_filter_) {
     // filter is BOOL(relevance): row survives iff relevance != 0.0, the expression
     // machinery (per-row datum writes, flag bookkeeping, vectorized BOOL eval) is skipped
@@ -689,11 +732,16 @@ int ObSRDaaTIterImpl::filter_on_demand(const int64_t count, const double relevan
       relevance_proj_datum.set_double(relevance);
       relevance_proj_expr->get_evaluated_flags(*eval_ctx).set(count);
       relevance_proj_expr->set_evaluated_projected(*eval_ctx);
-      ObDatum *filter_res = nullptr;
-      filter_expr->clear_evaluated_flag(*eval_ctx);
-      if (OB_FAIL(filter_expr->eval(*eval_ctx, filter_res))) {
+      if (OB_UNLIKELY(!iter_param_->need_calc_relevance())) {
+        // relevance skipped: the BOOL(score) filter is provably always-true
+        need_project = true;
       } else {
-        need_project = !(filter_res->is_null() || 0 == filter_res->get_int());
+        ObDatum *filter_res = nullptr;
+        filter_expr->clear_evaluated_flag(*eval_ctx);
+        if (OB_FAIL(filter_expr->eval(*eval_ctx, filter_res))) {
+        } else {
+          need_project = !(filter_res->is_null() || 0 == filter_res->get_int());
+        }
       }
     }
   } else if (OB_UNLIKELY(0 != count)) {
