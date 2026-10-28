@@ -18,6 +18,7 @@
 
 #include "sql/engine/basic/ob_values_table_access_op.h"
 #include "sql/engine/ob_exec_context.h"
+#include "sql/engine/ob_physical_plan.h"
 #include "sql/engine/expr/ob_obj_cast_runtime.h"
 
 namespace oceanbase
@@ -32,13 +33,14 @@ OB_SERIALIZE_MEMBER_INHERIT(ObValuesTableAccessSpec,
                             value_exprs_,
                             start_param_idx_,
                             end_param_idx_,
-                            obj_params_);
+                            obj_params_,
+                            file_info_);
 
 ObValuesTableAccessOp::ObValuesTableAccessOp(ObExecContext &exec_ctx,
                                              const ObOpSpec &spec,
                                              ObOpInput *input)
   : ObOperator(exec_ctx, spec, input), datum_caster_(), cm_(CM_NONE),
-    row_idx_(0), row_cnt_(0) {}
+    row_idx_(0), row_cnt_(0), reader_(NULL), cells_() {}
 
 int ObValuesTableAccessOp::inner_open()
 {
@@ -71,6 +73,9 @@ int ObValuesTableAccessOp::inner_open()
       } else if (ObValuesTableDef::ACCESS_OBJ == MY_SPEC.access_type_) {
         int64_t column_cnt = MY_SPEC.column_exprs_.count();
         row_cnt_ = MY_SPEC.obj_params_.count() / column_cnt;
+      } else if (ObValuesTableDef::ACCESS_FILE == MY_SPEC.access_type_) {
+        if (OB_FAIL(open_file_reader())) {
+        }
       } else {
         int64_t column_cnt = MY_SPEC.column_exprs_.count();
         row_cnt_ = MY_SPEC.value_exprs_.count() / column_cnt;
@@ -80,10 +85,54 @@ int ObValuesTableAccessOp::inner_open()
   return ret;
 }
 
+int ObValuesTableAccessOp::open_file_reader()
+{
+  int ret = OB_SUCCESS;
+  if (OB_NOT_NULL(reader_)) {
+    reader_->close();
+    reader_->destroy();
+    reader_ = NULL;
+  }
+  if (OB_FAIL(create_file_scan_reader(MY_SPEC.file_info_.format_,
+                                      eval_ctx_.exec_ctx_.get_allocator(),
+                                      reader_))) {
+  } else if (OB_ISNULL(reader_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(reader_->open(MY_SPEC.file_info_, eval_ctx_.exec_ctx_.get_allocator()))) {
+  } else {
+    row_cnt_ = reader_->get_row_cnt();
+  }
+  return ret;
+}
+
+int ObValuesTableAccessOp::calc_datum_from_file_cell(const ObObj &src_obj, ObExpr *dst_expr)
+{
+  int ret = OB_SUCCESS;
+  ObDatum &dst_datum = dst_expr->locate_datum_for_write(eval_ctx_);
+  if (src_obj.is_null()) {
+    dst_datum.set_null();
+    dst_expr->set_evaluated_projected(eval_ctx_);
+  } else if (OB_FAIL(dst_datum.from_obj(src_obj))) {
+  } else {
+    if (ObObjDatumMapType::OBJ_DATUM_STRING == dst_expr->obj_datum_map_) {
+      ObDatum src_datum = dst_datum;
+      ObExprStrResAlloc res_alloc(*dst_expr, eval_ctx_);
+      if (OB_FAIL(dst_datum.deep_copy(src_datum, res_alloc))) {
+      }
+    }
+    if (OB_SUCC(ret)) {
+      dst_expr->set_evaluated_projected(eval_ctx_);
+    }
+  }
+  return ret;
+}
+
 int ObValuesTableAccessOp::inner_rescan()
 {
   int ret = OB_SUCCESS;
   if (OB_FAIL(ObOperator::inner_rescan())) {
+  } else if (ObValuesTableDef::ACCESS_FILE == MY_SPEC.access_type_ &&
+             OB_NOT_NULL(reader_) && OB_FAIL(reader_->rewind())) {
   } else {
     row_idx_ = 0;
   }
@@ -94,6 +143,8 @@ int ObValuesTableAccessOp::switch_iterator()
 {
   int ret = OB_SUCCESS;
   if (OB_FAIL(ObOperator::inner_switch_iterator())) {
+  } else if (ObValuesTableDef::ACCESS_FILE == MY_SPEC.access_type_ &&
+             OB_NOT_NULL(reader_) && OB_FAIL(reader_->rewind())) {
   } else {
     row_idx_ = 0;
   }
@@ -268,6 +319,12 @@ OB_INLINE int ObValuesTableAccessOp::calc_next_row()
   ObPhysicalPlanCtx *plan_ctx = GET_PHY_PLAN_CTX(ctx_);
   if (row_idx_ == row_cnt_) {
     ret = OB_ITER_END;
+  } else if (ObValuesTableDef::ACCESS_FILE == MY_SPEC.access_type_ &&
+             OB_FAIL(reader_->next_row(eval_ctx_.exec_ctx_.get_allocator(), cells_))) {
+  } else if (ObValuesTableDef::ACCESS_FILE == MY_SPEC.access_type_ &&
+             OB_UNLIKELY(cells_.count() != col_num)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected file row cell count", K(ret), K(cells_.count()), K(col_num));
   } else if (ObValuesTableDef::FOLD_ACCESS_EXPR == MY_SPEC.access_type_ &&
              OB_FAIL(plan_ctx->replace_batch_param_datum(row_idx_,
                                           MY_SPEC.start_param_idx_,
@@ -304,6 +361,12 @@ OB_INLINE int ObValuesTableAccessOp::calc_next_row()
           }
           break;
         }
+        case ObValuesTableDef::ACCESS_FILE: {
+          const ObObj &cell = cells_.at(col_idx);
+          if (OB_FAIL(calc_datum_from_file_cell(cell, col_expr))) {
+          }
+          break;
+        }
       };
       col_idx++;
     } // while end
@@ -328,9 +391,23 @@ int ObValuesTableAccessOp::inner_close()
 {
   int ret = OB_SUCCESS;
   row_idx_ = 0;
+  if (OB_NOT_NULL(reader_)) {
+    reader_->close();
+  }
   if (OB_FAIL(datum_caster_.destroy())) {
   }
   return ret;
+}
+
+void ObValuesTableAccessOp::destroy()
+{
+  if (OB_NOT_NULL(reader_)) {
+    reader_->close();
+    reader_->destroy();
+    reader_ = NULL;
+  }
+  cells_.reset();
+  ObOperator::destroy();
 }
 } // end namespace sql
 } // end namespace oceanbase

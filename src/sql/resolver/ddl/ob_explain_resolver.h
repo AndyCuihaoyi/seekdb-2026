@@ -33,6 +33,8 @@ namespace sql
     virtual ~ObExplainResolver() {}
     virtual int resolve(const ParseNode &parse_tree);
     ObExplainStmt *get_explain_stmt();
+    int resolve_describe_file_table(ObDMLStmt *child_stmt, ObDMLStmt *&describe_stmt);
+    static const ObFileScanInfo *get_describe_file_info(ObDMLStmt *child_stmt);
     int resolve_columns(ObRawExpr *&expr, common::ObArray<ObQualifiedName> &columns)
     {
       UNUSED(expr);

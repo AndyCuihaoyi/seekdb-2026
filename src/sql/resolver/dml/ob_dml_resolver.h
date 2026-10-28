@@ -211,6 +211,10 @@ public:
   int create_unnest_table_item(TableItem *&table_item, ObString table_name);
   int unnest_table_add_column(TableItem *&table_item, ColumnItem *&col_item, ObString col_name);
   int resolve_hybrid_search_item(const ParseNode &parse_tree, TableItem *&table_item);
+  int resolve_file_table_item(const ParseNode &parse_tree, TableItem *&table_item);
+  int resolve_file_table_path(const ObString &file_path,
+                              const int64_t format,
+                              ObString &full_path);
 
   int fill_same_column_to_using(JoinedTable* &joined_table);
   int get_columns_from_table_item(const TableItem *table_item, common::ObIArray<common::ObString> &column_names);
@@ -671,6 +675,7 @@ protected:
   int gen_values_table_column_items(const int64_t column_cnt,
                                     const ObIArray<ObRawExprResType> &res_types,
                                     TableItem &table_item);
+  int gen_file_table_column_items(TableItem &table_item);
   int resolve_match_against_expr(ObMatchFunRawExpr &expr);
   int resolve_es_match_expr(ObMatchFunRawExpr &expr);
 private:

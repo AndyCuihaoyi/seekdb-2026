@@ -2986,6 +2986,156 @@ int ObSelectResolver::resolve_into_file_node(const ParseNode *list_node, ObSelec
   return ret;
 }
 
+static bool get_copy_option_str(const ParseNode *node, ObString &str)
+{
+  bool found = false;
+  if (NULL != node && NULL != node->str_value_ &&
+      (T_CHAR == node->type_ || T_VARCHAR == node->type_ ||
+       T_COLUMN_REF == node->type_ || T_IDENT == node->type_)) {
+    str.assign_ptr(node->str_value_, static_cast<int32_t>(node->str_len_));
+    found = true;
+  }
+  return found;
+}
+
+int ObSelectResolver::resolve_into_outfile_for_copy(const ParseNode *node, ObSelectIntoItem &into_item)
+{
+  int ret = OB_SUCCESS;
+  bool enable_file_sql = false;
+  ObExternalFileFormat external_format;
+  if (OB_ISNULL(node) || OB_ISNULL(allocator_) || OB_ISNULL(session_info_) || 3 != node->num_child_) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid copy node", K(ret), KP(node));
+  } else if (OB_FAIL(session_info_->get_sys_variable(share::SYS_VAR_ENABLE_FILE_SQL, enable_file_sql))) {
+    LOG_WARN("fail to get enable_file_sql", K(ret));
+  } else if (!enable_file_sql) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED,
+        "COPY statement when enable_file_sql is OFF. Execute SET SESSION enable_file_sql = ON first");
+  } else if (OB_FAIL(resolve_into_const_node(node->children_[0], into_item.outfile_name_))) {
+    LOG_WARN("fail to resolve copy target path", K(ret));
+  } else {
+    into_item.is_copy_ = true;
+    external_format.format_type_ = ObExternalFileFormat::CSV_FORMAT;
+    // COPY defaults follow RFC 4180: comma separated, double-quoted strings
+    ObString delimiter_str = ObString::make_string(",");
+    ObString quote_str = ObString::make_string("\"");
+    ObString escape_str = ObString::make_string("\"");
+    const ParseNode *option_list = node->children_[1];
+    for (int64_t i = 0; OB_SUCC(ret) && NULL != option_list && i < option_list->num_child_; ++i) {
+      const ParseNode *assign = option_list->children_[i];
+      const ParseNode *name_node = NULL;
+      const ParseNode *value_node = NULL;
+      ObString name;
+      if (OB_ISNULL(assign) || T_ASSIGN_ITEM != assign->type_ || 2 != assign->num_child_ ||
+          OB_ISNULL(name_node = assign->children_[0]) || NULL == name_node->str_value_) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("invalid copy option", K(ret), KP(assign));
+      } else {
+        value_node = assign->children_[1];
+        name.assign_ptr(name_node->str_value_, static_cast<int32_t>(name_node->str_len_));
+        if (0 == name.case_compare("format")) {
+          ObString format_str;
+          if (NULL != value_node && !get_copy_option_str(value_node, format_str)) {
+            ret = OB_INVALID_ARGUMENT;
+            LOG_USER_ERROR(OB_INVALID_ARGUMENT, "copy format option expects an identifier");
+          } else if (!format_str.empty() && 0 != format_str.case_compare("csv")) {
+            ret = OB_NOT_SUPPORTED;
+            LOG_USER_ERROR(OB_NOT_SUPPORTED, "COPY format other than csv");
+          }
+        } else if (0 == name.case_compare("delimiter")) {
+          if (NULL == value_node || !get_copy_option_str(value_node, delimiter_str)
+              || 1 != delimiter_str.length()) {
+            ret = OB_INVALID_ARGUMENT;
+            LOG_USER_ERROR(OB_INVALID_ARGUMENT, "copy delimiter option expects one character");
+          }
+        } else if (0 == name.case_compare("quote")) {
+          if (NULL == value_node || !get_copy_option_str(value_node, quote_str)
+              || 1 != quote_str.length()) {
+            ret = OB_INVALID_ARGUMENT;
+            LOG_USER_ERROR(OB_INVALID_ARGUMENT, "copy quote option expects one character");
+          }
+        } else if (0 == name.case_compare("escape")) {
+          if (NULL == value_node || !get_copy_option_str(value_node, escape_str)
+              || 1 != escape_str.length()) {
+            ret = OB_INVALID_ARGUMENT;
+            LOG_USER_ERROR(OB_INVALID_ARGUMENT, "copy escape option expects one character");
+          }
+        } else if (0 == name.case_compare("header")) {
+          bool with_header = true;
+          if (NULL != value_node) {
+            if (T_INT == value_node->type_ || T_BOOL == value_node->type_) {
+              with_header = (0 != value_node->value_);
+            } else {
+              ObString bool_str;
+              if (!get_copy_option_str(value_node, bool_str)) {
+                ret = OB_INVALID_ARGUMENT;
+                LOG_USER_ERROR(OB_INVALID_ARGUMENT, "copy header option expects true or false");
+              } else if (0 == bool_str.case_compare("true") || 0 == bool_str.case_compare("1") ||
+                         0 == bool_str.case_compare("on")) {
+                with_header = true;
+              } else if (0 == bool_str.case_compare("false") || 0 == bool_str.case_compare("0") ||
+                         0 == bool_str.case_compare("off")) {
+                with_header = false;
+              } else {
+                ret = OB_INVALID_ARGUMENT;
+                LOG_USER_ERROR(OB_INVALID_ARGUMENT, "copy header option expects true or false");
+              }
+            }
+          }
+          into_item.copy_with_header_ = with_header;
+        } else if (0 == name.case_compare("nullstr")) {
+          ObString null_str;
+          if (NULL == value_node || !get_copy_option_str(value_node, null_str)) {
+            ret = OB_INVALID_ARGUMENT;
+            LOG_USER_ERROR(OB_INVALID_ARGUMENT, "copy nullstr option expects a string literal");
+          } else if (OB_FAIL(ob_write_string(*allocator_, null_str, into_item.copy_null_str_))) {
+            LOG_WARN("fail to copy nullstr", K(ret));
+          }
+        } else {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "unknown COPY option");
+        }
+      }
+    }
+    if (OB_SUCC(ret)) {
+      // COPY defaults follow RFC 4180: comma separated, double-quoted strings
+      ObDataInFileStruct copy_fmt;
+      copy_fmt.field_term_str_ = delimiter_str;
+      copy_fmt.field_enclosed_str_ = quote_str;
+      copy_fmt.field_enclosed_char_ = static_cast<int64_t>(quote_str[0]);
+      copy_fmt.field_escaped_str_ = escape_str;
+      copy_fmt.field_escaped_char_ = static_cast<int64_t>(escape_str[0]);
+      copy_fmt.is_opt_field_enclosed_ = true;
+      if (OB_FAIL(external_format.csv_format_.init_format(copy_fmt,
+                                                          0,
+                                                          ObCharset::get_system_collation()))) {
+        LOG_WARN("fail to init csv format for copy", K(ret));
+      } else {
+        external_format.csv_format_.is_optional_ = true;
+      }
+    }
+    if (OB_SUCC(ret)
+        && OB_FAIL(external_format.to_string_with_alloc(into_item.external_properties_, *allocator_, true))) {
+      LOG_WARN("fail to serialize external format for copy", K(ret));
+    }
+    if (OB_SUCC(ret)) {
+      // option values are baked into the plan spec, do not share the plan across literal sets
+      ObSelectStmt *select_stmt = get_select_stmt();
+      ObQueryCtx *query_ctx = NULL;
+      if (OB_ISNULL(select_stmt) || OB_ISNULL(query_ctx = select_stmt->get_query_ctx())) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("query ctx is null", K(ret));
+      } else {
+        ObQueryHint &query_hint = query_ctx->get_query_hint_for_update();
+        const_cast<ObGlobalHint &>(query_hint.get_global_hint()).plan_cache_policy_ =
+            OB_USE_PLAN_CACHE_NONE;
+      }
+    }
+  }
+  return ret;
+}
+
 int ObSelectResolver::resolve_into_outfile_with_format(const ParseNode *node, ObSelectIntoItem &into_item)
 {
   int ret = OB_SUCCESS;
@@ -3107,6 +3257,9 @@ int ObSelectResolver::resolve_into_clause(const ParseNode *node)
       if (T_INTO_OUTFILE == node->type_) { // into outfile
         if (is_in_set_query()) {
           ret = OB_INAPPROPRIATE_INTO;
+        } else if (1 == node->value_) { // copied from COPY (select) TO
+          if (OB_FAIL(resolve_into_outfile_for_copy(node, *into_item))) {
+          }
         } else if (node->num_child_ == 3 && NULL != node->children_[1]
             && T_EXTERNAL_FILE_FORMAT == node->children_[1]->type_) { // Handle with `FORMAT`
           if (OB_FAIL(resolve_into_outfile_with_format(node, *into_item))) {

@@ -71,7 +71,11 @@ public:
       parallel_(1),
       buffer_size_(DEFAULT_BUFFER_SIZE),
       is_overwrite_(false),
-      external_properties_(alloc)
+      external_properties_(alloc),
+      is_copy_(false),
+      copy_with_header_(false),
+      copy_null_str_(alloc),
+      copy_header_names_(alloc)
   {
   }
 
@@ -91,6 +95,10 @@ public:
   int64_t buffer_size_;
   bool is_overwrite_;
   ObExternalFileFormat::StringData external_properties_;
+  bool is_copy_;
+  bool copy_with_header_;
+  ObExternalFileFormat::StringData copy_null_str_;
+  common::ObFixedArray<common::ObString, common::ObIAllocator> copy_header_names_;
   static const int64_t DEFAULT_MAX_FILE_SIZE = 256LL * 1024 * 1024;
   static const int64_t DEFAULT_BUFFER_SIZE = 1LL * 1024 * 1024;
 };
@@ -126,7 +134,11 @@ public:
       external_properties_(),
       format_type_(ObExternalFileFormat::FormatType::CSV_FORMAT),
       block_id_(0),
-      need_commit_(true)
+      need_commit_(true),
+      copy_target_(),
+      copy_temp_(),
+      copy_finalized_(false),
+      header_written_(false)
   {
   }
 
@@ -256,6 +268,10 @@ private:
   int create_the_only_data_writer(ObExternalFileWriter *&data_writer);
   int new_data_writer(ObExternalFileWriter *&data_writer);
   int check_secure_file_path(ObString file_name);
+  int prepare_copy_target();
+  int write_copy_header(ObCsvFileWriter &data_writer);
+  int finalize_copy();
+  int remove_copy_temp();
   char *get_json_buf() { return json_buf_; }
   int64_t get_json_buf_len() { return json_buf_len_; }
   char *get_shared_buf() { return shared_buf_; }
@@ -292,6 +308,10 @@ private:
   ObExternalFileFormat::FormatType format_type_;
   uint32_t block_id_;
   bool need_commit_;
+  ObString copy_target_; // final path of COPY target
+  ObString copy_temp_;   // temp file path that is renamed to copy_target_ on success
+  bool copy_finalized_;
+  bool header_written_;
   static const int64_t SHARED_BUFFER_SIZE = 2LL * 1024 * 1024;
 
 };

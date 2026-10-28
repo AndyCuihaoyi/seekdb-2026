@@ -4497,6 +4497,16 @@ int ObValuesTableDef::deep_copy(const ObValuesTableDef &other,
       } else if (OB_FAIL(column_types_.push_back(tmp_type))) {
       }
     }
+    if (OB_SUCC(ret) && OB_NOT_NULL(other.file_info_)) {
+      void *buf = NULL;
+      if (OB_ISNULL(buf = allocator->alloc(sizeof(ObFileScanInfo)))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else {
+        file_info_ = new (buf) ObFileScanInfo();
+        if (OB_FAIL(file_info_->assign(*other.file_info_, *allocator))) {
+        }
+      }
+    }
   }
   return ret;
 }
