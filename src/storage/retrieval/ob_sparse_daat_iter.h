@@ -47,17 +47,11 @@ struct ObSRMergeCmp
   int init(sql::ObDatumMeta id_meta, const ObFixedArray<const ObDatum *, ObIAllocator> *iter_ids);
   int cmp(const ObSRMergeItem &l, const ObSRMergeItem &r, int64_t &cmp_ret);
 private:
-  inline const ObDatum &get_id_datum(const int64_t iter_idx)
-  {
-    const ObDatum *datum = iter_ids_->at(iter_idx);
-    OB_ASSERT(nullptr != datum);
-    return *datum;
-  }
-private:
   common::ObDatumCmpFuncType cmp_func_;
-  // TODO: if memory lifetime of docid datum is guaranteed by dim_iters, we can use pointer to datum directly
-  //       and avoid deep copy into merge heap here
-  const ObFixedArray<const ObDatum *, ObIAllocator> *iter_ids_;
+  // raw backing storage of the caller-provided fixed array, valid for the iter's lifetime (count fixed at init)
+  const ObDatum * const *id_datums_;
+  // binary collation docid fast path, same result as strcmpsp(CS_TYPE_BINARY, ..., true)
+  bool is_binary_id_;
   bool is_inited_;
 };
 
@@ -107,6 +101,13 @@ protected:
   ObSRMergeHeap *merge_heap_;
   ObSRDaaTRelevanceCollector *relevance_collector_;
   ObFixedArray<const ObDatum *, ObIAllocator> iter_domain_ids_; // record every dim iter's output domain id, one (ObDatum *) for one dim iter
+  // raw backing storage of iter_domain_ids_, count fixed at init so the pointer is stable
+  const ObDatum **domain_id_ptrs_;
+  // dim iter pointers copied at init, avoids bounds-checked virtual at() in the merge loop
+  ObISRDaaTDimIter **dim_iter_ptrs_;
+  int64_t dim_cnt_;
+  // filter is BOOL(relevance_proj_expr): row passes iff relevance != 0.0
+  bool relevance_bool_filter_;
   ObFixedArray<ObDocIdExt, ObIAllocator> buffered_domain_ids_; // cache for output
   ObFixedArray<double, ObIAllocator> buffered_relevances_;
   ObFixedArray<int64_t, ObIAllocator> next_round_iter_idxes_;
