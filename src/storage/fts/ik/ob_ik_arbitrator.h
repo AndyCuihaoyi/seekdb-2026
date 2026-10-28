@@ -61,7 +61,8 @@ private:
 
 private:
   ObArenaAllocator alloc_;
-  hash::ObHashMap<int64_t, ObIKTokenChain *> chains_;
+  // one arbitrator instance serves a single batch on a single thread
+  hash::ObHashMap<int64_t, ObIKTokenChain *, hash::NoPthreadDefendMode> chains_;
 
 private:
   DISALLOW_COPY_AND_ASSIGN(ObIKArbitrator);

@@ -378,20 +378,74 @@ int ObFTRangeDict::match_with_hit(const ObString &single_word,
   return last_hit.dict_->match_with_hit(single_word, last_hit, hit);
 }
 
+// Decodes the whole [data, data + len) as exactly one canonical UTF-8 character.
+// Returns the codepoint on success, 0 if the sequence is not a single canonical character
+// (overlong, surrogate, out of range or multi-character input), in which case callers must
+// fall back to the binary string comparison.
+static uint32_t decode_single_utf8_char(const char *data, const int64_t len)
+{
+  if (OB_ISNULL(data) || len <= 0 || len > 4) {
+    return 0;
+  }
+  const unsigned char *s = reinterpret_cast<const unsigned char *>(data);
+  uint32_t code = 0;
+  int64_t consume = 0;
+  if (s[0] < 0x80) {
+    code = s[0];
+    consume = 1;
+  } else if (0xC0 == (s[0] & 0xE0)) {
+    code = s[0] & 0x1FU;
+    consume = 2;
+  } else if (0xE0 == (s[0] & 0xF0)) {
+    code = s[0] & 0x0FU;
+    consume = 3;
+  } else if (0xF0 == (s[0] & 0xF8)) {
+    code = s[0] & 0x07U;
+    consume = 4;
+  }
+  if (0 == consume || consume != len) {
+    return 0;
+  }
+  for (int64_t i = 1; i < consume; ++i) {
+    if (0x80 != (s[i] & 0xC0)) {
+      return 0;
+    }
+    code = (code << 6) | (s[i] & 0x3FU);
+  }
+  if ((2 == consume && code < 0x80) || (3 == consume && code < 0x800)
+      || (4 == consume && (code < 0x10000 || code > 0x10FFFF))
+      || (code >= 0xD800 && code <= 0xDFFF)) {
+    return 0;
+  }
+  return code;
+}
+
 int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict *&dict) const
 {
   int ret = OB_SUCCESS;
   bool found = false;
-  for (int i = 0; OB_SUCC(ret) && !found && i < range_dicts_.size(); ++i) {
-    if (ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                          range_dicts_[i].start_.get_word(),
-                          single_word)
-            <= 0
-        && ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                             range_dicts_[i].end_.get_word(),
-                             single_word)
-               >= 0) {
-      dict = range_dicts_[i].dict_;
+  dict = nullptr;
+  // Codepoint comparison is equivalent to the binary comparison below because the range
+  // bounds are single canonical UTF-8 characters: UTF-8 byte order preserves codepoint
+  // order and a single character is never a byte-prefix of a different character.
+  const uint32_t code = has_char_codes_
+                            ? decode_single_utf8_char(single_word.ptr(), single_word.length())
+                            : 0;
+  for (int64_t i = 0; !found && i < range_dicts_.size(); ++i) {
+    const ObFTRange &range = range_dicts_[i];
+    const bool in_range =
+        0 != code
+            ? (code >= range.start_code_ && code <= range.end_code_)
+            : (ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
+                                 range.start_.get_word(),
+                                 single_word)
+                   <= 0
+               && ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
+                                    range.end_.get_word(),
+                                    single_word)
+                      >= 0);
+    if (in_range) {
+      dict = range.dict_;
       found = true;
     }
   }
@@ -405,6 +459,7 @@ int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict 
 int ObFTRangeDict::build_dict_from_cache(const ObFTCacheRangeContainer &range_container)
 {
   int ret = OB_SUCCESS;
+  bool has_char_codes = true;
   for (ObList<ObFTCacheRangeHandle *, ObIAllocator>::const_iterator iter = range_container.get_handles().begin();
        OB_SUCC(ret) && iter != range_container.get_handles().end();
        iter++) {
@@ -418,9 +473,17 @@ int ObFTRangeDict::build_dict_from_cache(const ObFTCacheRangeContainer &range_co
       range.start_ = dat->start_word_;
       range.end_ = dat->end_word_;
       range.dict_ = dict;
+      range.start_code_ = decode_single_utf8_char(range.start_.word, range.start_.word_len);
+      range.end_code_ = decode_single_utf8_char(range.end_.word, range.end_.word_len);
+      if (0 == range.start_code_ || 0 == range.end_code_) {
+        has_char_codes = false;
+      }
       if (OB_FAIL(range_dicts_.push_back(range))) {
       }
     }
+  }
+  if (OB_SUCC(ret)) {
+    has_char_codes_ = has_char_codes && range_dicts_.size() > 0;
   }
   return ret;
 }
