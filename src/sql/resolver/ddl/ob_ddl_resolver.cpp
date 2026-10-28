@@ -96,12 +96,26 @@ ObDDLResolver::ObDDLResolver(ObResolverParams &params)
 ObDDLResolver::~ObDDLResolver()
 {}
 
-int ObDDLResolver::fill_ai_declared_cols(const share::schema::ObTableSchema &table_schema)
+int ObDDLResolver::fill_ai_declared_cols(const share::schema::ObTableSchema &table_schema,
+                                         const share::schema::ObTableSchema *extra_schema)
 {
   int ret = OB_SUCCESS;
   ai_declared_cols_store_.reset();
   for (int64_t i = 0; OB_SUCC(ret) && i < table_schema.get_column_count(); ++i) {
     const ObColumnSchemaV2 *col = table_schema.get_column_schema_by_idx(i);
+    if (OB_ISNULL(col)) {
+      ret = OB_ERR_UNEXPECTED;
+      SQL_RESV_LOG(WARN, "column schema is null", K(ret), K(i));
+    } else if (OB_FAIL(ai_declared_cols_store_.push_back(*col))) {
+      SQL_RESV_LOG(WARN, "push back declared column failed", K(ret));
+    }
+  }
+  // ALTER ADD has to see both the existing table columns and the columns the
+  // statement itself has added so far, otherwise an AI expression that
+  // references a normal column of the table fails dependency validation
+  for (int64_t i = 0; OB_SUCC(ret) && NULL != extra_schema
+       && i < extra_schema->get_column_count(); ++i) {
+    const ObColumnSchemaV2 *col = extra_schema->get_column_schema_by_idx(i);
     if (OB_ISNULL(col)) {
       ret = OB_ERR_UNEXPECTED;
       SQL_RESV_LOG(WARN, "column schema is null", K(ret), K(i));

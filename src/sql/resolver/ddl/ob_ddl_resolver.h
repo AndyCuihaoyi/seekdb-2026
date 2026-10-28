@@ -571,7 +571,8 @@ protected:
   { ai_declared_cols_ = NULL; ai_column_names_.reset(); ai_column_metas_.reset(); ai_declared_cols_store_.reset(); }
   const common::ObIArray<share::schema::ObColumnSchemaV2> *get_ai_declared_cols() const
   { return ai_declared_cols_; }
-  int fill_ai_declared_cols(const share::schema::ObTableSchema &table_schema);
+  int fill_ai_declared_cols(const share::schema::ObTableSchema &table_schema,
+                            const share::schema::ObTableSchema *extra_schema = NULL);
   /*
   int resolve_generated_column_definition(
       share::schema::ObColumnSchemaV2 &column,

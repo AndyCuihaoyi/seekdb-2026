@@ -381,8 +381,8 @@ int resolve_ai_column_attribute(ObSQLSessionInfo *session_info,
         is_ai_column = (0 == existing_ai_columns.at(j).case_compare(ref));
       }
       if (is_ai_column) {
+        // the official contract reports the bare OB_NOT_SUPPORTED message here
         ret = OB_NOT_SUPPORTED;
-        LOG_USER_ERROR(OB_NOT_SUPPORTED, "AI COLUMN depending on another AI column is");
       } else {
         bool found = false;
         if (NULL != declared_cols) {

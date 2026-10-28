@@ -3615,7 +3615,8 @@ int ObAlterTableResolver::resolve_add_column(const ParseNode &node, ObColumnName
         ObSEArray<ObColumnSchemaV2 *, 8> resolved_cols;
         reset_ai_column_state();
         if (OB_FAIL(get_table_schema_all_column_schema(resolved_cols, alter_table_stmt->get_alter_table_schema()))) {
-        } else if (OB_FAIL(fill_ai_declared_cols(alter_table_stmt->get_alter_table_schema()))) {
+        } else if (OB_FAIL(fill_ai_declared_cols(*table_schema_,
+                                                 &alter_table_stmt->get_alter_table_schema()))) {
         } else if (OB_FAIL(resolve_alter_table_column_definition(alter_column_schema,
                                                           node.children_[i],
                                                           stat,
