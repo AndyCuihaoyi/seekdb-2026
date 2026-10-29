@@ -139,6 +139,9 @@ protected:
   // scratch output datums for the direct-emit merge; the projection frame they are
   // published to is shared with the underlying scan and rewritten on every batch load
   ObDatum *emit_datums_;
+  // value slots backing emit_datums_: ObDatum keeps its bytes behind ptr_, so every
+  // scratch datum needs its own writable slot for the int docid writer
+  int64_t *emit_vals_;
   // per-dim weights copied at init; nullptr when the caller supplies none
   double *dim_weight_vals_;
   int64_t next_round_cnt_;
