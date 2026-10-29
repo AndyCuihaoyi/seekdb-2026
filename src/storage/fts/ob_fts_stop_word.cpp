@@ -80,8 +80,14 @@ int ObStopWordChecker::check_stopword(const ObFTWord &word, bool &is_stopword)
   } else if (OB_UNLIKELY(word.empty())) {
     ret = OB_INVALID_ARGUMENT;
   } else if (word.get_collation_type() == stopword_type_.get_collation_type()) {
-    // The set is keyed on raw bytes and a same-collation conversion returns the
-    // input unchanged, so the token can be looked up without an allocator.
+    // A direct lookup is equivalent to the converting path for this case:
+    //  - same-collation conversion returns the input bytes unchanged
+    //    (ObCharset::charset_convert short-circuits equal charsets), and
+    //  - word hashing and comparison of string datums dispatch on the charset's
+    //    basic-func table keyed by collation only, not on the concrete string
+    //    type, and the tokens here are always in-memory strings without a lob
+    //    locator (ObDatumFuncs::get_basic_func / get_datum_cmp_func).
+    // The extra ObObjMeta type check is therefore not needed for equivalence.
     ret = stopword_set_.exist_refactored(word);
   } else {
     common::ObArenaAllocator allocator(lib::ObMemAttr("ChkStopWord"));
