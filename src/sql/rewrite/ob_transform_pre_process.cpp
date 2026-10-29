@@ -3995,9 +3995,7 @@ int ObTransformPreProcess::preserve_order_for_fulltext_search(
   }
   if (OB_SUCC(ret) && nullptr != match_expr && !static_cast<ObMatchFunRawExpr*>(match_expr)->is_es_match()) {
     bool only_counted = false;
-    if (NATURAL_LANGUAGE_MODE != static_cast<ObMatchFunRawExpr *>(match_expr)->get_mode_flag()) {
-      // boolean mode MATCH is a plain predicate: leave its plan as before
-    } else if (OB_FAIL(check_derived_table_rows_only_counted(
+    if (OB_FAIL(check_derived_table_rows_only_counted(
                    parent_stmts, *static_cast<ObSelectStmt *>(stmt), only_counted))) {
     } else if (only_counted) {
       // keep the statement order-free: the scan then returns the matching documents in
