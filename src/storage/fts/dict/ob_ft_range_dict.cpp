@@ -420,6 +420,39 @@ static uint32_t decode_single_utf8_char(const char *data, const int64_t len)
   return code;
 }
 
+// Equivalent to ObCharset::strcmp(CS_TYPE_UTF8MB4_BIN, ...) without the charset and
+// collation dispatch: the utf8mb4_bin collation is memcmp over the common prefix, then
+// the length comparison picks the shorter string.
+static inline int ft_bin_cmp(const ObString &l, const ObString &r)
+{
+  const int64_t len = MIN(l.length(), r.length());
+  const int cmp = 0 == len ? 0 : MEMCMP(l.ptr(), r.ptr(), static_cast<size_t>(len));
+  return 0 != cmp ? cmp : static_cast<int>(l.length() - r.length());
+}
+
+bool ObFTRangeDict::has_ascending_ranges() const
+{
+  bool ascending = range_dicts_.size() > 0;
+  for (int64_t i = 0; ascending && i < range_dicts_.size(); ++i) {
+    const ObFTRange &range = range_dicts_[i];
+    if (has_char_codes_) {
+      // ranges must be non-empty, strictly ascending and disjoint
+      if (range.start_code_ > range.end_code_
+          || (i + 1 < range_dicts_.size()
+              && range_dicts_[i + 1].start_code_ <= range.end_code_)) {
+        ascending = false;
+      }
+    } else if (ft_bin_cmp(range.start_.get_word(), range.end_.get_word()) > 0
+               || (i + 1 < range_dicts_.size()
+                   && ft_bin_cmp(range.end_.get_word(),
+                                 range_dicts_[i + 1].start_.get_word())
+                          >= 0)) {
+      ascending = false;
+    }
+  }
+  return ascending;
+}
+
 int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict *&dict) const
 {
   int ret = OB_SUCCESS;
@@ -431,22 +464,48 @@ int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict 
   const uint32_t code = has_char_codes_
                             ? decode_single_utf8_char(single_word.ptr(), single_word.length())
                             : 0;
-  for (int64_t i = 0; !found && i < range_dicts_.size(); ++i) {
-    const ObFTRange &range = range_dicts_[i];
-    const bool in_range =
-        0 != code
-            ? (code >= range.start_code_ && code <= range.end_code_)
-            : (ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                                 range.start_.get_word(),
-                                 single_word)
-                   <= 0
-               && ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                                    range.end_.get_word(),
-                                    single_word)
-                      >= 0);
-    if (in_range) {
-      dict = range.dict_;
-      found = true;
+  const bool use_code = 0 != code;
+  if (ranges_ascending_) {
+    // Ranges were validated at init to be strictly ascending and disjoint, so the only
+    // candidate is the first range whose end is not less than the word.
+    int64_t low = 0;
+    int64_t high = range_dicts_.size() - 1;
+    int64_t candidate = range_dicts_.size();
+    while (low <= high) {
+      const int64_t mid = low + (high - low) / 2;
+      const ObFTRange &range = range_dicts_[mid];
+      const bool end_ge_word = use_code
+                                   ? range.end_code_ >= code
+                                   : ft_bin_cmp(range.end_.get_word(), single_word) >= 0;
+      if (end_ge_word) {
+        candidate = mid;
+        high = mid - 1;
+      } else {
+        low = mid + 1;
+      }
+    }
+    if (candidate < range_dicts_.size()) {
+      const ObFTRange &range = range_dicts_[candidate];
+      const bool start_le_word = use_code
+                                     ? range.start_code_ <= code
+                                     : ft_bin_cmp(range.start_.get_word(), single_word) <= 0;
+      if (start_le_word) {
+        dict = range.dict_;
+        found = true;
+      }
+    }
+  } else {
+    for (int64_t i = 0; !found && i < range_dicts_.size(); ++i) {
+      const ObFTRange &range = range_dicts_[i];
+      const bool in_range =
+          use_code
+              ? (code >= range.start_code_ && code <= range.end_code_)
+              : (ft_bin_cmp(range.start_.get_word(), single_word) <= 0
+                 && ft_bin_cmp(range.end_.get_word(), single_word) >= 0);
+      if (in_range) {
+        dict = range.dict_;
+        found = true;
+      }
     }
   }
   if (!found) {
@@ -484,6 +543,8 @@ int ObFTRangeDict::build_dict_from_cache(const ObFTCacheRangeContainer &range_co
   }
   if (OB_SUCC(ret)) {
     has_char_codes_ = has_char_codes && range_dicts_.size() > 0;
+    ranges_ascending_ = has_ascending_ranges();
+    LOG_INFO("build range dict from cache", K(ret), K(range_dicts_.size()), K(has_char_codes_), K(ranges_ascending_));
   }
   return ret;
 }
