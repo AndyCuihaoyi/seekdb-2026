@@ -105,6 +105,7 @@ ObSRDaaTIterImpl::ObSRDaaTIterImpl()
     buffered_ids_(nullptr),
     buffered_rels_(nullptr),
     next_round_idx_(nullptr),
+    emit_datums_(nullptr),
     dim_weight_vals_(nullptr),
     next_round_cnt_(0),
     filter_skip_(nullptr),
@@ -157,6 +158,10 @@ int ObSRDaaTIterImpl::init(
     } else if (OB_ISNULL(filter_skip_ = sql::to_bit_vector(
                             iter_allocator_->alloc(sql::ObBitVector::memory_size(max_batch_size))))) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else if (OB_ISNULL(emit_datums_ = static_cast<ObDatum *>(
+                            iter_allocator_->alloc(max_batch_size * sizeof(ObDatum))))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else if (FALSE_IT(MEMSET(emit_datums_, 0, max_batch_size * sizeof(ObDatum)))) {
     } else if (OB_FAIL(merge_cmp_.init(iter_param_->id_proj_expr_->datum_meta_, &iter_domain_ids_))) {
     } else if (OB_FAIL(init_merge_heap(dim_iters_->count()))) {
     } else {
@@ -264,6 +269,7 @@ void ObSRDaaTIterImpl::reset()
   buffered_ids_ = nullptr;
   buffered_rels_ = nullptr;
   next_round_idx_ = nullptr;
+  emit_datums_ = nullptr;
   if (OB_NOT_NULL(iter_allocator_) && OB_NOT_NULL(dim_weight_vals_)) {
     iter_allocator_->free(dim_weight_vals_);
   }
@@ -383,15 +389,18 @@ int ObSRDaaTIterImpl::get_next_rows(const int64_t capacity, int64_t &count)
       }
     } else if (merge_emit_all_ && iter_param_->eval_ctx_->is_vectorized()) {
       // Nothing to filter and every merged doc is accepted: project each row while it is
-      // merged instead of buffering it for a separate filter, compaction and project pass
-      // locate_datums_for_update points each datum's ptr_ at its res_buf row slice; writing
-      // a scalar through a datum located any other way dereferences an uninitialized ptr_
-      ObDatum *id_datums = iter_param_->id_proj_expr_->locate_datums_for_update(
+      // merged instead of buffering it for a separate filter, compaction and project pass.
+      // The projected datums share the eval frame with the inverted-index scan output, and
+      // loading the next dimension batch re-points that frame at the scan res_buf and
+      // overwrites rows already emitted in this batch. Merge into scratch datums and
+      // publish to the frame only once the batch is complete.
+      ObDatum *frame_id_datums = iter_param_->id_proj_expr_->locate_datums_for_update(
           *iter_param_->eval_ctx_, real_capacity);
       ObDatum *rel_datums = iter_param_->need_project_relevance()
           ? iter_param_->relevance_proj_expr_->locate_datums_for_update(
                 *iter_param_->eval_ctx_, real_capacity)
           : nullptr;
+      ObDatum *id_datums = emit_datums_;
       bool iter_end = false;
       while (OB_SUCC(ret) && !iter_end && count < real_capacity) {
         if (OB_FAIL(do_one_merge_round_emit(count, id_datums, rel_datums))) {
@@ -403,9 +412,15 @@ int ObSRDaaTIterImpl::get_next_rows(const int64_t capacity, int64_t &count)
         }
       }
       if (OB_SUCC(ret) && count > 0) {
+        MEMCPY(frame_id_datums, id_datums, count * sizeof(ObDatum));
         iter_param_->id_proj_expr_->set_evaluated_projected(*iter_param_->eval_ctx_);
         iter_param_->id_proj_expr_->get_evaluated_flags(*iter_param_->eval_ctx_).set_all(static_cast<int64_t>(0), count);
         if (OB_NOT_NULL(rel_datums)) {
+          // the score is constant zero on this path; write it after the merge so a
+          // dimension batch reload cannot leave stale values in the relevance frame
+          for (int64_t i = 0; i < count; ++i) {
+            rel_datums[i].set_double(0.0);
+          }
           iter_param_->relevance_proj_expr_->set_evaluated_projected(*iter_param_->eval_ctx_);
           iter_param_->relevance_proj_expr_->get_evaluated_flags(*iter_param_->eval_ctx_).set_all(static_cast<int64_t>(0), count);
         }
