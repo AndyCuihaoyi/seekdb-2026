@@ -1040,19 +1040,25 @@ int ObFtsIndexBuilderUtil::decide_parallelism(
   if (OB_UNLIKELY(original_parallelism <= 0)) {
     ret = OB_INVALID_ARGUMENT;
   } else {
+    // A DDL statement without a PARALLEL clause reaches this point as parallelism 1
+    // (calc_ddl_parallelism() only honours hints above 1). Every auxiliary table of a
+    // fulltext index is built separately, and with a width of one the per-word rows of
+    // the inverted index are generated from a single worker, which dominates the build
+    // wall clock. Use the machine's core count, capped at four so small machines are
+    // not oversubscribed, as the default width.
+    const int64_t default_parallelism = MIN(MAX(get_cpu_num(), 1L), 4L);
     switch (index_type) {
       case share::schema::ObIndexType::INDEX_TYPE_ROWKEY_DOC_ID_LOCAL:
-        decided_parallelism = MAX(original_parallelism, 1L);
+        decided_parallelism = original_parallelism > 1 ? original_parallelism : default_parallelism;
         break;
       case share::schema::ObIndexType::INDEX_TYPE_DOC_ID_ROWKEY_LOCAL:
       case share::schema::ObIndexType::INDEX_TYPE_FTS_INDEX_LOCAL:
       case share::schema::ObIndexType::INDEX_TYPE_FTS_DOC_WORD_LOCAL:
-        // A statement without a PARALLEL clause reaches this point as parallelism 1
-        // (calc_ddl_parallelism() only honours hints above 1), and the /3 shrink below
-        // would then order the whole inverted index from a single worker. Two workers is
-        // where the measured speedup saturates on the benchmark tablet, so keep it as the
-        // floor and let an explicit PARALLEL(n) still scale up.
-        decided_parallelism = MAX(original_parallelism / 3, 2L);
+        // An explicit PARALLEL(n) still scales up; without one, the core-count default
+        // above replaces the old single-worker path.
+        decided_parallelism = original_parallelism > 1
+                                  ? MAX(original_parallelism / 3, 2L)
+                                  : default_parallelism;
         break;
       case share::schema::ObIndexType::INDEX_TYPE_NORMAL_MULTIVALUE_LOCAL:
       case share::schema::ObIndexType::INDEX_TYPE_UNIQUE_MULTIVALUE_LOCAL:
