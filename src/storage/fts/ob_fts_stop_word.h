@@ -84,22 +84,9 @@ private:
   static const int64_t DEFAULT_STOPWORD_BUCKET_NUM = 37L;
   typedef common::hash::ObHashSet<storage::ObFTWord> StopWordSet;
 
-  // Direct index over the stop word list, consulted instead of the collation hash set for
-  // tokens that are pure ASCII: utf8mb4_general_ci compares such a token by its case folded
-  // bytes and ignores trailing spaces, so membership is decidable without hashing. Built once
-  // in init() and read only afterwards; stays disabled unless every list entry is a short
-  // lower case ASCII word, which keeps the index equivalent to the hash set by construction.
-  static const int64_t ASCII_INDEX_SLOT_CNT = 128;
-  static const int64_t ASCII_INDEX_MAX_WORD_LEN = 7;
-  bool build_ascii_index();
-  // Returns false when the token is not decidable by the index and the caller must fall back.
-  bool ascii_index_find(const common::ObString &word, bool &is_stopword) const;
-
   StopWordSet stopword_set_;
   ObObjMeta stopword_type_;
-  uint64_t ascii_index_[ASCII_INDEX_SLOT_CNT];
 
-  bool ascii_index_valid_ = false;
   bool inited_ = false;
 
   static_assert(sizeof(ob_stop_word_list) / sizeof(ob_stop_word_list[0]) <= DEFAULT_STOPWORD_BUCKET_NUM,

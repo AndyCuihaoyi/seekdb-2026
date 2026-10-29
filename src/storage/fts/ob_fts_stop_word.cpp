@@ -34,95 +34,11 @@ ObStopWordChecker::~ObStopWordChecker()
   destroy();
 }
 
-namespace
-{
-// The length in the top bits followed by the raw bytes, so two different
-// (length, bytes) pairs of at most ASCII_INDEX_MAX_WORD_LEN bytes never share a key.
-OB_INLINE uint64_t pack_ascii_word(const char *str, const int64_t len)
-{
-  uint64_t key = static_cast<uint64_t>(len);
-  for (int64_t i = 0; i < len; ++i) {
-    key = (key << 8) | static_cast<unsigned char>(str[i]);
-  }
-  return key;
-}
-
-OB_INLINE int64_t ascii_index_slot(const uint64_t key)
-{
-  return static_cast<int64_t>((key * 0x9E3779B97F4A7C15ULL) >> 57);
-}
-} // namespace
-
-bool ObStopWordChecker::build_ascii_index()
-{
-  bool valid = true;
-  const int64_t stopword_count = sizeof(ob_stop_word_list) / sizeof(ob_stop_word_list[0]);
-  MEMSET(ascii_index_, 0, sizeof(ascii_index_));
-  for (int64_t i = 0; valid && i < stopword_count; ++i) {
-    const char *word = ob_stop_word_list[i];
-    const int64_t len = STRLEN(word);
-    if (OB_UNLIKELY(0 == len || len > ASCII_INDEX_MAX_WORD_LEN)) {
-      valid = false;
-    }
-    for (int64_t j = 0; valid && j < len; ++j) {
-      if (OB_UNLIKELY(word[j] < 'a' || word[j] > 'z')) {
-        valid = false;
-      }
-    }
-    if (valid) {
-      const uint64_t key = pack_ascii_word(word, len);
-      int64_t slot = ascii_index_slot(key);
-      while (OB_UNLIKELY(0 != ascii_index_[slot] && key != ascii_index_[slot])) {
-        slot = (slot + 1) & (ASCII_INDEX_SLOT_CNT - 1);
-      }
-      ascii_index_[slot] = key;
-    }
-  }
-  return valid;
-}
-
-bool ObStopWordChecker::ascii_index_find(const common::ObString &word, bool &is_stopword) const
-{
-  bool decidable = true;
-  const char *ptr = word.ptr();
-  int64_t len = word.length();
-  is_stopword = false;
-  // a space padded comparison ignores trailing spaces, so they carry no membership information
-  while (len > 0 && ' ' == ptr[len - 1]) {
-    --len;
-  }
-  if (len > ASCII_INDEX_MAX_WORD_LEN) {
-    // longer than every indexed entry, and ASCII weights compare one byte at a time
-  } else if (0 == len) {
-    // the list holds no empty word
-  } else {
-    char folded[ASCII_INDEX_MAX_WORD_LEN];
-    for (int64_t i = 0; decidable && i < len; ++i) {
-      const unsigned char c = static_cast<unsigned char>(ptr[i]);
-      if (OB_UNLIKELY(c >= 0x80)) {
-        // a collation may fold a non-ASCII weight onto an ASCII one: keep the hash set path
-        decidable = false;
-      } else {
-        folded[i] = static_cast<char>((c >= 'A' && c <= 'Z') ? (c + ('a' - 'A')) : c);
-      }
-    }
-    if (decidable) {
-      const uint64_t key = pack_ascii_word(folded, len);
-      int64_t slot = ascii_index_slot(key);
-      while (OB_UNLIKELY(0 != ascii_index_[slot] && key != ascii_index_[slot])) {
-        slot = (slot + 1) & (ASCII_INDEX_SLOT_CNT - 1);
-      }
-      is_stopword = (key == ascii_index_[slot]);
-    }
-  }
-  return decidable;
-}
-
 int ObStopWordChecker::init()
 {
   int ret = OB_SUCCESS;
-
-
+  
+  
 
   if (inited_) {
     ret = OB_INIT_TWICE;
@@ -133,7 +49,6 @@ int ObStopWordChecker::init()
     stop_meta.set_collation_type(ObCollationType::CS_TYPE_UTF8MB4_GENERAL_CI);
 
     stopword_type_.set_meta(stop_meta);
-    ascii_index_valid_ = build_ascii_index();
     const int64_t stopword_count = sizeof(ob_stop_word_list) / sizeof(ob_stop_word_list[0]);
     for (int64_t i = 0; OB_SUCC(ret) && i < stopword_count; ++i) {
       ObFTWord stopword(STRLEN(ob_stop_word_list[i]), ob_stop_word_list[i], stopword_type_);
@@ -152,7 +67,6 @@ void ObStopWordChecker::destroy()
 {
   if (inited_) {
     stopword_set_.destroy();
-    ascii_index_valid_ = false;
     inited_ = false;
   }
 }
@@ -160,18 +74,12 @@ void ObStopWordChecker::destroy()
 int ObStopWordChecker::check_stopword(const ObFTWord &word, bool &is_stopword)
 {
   int ret = OB_SUCCESS;
-  bool decided = false;
   is_stopword = false;
-  const bool same_collation = (word.get_collation_type() == stopword_type_.get_collation_type());
   if (OB_UNLIKELY(!inited_)) {
     ret = OB_NOT_INIT;
   } else if (OB_UNLIKELY(word.empty())) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (same_collation && ascii_index_valid_
-             && (decided = ascii_index_find(word.get_word().get_string(), is_stopword))) {
-    // An ASCII token under utf8mb4_general_ci compares by its case folded bytes, so the
-    // index gives the same answer as the hash set without hashing or latching a bucket.
-  } else if (same_collation) {
+  } else if (word.get_collation_type() == stopword_type_.get_collation_type()) {
     // A direct lookup is equivalent to the converting path for this case:
     //  - same-collation conversion returns the input bytes unchanged
     //    (ObCharset::charset_convert short-circuits equal charsets), and
@@ -195,9 +103,7 @@ int ObStopWordChecker::check_stopword(const ObFTWord &word, bool &is_stopword)
       ret = stopword_set_.exist_refactored(converted);
     }
   }
-  if (decided) {
-    // is_stopword is final
-  } else if (OB_HASH_NOT_EXIST == ret) {
+  if (OB_HASH_NOT_EXIST == ret) {
     is_stopword = false;
     ret = OB_SUCCESS;
   } else if (OB_HASH_EXIST == ret) {
