@@ -1,0 +1,80 @@
+# owner: cuihaoyi
+# owner group: storage
+# tags: fts
+# description: regression for the process-global FTS dictionary cache. Repeated
+#   TOKENIZE calls must stay identical, running other parsers must not disturb the
+#   shared IK dictionaries, every emitted token must be searchable through MATCH,
+#   unrelated words must miss, and ALTER SYSTEM FLUSH KVCACHE CACHE='dict_cache'
+#   must neither change TOKENIZE output nor break index build/query afterwards.
+
+--disable_warnings
+drop database if exists fts_dict_cache;
+create database fts_dict_cache;
+use fts_dict_cache;
+--enable_warnings
+
+set ob_query_timeout = 10000000000;
+
+--result_format 4
+
+create table t_doc (
+  id int primary key,
+  title varchar(100),
+  body text,
+  fulltext index fti(title, body) with parser ik);
+
+insert into t_doc values
+  (1, '电影评论', '昨晚看的一部电影非常感人，让我思考了很多。'),
+  (2, 'Security Audit', 'Completed the annual security audit and data protection review.');
+
+create table t_sig (id int primary key, sig varchar(64));
+
+# 1. repeated TOKENIZE using the shared IK dictionaries must be identical
+insert into t_sig values (1, md5(cast(tokenize('电影评论', 'ik') as char)));
+insert into t_sig values (2, md5(cast(tokenize('电影评论', 'ik') as char)));
+insert into t_sig values (3, md5(cast(tokenize('电影评论', 'ik') as char)));
+select count(distinct sig) as distinct_sig_cnt from t_sig;
+
+# 2. running other parsers and another IK configuration must not disturb the
+#    dictionaries shared by subsequent TOKENIZE calls
+select tokenize('电影评论', 'space');
+select tokenize('电影评论', 'ngram');
+select tokenize('电影评论', 'beng');
+select tokenize('中华人民共和国人民大会堂', 'ik', '[{"additional_args": [{"ik_mode": "max_word"}]}]');
+insert into t_sig values (4, md5(cast(tokenize('电影评论', 'ik') as char)));
+select count(distinct sig) as distinct_sig_cnt from t_sig;
+
+# 3. every token emitted by TOKENIZE can be found through MATCH
+select tokenize('电影评论', 'ik');
+select id from t_doc where match(title, body) against('电影') order by id;
+select id from t_doc where match(title, body) against('评论') order by id;
+select tokenize('Security Audit', 'ik');
+select id from t_doc where match(title, body) against('security') order by id;
+select id from t_doc where match(title, body) against('audit') order by id;
+
+# 4. words that never appear must not hit
+select id from t_doc where match(title, body) against('量子计算') order by id;
+select id from t_doc where match(title, body) against('blockchain') order by id;
+
+# 5. flushing the dict KV cache must not change TOKENIZE or MATCH behavior
+connect(sys_conn, $OBMYSQL_MS0, root@sys,,oceanbase, $OBMYSQL_PORT);
+connection sys_conn;
+alter system flush kvcache cache = 'dict_cache';
+disconnect sys_conn;
+connection default;
+
+insert into t_sig values (5, md5(cast(tokenize('电影评论', 'ik') as char)));
+select count(distinct sig) as distinct_sig_cnt from t_sig;
+select id from t_doc where match(title, body) against('电影') order by id;
+
+# 6. building a new index still works after the dict KV cache has been flushed
+create table t_doc2 (id int primary key, body text, fulltext index fti2(body) with parser ik);
+insert into t_doc2 values (1, '自然语言处理很有趣'), (2, '数据库系统性能优化');
+select id from t_doc2 where match(body) against('自然语言') order by id;
+select id from t_doc2 where match(body) against('数据库系统') order by id;
+select id from t_doc2 where match(body) against('量子计算') order by id;
+
+drop table t_sig;
+drop table t_doc;
+drop table t_doc2;
+drop database fts_dict_cache;

@@ -1,0 +1,147 @@
+drop database if exists fts_dict_cache;
+create database fts_dict_cache;
+use fts_dict_cache;
+set ob_query_timeout = 10000000000;
+result_format: 4
+create table t_doc (
+  id int primary key,
+  title varchar(100),
+  body text,
+  fulltext index fti(title, body) with parser ik);
+
+insert into t_doc values
+  (1, '电影评论', '昨晚看的一部电影非常感人，让我思考了很多。'),
+  (2, 'Security Audit', 'Completed the annual security audit and data protection review.');
+
+create table t_sig (id int primary key, sig varchar(64));
+
+insert into t_sig values (1, md5(cast(tokenize('电影评论', 'ik') as char)));
+insert into t_sig values (2, md5(cast(tokenize('电影评论', 'ik') as char)));
+insert into t_sig values (3, md5(cast(tokenize('电影评论', 'ik') as char)));
+select count(distinct sig) as distinct_sig_cnt from t_sig;
++------------------+
+| distinct_sig_cnt |
++------------------+
+|                1 |
++------------------+
+
+select tokenize('电影评论', 'space');
++-----------------------------------+
+| tokenize('电影评论', 'space')     |
++-----------------------------------+
+| ["电影评论"]                      |
++-----------------------------------+
+select tokenize('电影评论', 'ngram');
++-----------------------------------+
+| tokenize('电影评论', 'ngram')     |
++-----------------------------------+
+| ["影评", "电影", "评论"]          |
++-----------------------------------+
+select tokenize('电影评论', 'beng');
++----------------------------------+
+| tokenize('电影评论', 'beng')     |
++----------------------------------+
+| ["电影评论"]                     |
++----------------------------------+
+select tokenize('中华人民共和国人民大会堂', 'ik', '[{"additional_args": [{"ik_mode": "max_word"}]}]');
++-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| tokenize('中华人民共和国人民大会堂', 'ik', '[{"additional_args": [{"ik_mode": "max_word"}]}]')                                                                                                  |
++-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| ["大会", "人民大会堂", "大会堂", "共和国", "人民大会", "人民共和国", "中华人民", "共和", "会堂", "中华", "中华人民共和国", "国人", "华人", "人民"]                                              |
++-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+insert into t_sig values (4, md5(cast(tokenize('电影评论', 'ik') as char)));
+select count(distinct sig) as distinct_sig_cnt from t_sig;
++------------------+
+| distinct_sig_cnt |
++------------------+
+|                1 |
++------------------+
+
+select tokenize('电影评论', 'ik');
++--------------------------------+
+| tokenize('电影评论', 'ik')     |
++--------------------------------+
+| ["电影", "评论"]               |
++--------------------------------+
+select id from t_doc where match(title, body) against('电影') order by id;
++----+
+| id |
++----+
+|  1 |
++----+
+select id from t_doc where match(title, body) against('评论') order by id;
++----+
+| id |
++----+
+|  1 |
++----+
+select tokenize('Security Audit', 'ik');
++----------------------------------+
+| tokenize('Security Audit', 'ik') |
++----------------------------------+
+| ["security", "audit"]            |
++----------------------------------+
+select id from t_doc where match(title, body) against('security') order by id;
++----+
+| id |
++----+
+|  2 |
++----+
+select id from t_doc where match(title, body) against('audit') order by id;
++----+
+| id |
++----+
+|  2 |
++----+
+
+select id from t_doc where match(title, body) against('量子计算') order by id;
++----+
+| id |
++----+
++----+
+select id from t_doc where match(title, body) against('blockchain') order by id;
++----+
+| id |
++----+
++----+
+
+alter system flush kvcache cache = 'dict_cache';
+
+insert into t_sig values (5, md5(cast(tokenize('电影评论', 'ik') as char)));
+select count(distinct sig) as distinct_sig_cnt from t_sig;
++------------------+
+| distinct_sig_cnt |
++------------------+
+|                1 |
++------------------+
+select id from t_doc where match(title, body) against('电影') order by id;
++----+
+| id |
++----+
+|  1 |
++----+
+
+create table t_doc2 (id int primary key, body text, fulltext index fti2(body) with parser ik);
+insert into t_doc2 values (1, '自然语言处理很有趣'), (2, '数据库系统性能优化');
+select id from t_doc2 where match(body) against('自然语言') order by id;
++----+
+| id |
++----+
+|  1 |
++----+
+select id from t_doc2 where match(body) against('数据库系统') order by id;
++----+
+| id |
++----+
+|  2 |
++----+
+select id from t_doc2 where match(body) against('量子计算') order by id;
++----+
+| id |
++----+
++----+
+
+drop table t_sig;
+drop table t_doc;
+drop table t_doc2;
+drop database fts_dict_cache;
