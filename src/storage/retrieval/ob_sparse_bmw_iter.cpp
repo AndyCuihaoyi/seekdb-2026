@@ -32,7 +32,10 @@ ObSRBMWIterImpl::ObSRBMWIterImpl()
     top_k_count_(0),
     domain_id_cmp_(),
     id_cache_(),
-    status_(BMWStatus::MAX_STATUS)
+    status_(BMWStatus::MAX_STATUS),
+    skip_pivot_range_test_(false),
+    pivot_range_accept_cnt_(0),
+    pivot_range_skip_cnt_(0)
 {}
 
 int ObSRBMWIterImpl::init(
@@ -127,6 +130,9 @@ int ObSRBMWIterImpl::top_k_search()
   int64_t eval_pivot_cnt = 0;
   int64_t eval_pivot_range_cnt = 0;
   int64_t skip_range_cnt = 0;
+  skip_pivot_range_test_ = false;
+  pivot_range_accept_cnt_ = 0;
+  pivot_range_skip_cnt_ = 0;
 
   int64_t pivot_iter_idx = 0;
   while (OB_SUCC(ret) && BMWStatus::FINISHED != status_) {
@@ -145,8 +151,20 @@ int ObSRBMWIterImpl::top_k_search()
       break;
     }
     case BMWStatus::EVALUATE_PIVOT_RANGE: {
-      bool is_candidate = false;
-      if (OB_FAIL(evaluate_pivot_range(pivot_iter_idx, is_candidate))) {
+      bool is_candidate = true;
+      if (skip_pivot_range_test_ && ++pivot_range_skip_cnt_ < PIVOT_RANGE_REPROBE_SKIP_CNT) {
+        // the bound has not cut a single range in this query, so spend no more seeks on it
+      } else {
+        pivot_range_skip_cnt_ = 0;
+        if (OB_FAIL(evaluate_pivot_range(pivot_iter_idx, is_candidate))) {
+        } else if (is_candidate) {
+          skip_pivot_range_test_ = ++pivot_range_accept_cnt_ >= PIVOT_RANGE_ADAPT_ACCEPT_CNT;
+        } else {
+          pivot_range_accept_cnt_ = 0;
+          skip_pivot_range_test_ = false;
+        }
+      }
+      if (OB_FAIL(ret)) {
       } else if (is_candidate) {
         ++eval_pivot_cnt;
         status_ = BMWStatus::EVALUATE_PIVOT;
