@@ -58,6 +58,7 @@ private:
   uint64_t row_idx_;
   bool is_fts_index_aux_;
   storage::ObFTParseHelper helper_;
+  storage::ObFTWordMap word_map_;
   bool is_inited_;
 
   DISALLOW_COPY_AND_ASSIGN(ObFTIndexRowCache);
@@ -182,6 +183,7 @@ public:
       ObDomainIndexRow &spat_rows);
   static int generate_fulltext_word_rows(common::ObIAllocator &allocator,
                                          storage::ObFTParseHelper *helper,
+                                         storage::ObFTWordMap &word_map,
                                          const common::ObObjMeta &ft_obj_meta,
                                          const ObDatum &doc_id_datum,
                                          const ObString &fulltext,
@@ -360,6 +362,7 @@ public:
     ft_doc_word_iter_(nullptr),
     ft_doc_word_allocator_(allocator),
     ft_parse_helper_(),
+    ft_word_map_(),
     is_inited_(false)
   {
     ObDomainDMLIterator::mode_ = mode;
@@ -393,6 +396,7 @@ private:
   data_plane::ObFTDocWordIterator *ft_doc_word_iter_;
   common::ObArenaAllocator ft_doc_word_allocator_;
   storage::ObFTParseHelper ft_parse_helper_;
+  storage::ObFTWordMap ft_word_map_;
   bool is_inited_;
 };
 
