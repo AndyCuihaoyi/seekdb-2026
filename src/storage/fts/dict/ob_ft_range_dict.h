@@ -38,7 +38,7 @@ public:
   ObFTRangeDict(ObIAllocator &alloc,
                 ObFTCacheRangeContainer *range_container,
                 const ObFTDictDesc &desc)
-      : is_inited_(false), has_char_codes_(false), desc_(desc),
+      : is_inited_(false), has_char_codes_(false), ranges_ascending_(false), desc_(desc),
         range_alloc_(lib::ObMemAttr("Range Dict")),
         range_dicts_(&range_alloc_), range_container_(range_container)
   {
@@ -102,6 +102,9 @@ private:
   }
 
   int find_first_char_range(const ObString &single_word, ObIFTDict *&dict) const;
+  // true when every range is non-empty and ranges are strictly ascending and disjoint,
+  // which lets find_first_char_range binary search instead of scanning linearly
+  bool has_ascending_ranges() const;
 
 private:
   static constexpr int DEFAULT_KEY_PER_RANGE = 50000; // by estimated
@@ -109,6 +112,7 @@ private:
   // true when every range start_/end_ is a canonical single UTF-8 character, so range
   // resolution can compare codepoints instead of binary-comparing strings
   bool has_char_codes_;
+  bool ranges_ascending_;
   ObFTDictDesc desc_;
   ObArenaAllocator range_alloc_;
   ObVector<ObFTRange, ObArenaAllocator> range_dicts_;
