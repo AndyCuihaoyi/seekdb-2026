@@ -304,10 +304,23 @@ int ObTextRetrievalTokenIter::advance_to(const ObDatum &id_datum)
 int ObTextRetrievalTokenIter::update_scan_param(const ObString &token, common::ObArenaAllocator &allocator)
 {
   int ret = OB_SUCCESS;
-  if (OB_UNLIKELY(inv_idx_agg_param_->key_ranges_.count() != 1)) {
+  const ObNewRange *range_template = nullptr;
+  if (OB_NOT_NULL(inv_idx_agg_param_)) {
+    if (OB_UNLIKELY(inv_idx_agg_param_->key_ranges_.count() != 1)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      range_template = &inv_idx_agg_param_->key_ranges_.at(0);
+    }
+  } else if (OB_UNLIKELY(inv_idx_scan_param_->key_ranges_.count() != 1)) {
+    // without the inverted index aggregate scan, the token range template can only come
+    // from the single default range shared with the aggregate scan
     ret = OB_ERR_UNEXPECTED;
   } else {
-    ObNewRange scan_range = inv_idx_agg_param_->key_ranges_.at(0);
+    range_template = &inv_idx_scan_param_->key_ranges_.at(0);
+  }
+  if (OB_FAIL(ret)) {
+  } else {
+    ObNewRange scan_range = *range_template;
     ObObj tmp_obj;
     tmp_obj.set_string(ObVarcharType, token);
     tmp_obj.set_meta_type(scan_range.start_key_.get_obj_ptr()->meta_);
