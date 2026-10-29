@@ -26,6 +26,36 @@ namespace oceanbase
 namespace storage
 {
 
+// Same ordering as memcmp over the common prefix with a length-difference tiebreak, but
+// word-wise inline: domain ids are short fixed-width keys compared several times per
+// emitted row, so the libc call overhead costs more than the byte work itself.
+// Big-endian-normalized words keep u64 ordering identical to byte ordering.
+inline int ob_binary_key_cmp(const char *lhs_ptr, const int64_t lhs_len,
+                             const char *rhs_ptr, const int64_t rhs_len)
+{
+  const int64_t min_len = lhs_len < rhs_len ? lhs_len : rhs_len;
+  int64_t off = 0;
+  for (; off + 8 <= min_len; off += 8) {
+    uint64_t l = 0;
+    uint64_t r = 0;
+    __builtin_memcpy(&l, lhs_ptr + off, sizeof(l));
+    __builtin_memcpy(&r, rhs_ptr + off, sizeof(r));
+    l = __builtin_bswap64(l);
+    r = __builtin_bswap64(r);
+    if (l != r) {
+      return l < r ? -1 : 1;
+    }
+  }
+  for (; off < min_len; ++off) {
+    const unsigned char l = static_cast<const unsigned char>(lhs_ptr[off]);
+    const unsigned char r = static_cast<const unsigned char>(rhs_ptr[off]);
+    if (l != r) {
+      return l < r ? -1 : 1;
+    }
+  }
+  return lhs_len < rhs_len ? -1 : (lhs_len > rhs_len ? 1 : 0);
+}
+
 class ObDomainIdCmp
 {
 public:
@@ -89,11 +119,7 @@ int ObDomainIdCmp::compare(const ObDatum &lhs, const ObDatum &rhs, int &cmp_ret)
   } else if (OB_LIKELY(is_binary_id_) && !lhs.is_null() && !rhs.is_null()) {
     // bit-identical to strcmpsp(CS_TYPE_BINARY, ...): memcmp over the common prefix with a
     // length-difference tiebreak, without the charset lookup and argument validation
-    const int64_t min_len = MIN(lhs.len_, rhs.len_);
-    const int memcmp_ret = min_len > 0 ? memcmp(lhs.ptr_, rhs.ptr_, min_len) : 0;
-    cmp_ret = memcmp_ret < 0 ? -1
-            : (memcmp_ret > 0 ? 1
-            : (lhs.len_ < rhs.len_ ? -1 : (lhs.len_ > rhs.len_ ? 1 : 0)));
+    cmp_ret = ob_binary_key_cmp(lhs.ptr_, lhs.len_, rhs.ptr_, rhs.len_);
   } else {
     ret = cmp_func_(lhs, rhs, cmp_ret, nullptr);
   }

@@ -579,11 +579,7 @@ int ObTextRetrievalDaaTTokenIter::compare_ids(
                 && nullptr != target.ptr_ && nullptr != curr.ptr_)) {
     // same order as strcmpsp(CS_TYPE_BINARY, ...): byte compare over the common prefix with a
     // length-difference tiebreak, without the per-call charset lookup and argument validation
-    const int64_t min_len = MIN(target.len_, curr.len_);
-    const int memcmp_ret = min_len > 0 ? memcmp(target.ptr_, curr.ptr_, min_len) : 0;
-    result = memcmp_ret < 0 ? -1
-           : (memcmp_ret > 0 ? 1
-           : (target.len_ < curr.len_ ? -1 : (target.len_ > curr.len_ ? 1 : 0)));
+    result = ob_binary_key_cmp(target.ptr_, target.len_, curr.ptr_, curr.len_);
   } else {
     ret = cmp_func_(target, curr, result, nullptr);
   }
