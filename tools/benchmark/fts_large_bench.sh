@@ -44,7 +44,12 @@ BENG_TEXT="The quick brown fox jumps over the lazy dog. Full-text search indexin
 declare -A METRICS
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/fts_large_bench.XXXXXX")"
 
-cleanup() { rm -rf "${TMP_DIR}"; }
+cleanup() {
+  if [[ -n "${OBS_PERF_PID:-}" ]]; then
+    kill -INT "${OBS_PERF_PID}" 2>/dev/null || true
+  fi
+  rm -rf "${TMP_DIR}"
+}
 trap cleanup EXIT
 
 log() { echo "$@" >&2; }
@@ -227,6 +232,9 @@ write_report() {
     echo "build_ik_content_sec:   ${METRICS[build_ik_content_sec]:-N/A}"
     echo "build_beng_en_sec:      ${METRICS[build_beng_en_sec]:-N/A}"
     echo "build_total_sec:        ${METRICS[build_total_sec]:-N/A}"
+    echo "build_cpu_sec:          ${METRICS[build_cpu_sec]:-N/A}"
+    echo "build_insn:             ${METRICS[build_insn]:-N/A}"
+    echo "build_major_faults:     ${METRICS[build_major_faults]:-N/A}"
     echo "----------------------------------------"
     echo "tokenize_ik_avg_ms:     ${METRICS[tokenize_ik_avg_ms]:-N/A}"
     echo "tokenize_ik_median_ms:  ${METRICS[tokenize_ik_median_ms]:-N/A}"
@@ -293,6 +301,15 @@ if [[ "${SKIP_LOAD}" != "1" ]]; then
 
   log "[3/5] build fulltext indexes ..."
   build_start_ns=$(now_ns)
+  # Optional host-independent build cost: OBS_PID names the observer process; its CPU time
+  # and retired instructions do not depend on how busy the machine is.
+  obs_cpu_ticks_start=""
+  if [[ -n "${OBS_PID:-}" && -r "/proc/${OBS_PID}/stat" ]]; then
+    obs_cpu_ticks_start=$(awk '{print $14+$15}' "/proc/${OBS_PID}/stat")
+    perf stat -p "${OBS_PID}" -e instructions -e major-faults -x, -o "${TMP_DIR}/build.perf" &
+    OBS_PERF_PID=$!
+    sleep 0.2
+  fi
   time_mysql_command "build_ik_all" \
     "USE fts_large_bench; ALTER TABLE docs ADD FULLTEXT INDEX fti_all_ik(title, content) WITH PARSER ik;"
   time_mysql_command "build_ik_content" \
@@ -301,6 +318,16 @@ if [[ "${SKIP_LOAD}" != "1" ]]; then
     "USE fts_large_bench; ALTER TABLE docs ADD FULLTEXT INDEX fti_en_beng(title_en, content_en) WITH PARSER beng;"
   build_end_ns=$(now_ns)
   METRICS[build_total_sec]="$(elapsed_sec "${build_start_ns}" "${build_end_ns}")"
+  if [[ -n "${OBS_PERF_PID:-}" ]]; then
+    kill -INT "${OBS_PERF_PID}" 2>/dev/null || true
+    wait "${OBS_PERF_PID}" 2>/dev/null || true
+    unset OBS_PERF_PID
+    obs_cpu_ticks_end=$(awk '{print $14+$15}' "/proc/${OBS_PID}/stat")
+    obs_clk_tck=$(getconf CLK_TCK 2>/dev/null || echo 100)
+    METRICS[build_cpu_sec]=$(awk -v a="${obs_cpu_ticks_start}" -v b="${obs_cpu_ticks_end}" -v h="${obs_clk_tck}" 'BEGIN{printf "%.2f", (b-a)/h}')
+    METRICS[build_insn]=$(awk -F, '$3=="instructions"{print $1}' "${TMP_DIR}/build.perf" | tr -d ' ')
+    METRICS[build_major_faults]=$(awk -F, '$3=="major-faults"{print $1}' "${TMP_DIR}/build.perf" | tr -d ' ')
+  fi
 else
   log "[1-3/5] SKIP_LOAD=1, reuse existing fts_large_bench.docs and indexes"
   loaded=$(mysql_exec "USE fts_large_bench; SELECT COUNT(*) FROM docs;" 2>/dev/null | tail -1 || echo "0")
