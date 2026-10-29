@@ -65,7 +65,12 @@ public:
   // no duplicate should be inserted
   int insert(const ObString &key, ObFTWordCode code);
 
-  int find(const ObFTSingleWord &word, ObFTWordCode &code) const;
+  // word/word_len identify a single character; taking them separately lets callers on the
+  // hot path skip building an ObFTSingleWord when the lookup is served by the find cache.
+  int find(const char *word, const int32_t word_len, ObFTWordCode &code) const;
+  // Uncached probe for maps that are still being built: insert() can change the answer, so
+  // the runtime find() cache must not be used there.
+  int probe(const ObFTSingleWord &word, ObFTWordCode &code) const;
 
 private:
   struct Header header_;

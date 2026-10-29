@@ -44,6 +44,62 @@ namespace oceanbase
 namespace storage
 {
 
+namespace
+{
+// The range boundaries never change after init, so the range resolved for the first
+// character of a word is a pure function of (range dict, character). Text repeats
+// characters heavily, so a small thread local directory skips the binary search for them.
+// The range dict pointer doubles as the tag.
+constexpr int64_t FT_RANGE_CACHE_CNT = 512;
+
+struct ObFTRangeCacheEntry
+{
+  const ObFTRangeDict *range_dict_;
+  uint64_t word_key_;
+  ObIFTDict *dict_;
+  bool found_;
+};
+
+// POD holder: constant initialization keeps the thread local array free of a per-access
+// dynamic initialization guard.
+thread_local ObFTRangeCacheEntry ft_range_cache[FT_RANGE_CACHE_CNT];
+
+// Words here are single UTF-8 characters (at most 4 bytes). Constant-size loads keep the
+// copy inline: a variable-length memcpy compiles to a libc call that costs more than the
+// binary search it replaces.
+uint64_t pack_first_char(const char *word, const int64_t word_len)
+{
+  uint64_t payload = 0;
+  switch (word_len) {
+    case 1: {
+      payload = static_cast<uint8_t>(word[0]);
+      break;
+    }
+    case 2: {
+      uint16_t head = 0;
+      MEMCPY(&head, word, sizeof(head));
+      payload = head;
+      break;
+    }
+    case 3: {
+      uint16_t head = 0;
+      MEMCPY(&head, word, sizeof(head));
+      payload = head | (static_cast<uint64_t>(static_cast<uint8_t>(word[2])) << 16);
+      break;
+    }
+    case 4: {
+      uint32_t head = 0;
+      MEMCPY(&head, word, sizeof(head));
+      payload = head;
+      break;
+    }
+    default: {
+      break;
+    }
+  }
+  return payload ^ (static_cast<uint64_t>(word_len) << 56);
+}
+} // namespace
 
 int ObFTRangeDict::build_cache_from_ik_dict(const ObFTDictDesc &desc, ObFTCacheRangeContainer &range_container)
 {
@@ -458,6 +514,23 @@ int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict 
   int ret = OB_SUCCESS;
   bool found = false;
   dict = nullptr;
+  // Serve repeated first characters from the per-thread directory: the resolved range is a
+  // pure function of (range dict, word) because the boundaries never change after init.
+  // Words longer than a UTF-8 character cannot be cached (packed key) and bypass the cache.
+  const bool cacheable = OB_NOT_NULL(single_word.ptr()) && single_word.length() > 0
+                         && single_word.length() <= 4;
+  uint64_t word_key = 0;
+  ObFTRangeCacheEntry *entry = nullptr;
+  if (cacheable) {
+    word_key = pack_first_char(single_word.ptr(), single_word.length());
+    uint64_t hash = (word_key ^ reinterpret_cast<uint64_t>(this)) * 0x9E3779B97F4A7C15ULL;
+    hash ^= hash >> 29;
+    entry = &ft_range_cache[hash & (FT_RANGE_CACHE_CNT - 1)];
+    if (entry->range_dict_ == this && entry->word_key_ == word_key) {
+      dict = entry->dict_;
+      return entry->found_ ? OB_SUCCESS : OB_ENTRY_NOT_EXIST;
+    }
+  }
   // Codepoint comparison is equivalent to the binary comparison below because the range
   // bounds are single canonical UTF-8 characters: UTF-8 byte order preserves codepoint
   // order and a single character is never a byte-prefix of a different character.
@@ -511,6 +584,12 @@ int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict 
   if (!found) {
     // not found, dis match
     ret = OB_ENTRY_NOT_EXIST;
+  }
+  if (nullptr != entry) {
+    entry->range_dict_ = this;
+    entry->word_key_ = word_key;
+    entry->dict_ = dict;
+    entry->found_ = found;
   }
   return ret;
 }

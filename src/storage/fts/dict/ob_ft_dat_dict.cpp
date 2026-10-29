@@ -230,7 +230,7 @@ int ObFTDATBuilder<DATA_TYPE>::encode(const ObString &word, ObFTWordCode &code, 
   ObFTWordCode code_value;
   ObFTSingleWord single_word;
   single_word.set_word(word.ptr(), word.length());
-  ret = map_->find(single_word, code);
+  ret = map_->probe(single_word, code);
   if (OB_ENTRY_NOT_EXIST == ret) {
     if (add) {
       code = next_code_++;
@@ -258,9 +258,8 @@ int ObFTDATReader<DATA_TYPE>::match_with_hit(const ObString &ft_char,
   int32_t *base = reinterpret_cast<int32_t *>(dat_->buff + dat_->base_offset_);
   int32_t *check = reinterpret_cast<int32_t *>(dat_->buff + dat_->check_offset_);
 
-  ObFTSingleWord word;
-  word.set_word(ft_char.ptr(), ft_char.length());
-  if (OB_FAIL(dat_->get_map()->find(word, code)) && OB_ENTRY_NOT_EXIST != ret) {
+  if (OB_FAIL(map->find(ft_char.ptr(), static_cast<int32_t>(ft_char.length()), code))
+      && OB_ENTRY_NOT_EXIST != ret) {
   } else if (OB_ENTRY_NOT_EXIST == ret) {
     ret = OB_SUCCESS;
     hit.set_unmatch();
@@ -299,7 +298,104 @@ template class ObFTDATReader<void>;
 
 ObArrayHashMap *ObFTDAT::get_map() { return reinterpret_cast<ObArrayHashMap *>(buff); }
 
-int ObArrayHashMap::find(const ObFTSingleWord &word, ObFTWordCode &code) const
+namespace
+{
+// A dict's char -> code mapping is immutable once the dict is published: ObFTDictHub builds
+// each cached dict once for the process lifetime (see ob_ft_dict_hub.h) and the DAT blocks
+// stay pinned by the cache container. The murmur hash plus the capacity modulo below cost
+// more than the lookup itself, and text repeats characters heavily, so a small thread local
+// directory serves the repeated single characters. The map pointer doubles as the tag.
+constexpr int64_t FT_WORD_CODE_CACHE_CNT = 2048;
+
+struct ObFTWordCodeCacheEntry
+{
+  const ObArrayHashMap *map_;
+  uint64_t word_key_;
+  int32_t code_;
+  bool found_;
+};
+
+// POD holder: constant initialization keeps the thread local array free of a per-access
+// dynamic initialization guard.
+thread_local ObFTWordCodeCacheEntry ft_word_code_cache[FT_WORD_CODE_CACHE_CNT];
+
+// Single characters are 1 to MAX_MB_LEN bytes. Constant-size loads keep the copy inline:
+// a variable-length memcpy here compiles to a libc call that costs more than the hash it
+// replaces.
+uint64_t pack_single_word(const char *word, const int32_t word_len)
+{
+  uint64_t payload = 0;
+  switch (word_len) {
+    case 1: {
+      payload = static_cast<uint8_t>(word[0]);
+      break;
+    }
+    case 2: {
+      uint16_t head = 0;
+      MEMCPY(&head, word, sizeof(head));
+      payload = head;
+      break;
+    }
+    case 3: {
+      uint16_t head = 0;
+      MEMCPY(&head, word, sizeof(head));
+      payload = head | (static_cast<uint64_t>(static_cast<uint8_t>(word[2])) << 16);
+      break;
+    }
+    case 4: {
+      uint32_t head = 0;
+      MEMCPY(&head, word, sizeof(head));
+      payload = head;
+      break;
+    }
+    case 5: {
+      uint32_t head = 0;
+      MEMCPY(&head, word, sizeof(head));
+      payload = head | (static_cast<uint64_t>(static_cast<uint8_t>(word[4])) << 32);
+      break;
+    }
+    default: {
+      break;
+    }
+  }
+  return payload ^ (static_cast<uint64_t>(word_len) << 56);
+}
+} // namespace
+
+int ObArrayHashMap::find(const char *word, const int32_t word_len, ObFTWordCode &code) const
+{
+  int ret = OB_ENTRY_NOT_EXIST;
+  // Dict keys are single characters; anything longer cannot be in the map.
+  const bool cacheable = word_len > 0 && word_len <= static_cast<int32_t>(common::ObCharset::MAX_MB_LEN);
+  uint64_t word_key = 0;
+  ObFTWordCodeCacheEntry *entry = nullptr;
+  if (cacheable) {
+    word_key = pack_single_word(word, word_len);
+    uint64_t hash = (word_key ^ reinterpret_cast<uint64_t>(this)) * 0x9E3779B97F4A7C15ULL;
+    hash ^= hash >> 29;
+    entry = &ft_word_code_cache[hash & (FT_WORD_CODE_CACHE_CNT - 1)];
+    if (entry->map_ == this && entry->word_key_ == word_key) {
+      if (entry->found_) {
+        code = entry->code_;
+        ret = OB_SUCCESS;
+      }
+      return ret;
+    }
+  }
+  ObFTSingleWord single;
+  if (!cacheable || OB_SUCCESS == single.set_word(word, word_len)) {
+    ret = probe(single, code);
+  }
+  if (nullptr != entry) {
+    entry->map_ = this;
+    entry->word_key_ = word_key;
+    entry->code_ = OB_SUCCESS == ret ? code : 0;
+    entry->found_ = OB_SUCCESS == ret;
+  }
+  return ret;
+}
+
+int ObArrayHashMap::probe(const ObFTSingleWord &word, ObFTWordCode &code) const
 {
   int ret = OB_ENTRY_NOT_EXIST;
   uint64_t hash = word.get_word().hash();
