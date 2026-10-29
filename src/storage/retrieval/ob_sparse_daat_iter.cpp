@@ -105,6 +105,8 @@ ObSRDaaTIterImpl::ObSRDaaTIterImpl()
     buffered_ids_(nullptr),
     buffered_rels_(nullptr),
     next_round_idx_(nullptr),
+    emit_datums_(nullptr),
+    emit_vals_(nullptr),
     dim_weight_vals_(nullptr),
     next_round_cnt_(0),
     filter_skip_(nullptr),
@@ -157,9 +159,20 @@ int ObSRDaaTIterImpl::init(
     } else if (OB_ISNULL(filter_skip_ = sql::to_bit_vector(
                             iter_allocator_->alloc(sql::ObBitVector::memory_size(max_batch_size))))) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else if (OB_ISNULL(emit_datums_ = static_cast<ObDatum *>(
+                            iter_allocator_->alloc(max_batch_size * sizeof(ObDatum))))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else if (OB_ISNULL(emit_vals_ = static_cast<int64_t *>(
+                            iter_allocator_->alloc(max_batch_size * sizeof(int64_t))))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else if (FALSE_IT(MEMSET(emit_datums_, 0, max_batch_size * sizeof(ObDatum)))) {
+    } else if (FALSE_IT(MEMSET(emit_vals_, 0, max_batch_size * sizeof(int64_t)))) {
     } else if (OB_FAIL(merge_cmp_.init(iter_param_->id_proj_expr_->datum_meta_, &iter_domain_ids_))) {
     } else if (OB_FAIL(init_merge_heap(dim_iters_->count()))) {
     } else {
+      for (int64_t i = 0; i < max_batch_size; ++i) {
+        emit_datums_[i].ptr_ = reinterpret_cast<const char *>(emit_vals_ + i);
+      }
       for (int64_t i = 0; i < dim_iters.count(); ++i) {
         next_round_iter_idxes_[i] = i;
       }
@@ -264,6 +277,8 @@ void ObSRDaaTIterImpl::reset()
   buffered_ids_ = nullptr;
   buffered_rels_ = nullptr;
   next_round_idx_ = nullptr;
+  emit_datums_ = nullptr;
+  emit_vals_ = nullptr;
   if (OB_NOT_NULL(iter_allocator_) && OB_NOT_NULL(dim_weight_vals_)) {
     iter_allocator_->free(dim_weight_vals_);
   }
@@ -383,15 +398,18 @@ int ObSRDaaTIterImpl::get_next_rows(const int64_t capacity, int64_t &count)
       }
     } else if (merge_emit_all_ && iter_param_->eval_ctx_->is_vectorized()) {
       // Nothing to filter and every merged doc is accepted: project each row while it is
-      // merged instead of buffering it for a separate filter, compaction and project pass
-      // locate_datums_for_update points each datum's ptr_ at its res_buf row slice; writing
-      // a scalar through a datum located any other way dereferences an uninitialized ptr_
-      ObDatum *id_datums = iter_param_->id_proj_expr_->locate_datums_for_update(
+      // merged instead of buffering it for a separate filter, compaction and project pass.
+      // The projected datums share the eval frame with the inverted-index scan output, and
+      // loading the next dimension batch re-points that frame at the scan res_buf and
+      // overwrites rows already emitted in this batch. Merge into scratch datums and
+      // publish to the frame only once the batch is complete.
+      ObDatum *frame_id_datums = iter_param_->id_proj_expr_->locate_datums_for_update(
           *iter_param_->eval_ctx_, real_capacity);
       ObDatum *rel_datums = iter_param_->need_project_relevance()
           ? iter_param_->relevance_proj_expr_->locate_datums_for_update(
                 *iter_param_->eval_ctx_, real_capacity)
           : nullptr;
+      ObDatum *id_datums = emit_datums_;
       bool iter_end = false;
       while (OB_SUCC(ret) && !iter_end && count < real_capacity) {
         if (OB_FAIL(do_one_merge_round_emit(count, id_datums, rel_datums))) {
@@ -403,9 +421,15 @@ int ObSRDaaTIterImpl::get_next_rows(const int64_t capacity, int64_t &count)
         }
       }
       if (OB_SUCC(ret) && count > 0) {
+        MEMCPY(frame_id_datums, id_datums, count * sizeof(ObDatum));
         iter_param_->id_proj_expr_->set_evaluated_projected(*iter_param_->eval_ctx_);
         iter_param_->id_proj_expr_->get_evaluated_flags(*iter_param_->eval_ctx_).set_all(static_cast<int64_t>(0), count);
         if (OB_NOT_NULL(rel_datums)) {
+          // the score is constant zero on this path; write it after the merge so a
+          // dimension batch reload cannot leave stale values in the relevance frame
+          for (int64_t i = 0; i < count; ++i) {
+            rel_datums[i].set_double(0.0);
+          }
           iter_param_->relevance_proj_expr_->set_evaluated_projected(*iter_param_->eval_ctx_);
           iter_param_->relevance_proj_expr_->get_evaluated_flags(*iter_param_->eval_ctx_).set_all(static_cast<int64_t>(0), count);
         }
@@ -548,48 +572,46 @@ int ObSRDaaTIterImpl::fast_fill_dims()
 
 // same min-docid selection and consumed-dim marking as fast_collect_dims, without the
 // relevance collector: only used when the collector accepts every merged doc
+//
+// One pass over the dim registers instead of two: dims tying with the running minimum are
+// recorded as they are found. A strictly smaller id is smaller than every id seen before it,
+// so the recorded set can be restarted and stays ascending by dim index, exactly like the
+// ascending second pass it replaces.
 int ObSRDaaTIterImpl::fast_pick_min(const ObDatum *&id_datum, bool &got_valid_id)
 {
   int ret = OB_SUCCESS;
   got_valid_id = false;
   int64_t min_d = -1;
+  const ObDatum *min_id = nullptr;
+  next_round_cnt_ = 0;
   for (int64_t d = 0; OB_SUCC(ret) && d < dim_cnt_; ++d) {
     if (!dim_states_[d].active_) {
       continue;
     } else if (min_d < 0) {
       min_d = d;
+      min_id = dim_states_[d].id_;
+      next_round_idx_[next_round_cnt_++] = d;
     } else {
       int64_t cmp_ret = 0;
-      if (OB_FAIL(merge_cmp_.cmp_datum(*dim_states_[d].id_, *dim_states_[min_d].id_, cmp_ret))) {
+      if (OB_FAIL(merge_cmp_.cmp_datum(*dim_states_[d].id_, *min_id, cmp_ret))) {
       } else if (cmp_ret < 0) {
+        next_round_cnt_ = 0;
         min_d = d;
+        min_id = dim_states_[d].id_;
+        next_round_idx_[next_round_cnt_++] = d;
+      } else if (0 == cmp_ret) {
+        next_round_idx_[next_round_cnt_++] = d;
       }
     }
   }
   if (OB_FAIL(ret)) {
   } else if (min_d < 0) {
     ret = OB_ITER_END;
+  } else if (OB_ISNULL(min_id)) {
+    ret = OB_ERR_UNEXPECTED;
   } else {
-    const ObDatum *min_id = dim_states_[min_d].id_;
-    next_round_cnt_ = 0;
-    for (int64_t d = 0; OB_SUCC(ret) && d < dim_cnt_; ++d) {
-      if (!dim_states_[d].active_) {
-        continue;
-      }
-      int64_t cmp_ret = 0;
-      if (OB_FAIL(merge_cmp_.cmp_datum(*dim_states_[d].id_, *min_id, cmp_ret))) {
-      } else if (0 == cmp_ret) {
-        next_round_idx_[next_round_cnt_++] = d;
-      }
-    }
-    if (OB_SUCC(ret)) {
-      if (OB_ISNULL(min_id)) {
-        ret = OB_ERR_UNEXPECTED;
-      } else {
-        id_datum = min_id;
-        got_valid_id = true;
-      }
-    }
+    id_datum = min_id;
+    got_valid_id = true;
   }
   return ret;
 }
@@ -600,50 +622,48 @@ int ObSRDaaTIterImpl::fast_collect_dims(const ObDatum *&id_datum, double &releva
   relevance = 0.0;
   got_valid_id = false;
   int64_t min_d = -1;
+  const ObDatum *min_id = nullptr;
+  next_round_cnt_ = 0;
+  // one compare pass, see fast_pick_min: the collected dims stay ascending by index, so the
+  // relevance sum is taken in the same order as before
   for (int64_t d = 0; OB_SUCC(ret) && d < dim_cnt_; ++d) {
     if (!dim_states_[d].active_) {
       continue;
     } else if (min_d < 0) {
       min_d = d;
+      min_id = dim_states_[d].id_;
+      next_round_idx_[next_round_cnt_++] = d;
     } else {
       int64_t cmp_ret = 0;
-      if (OB_FAIL(merge_cmp_.cmp_datum(*dim_states_[d].id_, *dim_states_[min_d].id_, cmp_ret))) {
+      if (OB_FAIL(merge_cmp_.cmp_datum(*dim_states_[d].id_, *min_id, cmp_ret))) {
       } else if (cmp_ret < 0) {
+        next_round_cnt_ = 0;
         min_d = d;
+        min_id = dim_states_[d].id_;
+        next_round_idx_[next_round_cnt_++] = d;
+      } else if (0 == cmp_ret) {
+        next_round_idx_[next_round_cnt_++] = d;
       }
     }
   }
   if (OB_FAIL(ret)) {
   } else if (min_d < 0) {
     ret = OB_ITER_END;
+  } else if (OB_ISNULL(min_id)) {
+    ret = OB_ERR_UNEXPECTED;
   } else {
-    const ObDatum *min_id = dim_states_[min_d].id_;
-    next_round_cnt_ = 0;
-    for (int64_t d = 0; OB_SUCC(ret) && d < dim_cnt_; ++d) {
-      if (!dim_states_[d].active_) {
-        continue;
-      }
-      int64_t cmp_ret = 0;
-      if (OB_FAIL(merge_cmp_.cmp_datum(*dim_states_[d].id_, *min_id, cmp_ret))) {
-      } else if (0 != cmp_ret) {
-        // stays in the merge with its current row, not re-fetched next round
-      } else if (merge_emit_all_) {
-        next_round_idx_[next_round_cnt_++] = d;
-      } else if (OB_FAIL(relevance_collector_->collect_one_dim(d, dim_states_[d].rel_))) {
-      } else {
-        next_round_idx_[next_round_cnt_++] = d;
+    id_datum = min_id;
+    for (int64_t i = 0; !merge_emit_all_ && OB_SUCC(ret) && i < next_round_cnt_; ++i) {
+      const int64_t d = next_round_idx_[i];
+      if (OB_FAIL(relevance_collector_->collect_one_dim(d, dim_states_[d].rel_))) {
       }
     }
-    if (OB_SUCC(ret)) {
-      id_datum = min_id;
-      if (OB_ISNULL(id_datum)) {
-        ret = OB_ERR_UNEXPECTED;
-      } else if (merge_emit_all_) {
-        // the collector accepts every merged doc and its score is not observed
-        got_valid_id = true;
-      } else if (OB_FAIL(relevance_collector_->get_result(relevance, got_valid_id))) {
-      } else if (got_valid_id && OB_FAIL(process_collected_row(*id_datum, relevance))) {
-      }
+    if (OB_FAIL(ret)) {
+    } else if (merge_emit_all_) {
+      // the collector accepts every merged doc and its score is not observed
+      got_valid_id = true;
+    } else if (OB_FAIL(relevance_collector_->get_result(relevance, got_valid_id))) {
+    } else if (got_valid_id && OB_FAIL(process_collected_row(*id_datum, relevance))) {
     }
   }
   return ret;
