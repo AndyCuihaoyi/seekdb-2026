@@ -179,7 +179,7 @@ int ObTransformPreProcess::transform_one_stmt(common::ObIArray<ObParentDMLStmt> 
     }
     if (OB_SUCC(ret)) {
       if (stmt->get_match_exprs().count() > 0 &&
-          OB_FAIL(preserve_order_for_fulltext_search(stmt, is_happened))) {
+          OB_FAIL(preserve_order_for_fulltext_search(parent_stmts, stmt, is_happened))) {
       } else {
         trans_happened |= is_happened;
       }
@@ -3788,9 +3788,66 @@ int ObTransformPreProcess::do_flatten_conditions(ObDMLStmt *stmt, ObIArray<ObRaw
   return ret;
 }
 
+// Cardinality-invariance lemma: when a derived table is consumed only by an outer
+// single-table COUNT(*), the value crossing that boundary is min(limit, |matches|) and
+// does not depend on which matched rows the LIMIT picked. The relevance score is then
+// unobservable outside the derived table, so the retrieval scan may return the matching
+// documents in docid order and stop once the limit is reached instead of evaluating a
+// relevance top-k over the whole match set.
+int ObTransformPreProcess::check_derived_table_rows_only_counted(
+    const common::ObIArray<ObParentDMLStmt> &parent_stmts,
+    const ObSelectStmt &stmt,
+    bool &only_counted)
+{
+  int ret = OB_SUCCESS;
+  only_counted = false;
+  const ObDMLStmt *parent = nullptr;
+  if (parent_stmts.empty()) {
+    // a top-level statement delivers its rows to the client
+  } else if (OB_ISNULL(parent = parent_stmts.at(parent_stmts.count() - 1).stmt_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (!parent->is_select_stmt()) {
+    // rows feed a DML statement
+  } else if (NULL == stmt.get_limit_expr()) {
+    // without a LIMIT inside the derived table the whole match set crosses the boundary
+  } else if (NULL != stmt.get_limit_percent_expr() || stmt.is_calc_found_rows()
+             || stmt.has_select_into() || stmt.is_set_stmt()) {
+    // constructs that read the derived rows themselves
+  } else {
+    const ObSelectStmt *consumer = static_cast<const ObSelectStmt *>(parent);
+    const TableItem *table = nullptr;
+    const ObRawExpr *select_expr = nullptr;
+    if (consumer->is_set_stmt() || consumer->is_calc_found_rows()
+        || consumer->has_select_into() || consumer->has_window_function()
+        || consumer->has_window_function_filter() || consumer->is_distinct()
+        || consumer->has_order_by() || consumer->has_having()
+        || consumer->has_limit() || 1 != consumer->get_table_items().count()
+        || 1 != consumer->get_from_item_size() || 1 != consumer->get_aggr_item_size()
+        || 1 != consumer->get_select_items().count()
+        || 0 != consumer->get_group_expr_size() || 0 != consumer->get_rollup_expr_size()
+        || !consumer->get_condition_exprs().empty() || !consumer->get_semi_infos().empty()) {
+      // the consumer reads more than the cardinality of the derived table
+    } else if (OB_ISNULL(table = consumer->get_table_item(0))) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (!table->is_generated_table() || table->ref_query_ != &stmt) {
+      // the consumer's only table is not this statement
+    } else if (OB_ISNULL(select_expr = consumer->get_select_items().at(0).expr_)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (T_FUN_COUNT != select_expr->get_expr_type() || 0 != select_expr->get_param_count()) {
+      // the consumer projects something other than COUNT(*)
+    } else {
+      only_counted = true;
+    }
+  }
+  return ret;
+}
+
 // full-text index queries on a single base table are processed with order preservation. 
 // (Order is not preserved in multi-table join scenarios.)
-int ObTransformPreProcess::preserve_order_for_fulltext_search(ObDMLStmt *stmt, bool& trans_happened)
+int ObTransformPreProcess::preserve_order_for_fulltext_search(
+    const common::ObIArray<ObParentDMLStmt> &parent_stmts,
+    ObDMLStmt *stmt,
+    bool& trans_happened)
 {
   int ret = OB_SUCCESS;
   trans_happened = false;
@@ -3937,10 +3994,20 @@ int ObTransformPreProcess::preserve_order_for_fulltext_search(ObDMLStmt *stmt, b
     }
   }
   if (OB_SUCC(ret) && nullptr != match_expr && !static_cast<ObMatchFunRawExpr*>(match_expr)->is_es_match()) {
-    OrderItem item(match_expr, default_desc_direction());
-    if (OB_FAIL(stmt->add_order_item(item))) {
+    bool only_counted = false;
+    if (NATURAL_LANGUAGE_MODE != static_cast<ObMatchFunRawExpr *>(match_expr)->get_mode_flag()) {
+      // boolean mode MATCH is a plain predicate: leave its plan as before
+    } else if (OB_FAIL(check_derived_table_rows_only_counted(
+                   parent_stmts, *static_cast<ObSelectStmt *>(stmt), only_counted))) {
+    } else if (only_counted) {
+      // keep the statement order-free: the scan then returns the matching documents in
+      // primary-key order and terminates once the limit is reached
     } else {
-      trans_happened = true;
+      OrderItem item(match_expr, default_desc_direction());
+      if (OB_FAIL(stmt->add_order_item(item))) {
+      } else {
+        trans_happened = true;
+      }
     }
   } 
   return ret;
