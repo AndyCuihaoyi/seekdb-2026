@@ -1894,7 +1894,10 @@ int ObTscCgService::generate_text_ir_ctdef(const ObLogTableScan &op,
 
   if (OB_SUCC(ret)) {
     root_ctdef = ir_scan_ctdef;
-    if (OB_FAIL(generate_text_ir_spec_exprs(tr_info, *ir_scan_ctdef))) {
+    bool proj_unobserved = false;
+    if (OB_FAIL(check_text_proj_unobserved(op, cg_ctx, tr_info, proj_unobserved))) {
+      LOG_WARN("failed to check text retrieval projection", K(ret));
+    } else if (OB_FAIL(generate_text_ir_spec_exprs(tr_info, *ir_scan_ctdef, proj_unobserved))) {
     } else {
       const ObCostTableScanInfo *est_cost_info = op.get_est_cost_info();
       int partition_row_cnt = 0;
@@ -2994,8 +2997,35 @@ int ObTscCgService::generate_spiv_block_max_spec(
   return ret;
 }
 
+int ObTscCgService::check_text_proj_unobserved(const ObLogTableScan &op,
+                                               const DASScanCGCtx &cg_ctx,
+                                               const ObTextRetrievalInfo &tr_info,
+                                               bool &unobserved)
+{
+  int ret = OB_SUCCESS;
+  unobserved = false;
+  // The merge iter projects the matched doc id (and the score) into the eval frame only so an
+  // operator above the scan can read them. When the scan is a pure filter -- no index back, no
+  // domain id/rowkey lookup, no sort or score consumer -- nothing reads those datums and the
+  // per-row materialization is dead work.
+  if (!cg_ctx.is_func_lookup_ && !cg_ctx.is_vec_iter_func_lookup_
+      && !cg_ctx.is_es_match_ && !cg_ctx.is_merge_fts_index_
+      && !op.need_get_rowkey_exprs() && !tr_info.need_sort() && tr_info.skip_relevance_eval_) {
+    unobserved = true;
+    const common::ObIArray<ObRawExpr *> &output_exprs = op.get_output_exprs();
+    for (int64_t i = 0; unobserved && i < output_exprs.count(); ++i) {
+      ObRawExpr *expr = output_exprs.at(i);
+      if (expr == tr_info.docid_or_rowkey_column_ || (OB_NOT_NULL(expr) && expr->is_match_against_expr())) {
+        unobserved = false;
+      }
+    }
+  }
+  return ret;
+}
+
 int ObTscCgService::generate_text_ir_spec_exprs(const ObTextRetrievalInfo &tr_info,
-                                                ObDASIRScanCtDef &text_ir_scan_ctdef)
+                                                ObDASIRScanCtDef &text_ir_scan_ctdef,
+                                                const bool proj_unobserved)
 {
   int ret = OB_SUCCESS;
   ObSEArray<ObExpr *, 4> result_output;
@@ -3007,6 +3037,7 @@ int ObTscCgService::generate_text_ir_spec_exprs(const ObTextRetrievalInfo &tr_in
   } else {
     text_ir_scan_ctdef.mode_flag_ = tr_info.match_expr_->get_mode_flag();
     text_ir_scan_ctdef.skip_relevance_eval_ = tr_info.skip_relevance_eval_ ? 1 : 0;
+    text_ir_scan_ctdef.skip_proj_cols_ = proj_unobserved ? 1 : 0;
     const UIntFixedArray &inv_scan_col_id = text_ir_scan_ctdef.get_inv_idx_scan_ctdef()->access_column_ids_;
     const ObColumnRefRawExpr *doc_id_column = tr_info.docid_or_rowkey_column_;
     const ObColumnRefRawExpr *doc_length_column = tr_info.doc_length_column_;

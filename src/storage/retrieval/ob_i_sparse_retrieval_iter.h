@@ -113,6 +113,7 @@ struct ObSparseRetrievalMergeParam
       topk_limit_(0),
       field_boost_(1.0),
       skip_relevance_eval_(false),
+      skip_proj_cols_(false),
       max_batch_size_(1)
   {}
   ~ObSparseRetrievalMergeParam() {}
@@ -133,6 +134,7 @@ struct ObSparseRetrievalMergeParam
   int64_t topk_limit_;
   double field_boost_;
   bool skip_relevance_eval_; // score provably unobserved: never evaluate the BM25 expr
+  bool skip_proj_cols_; // doc id / score not read above the scan: count rows without projecting
   int64_t max_batch_size_;
 };
 

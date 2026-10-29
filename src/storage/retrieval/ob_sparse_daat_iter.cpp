@@ -115,7 +115,8 @@ ObSRDaaTIterImpl::ObSRDaaTIterImpl()
     use_fast_merge_(false),
     relevance_keep_all_(false),
     merge_emit_all_(false),
-    skip_dim_score_(false)
+    skip_dim_score_(false),
+    skip_proj_(false)
 {
 }
 
@@ -221,6 +222,7 @@ int ObSRDaaTIterImpl::init(
         skip_dim_score_ = iter_param_->skip_relevance_eval_;
         merge_emit_all_ = relevance_keep_all_ && skip_dim_score_
                           && relevance_collector.accepts_every_merged_doc();
+        skip_proj_ = merge_emit_all_ && iter_param_->skip_proj_cols_;
         if (OB_NOT_NULL(iter_param_->dim_weights_) && dim_cnt_ > 0) {
           if (OB_UNLIKELY(iter_param_->dim_weights_->count() < dim_cnt_)) {
             ret = OB_ERR_UNEXPECTED;
@@ -284,6 +286,7 @@ void ObSRDaaTIterImpl::reset()
   }
   dim_weight_vals_ = nullptr;
   merge_emit_all_ = false;
+  skip_proj_ = false;
   skip_dim_score_ = false;
   filter_skip_ = nullptr;
   next_round_cnt_ = 0;
@@ -403,9 +406,11 @@ int ObSRDaaTIterImpl::get_next_rows(const int64_t capacity, int64_t &count)
       // loading the next dimension batch re-points that frame at the scan res_buf and
       // overwrites rows already emitted in this batch. Merge into scratch datums and
       // publish to the frame only once the batch is complete.
-      ObDatum *frame_id_datums = iter_param_->id_proj_expr_->locate_datums_for_update(
-          *iter_param_->eval_ctx_, real_capacity);
-      ObDatum *rel_datums = iter_param_->need_project_relevance()
+      ObDatum *frame_id_datums = skip_proj_
+          ? nullptr
+          : iter_param_->id_proj_expr_->locate_datums_for_update(
+                *iter_param_->eval_ctx_, real_capacity);
+      ObDatum *rel_datums = (!skip_proj_ && iter_param_->need_project_relevance())
           ? iter_param_->relevance_proj_expr_->locate_datums_for_update(
                 *iter_param_->eval_ctx_, real_capacity)
           : nullptr;
@@ -420,7 +425,7 @@ int ObSRDaaTIterImpl::get_next_rows(const int64_t capacity, int64_t &count)
           }
         }
       }
-      if (OB_SUCC(ret) && count > 0) {
+      if (OB_SUCC(ret) && count > 0 && !skip_proj_) {
         MEMCPY(frame_id_datums, id_datums, count * sizeof(ObDatum));
         iter_param_->id_proj_expr_->set_evaluated_projected(*iter_param_->eval_ctx_);
         iter_param_->id_proj_expr_->get_evaluated_flags(*iter_param_->eval_ctx_).set_all(static_cast<int64_t>(0), count);
@@ -717,6 +722,14 @@ int ObSRDaaTIterImpl::emit_row(int64_t &count,
     // consumed by the offset, not projected
   } else if (OB_UNLIKELY(count < 0 || count >= buffered_domain_ids_.count())) {
     ret = OB_INVALID_ARGUMENT;
+  } else if (skip_proj_) {
+    // the caller never reads the projected doc id: count the row instead of converting the
+    // index doc id datum and re-pointing a frame datum at it
+    ++count;
+    ++output_row_cnt_;
+    if (limit_param->is_valid() && output_row_cnt_ >= limit_param->limit_) {
+      ret = OB_ITER_END;
+    }
   } else if (OB_FAIL(buffered_ids_[count].from_datum(id_datum))) {
     // the projected datum points into buffered_ids_, which outlives the source row buffer
   } else {

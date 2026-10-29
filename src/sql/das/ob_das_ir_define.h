@@ -88,6 +88,8 @@ public:
   bool skip_relevance_eval() const { return skip_relevance_eval_ || nullptr == relevance_expr_; }
   bool need_proj_relevance_score() const { return nullptr != relevance_proj_col_; }
   bool need_inv_idx_agg() const { return has_inv_agg_ && need_calc_relevance(); }
+  // merge may count rows without materializing the projected doc id / score
+  bool skip_proj_cols() const { return skip_proj_cols_ && skip_relevance_eval(); }
   bool need_block_max_scan() const { return has_block_max_scan_; }
   bool need_avg_doc_len_est() const { return has_avg_doc_len_est_ && nullptr != avg_doc_token_cnt_expr_; }
   bool has_pushdown_topk() const { return nullptr != topk_limit_expr_; }
@@ -192,7 +194,8 @@ public:
       uint8_t skip_relevance_eval_:1;
       uint8_t has_block_max_scan_:1;
       uint8_t has_avg_doc_len_est_:1;
-      uint8_t reserved_:3;
+      uint8_t skip_proj_cols_:1;
+      uint8_t reserved_:2;
     };
   };
   ObExpr *field_boost_expr_;

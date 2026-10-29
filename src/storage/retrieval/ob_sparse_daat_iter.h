@@ -156,6 +156,9 @@ protected:
   bool merge_emit_all_;
   // relevance is not computed at all: never fetch the per-dim posting score
   bool skip_dim_score_;
+  // keep-all emit and nothing above the scan reads the projected doc id / score:
+  // count merged docs instead of materializing them
+  bool skip_proj_;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObSRDaaTIterImpl);
 };

@@ -149,6 +149,7 @@ private:
   bool check_rangekey_inited_;
   bool inv_idx_tablet_switched_;
   bool skip_relevance_eval_;
+  bool skip_proj_cols_;
   bool is_inited_;
   DISALLOW_COPY_AND_ASSIGN(ObDASLegacyTRMergeIter);
 };

@@ -56,6 +56,7 @@ ObDASLegacyTRMergeIter::ObDASLegacyTRMergeIter()
     check_rangekey_inited_(false),
     inv_idx_tablet_switched_(false),
     skip_relevance_eval_(false),
+    skip_proj_cols_(false),
     is_inited_(false)
 {
 }
@@ -104,6 +105,8 @@ int ObDASLegacyTRMergeIter::inner_init(ObDASIterParam &param)
         skip_relevance_eval_ = false;
       }
     }
+    // not projecting is only sound while the score filter is also known to keep every row
+    skip_proj_cols_ = ir_ctdef_->skip_proj_cols() && skip_relevance_eval_;
     sr_iter_param_.max_batch_size_ = merge_param.max_batch_size_; // may be greater than ir_rtdef_->eval_ctx_->max_batch_size_
     inv_idx_tablet_switched_ = false;
     is_inited_ = true;
@@ -392,6 +395,7 @@ int ObDASLegacyTRMergeIter::create_sparse_retrieval_iter()
   sr_iter_param_.id_proj_expr_ = ir_ctdef_->inv_scan_domain_id_col_;
   sr_iter_param_.relevance_expr_ = ir_ctdef_->relevance_expr_;
   sr_iter_param_.skip_relevance_eval_ = skip_relevance_eval_;
+  sr_iter_param_.skip_proj_cols_ = skip_proj_cols_;
   sr_iter_param_.relevance_proj_expr_ = ir_ctdef_->relevance_proj_col_;
   sr_iter_param_.filter_expr_ = ir_ctdef_->match_filter_;
   sr_iter_param_.topk_limit_ = topk_limit_;

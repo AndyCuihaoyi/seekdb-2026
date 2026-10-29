@@ -207,8 +207,13 @@ private:
   int generate_text_ir_pushdown_expr_ctdef(const ObTextRetrievalInfo &tr_info,
                                            const ObLogTableScan &op,
                                            ObDASScanCtDef &scan_ctdef);
+  int check_text_proj_unobserved(const ObLogTableScan &op,
+                                 const DASScanCGCtx &cg_ctx,
+                                 const ObTextRetrievalInfo &tr_info,
+                                 bool &unobserved);
   int generate_text_ir_spec_exprs(const ObTextRetrievalInfo &tr_info,
-                                  ObDASIRScanCtDef &text_ir_scan_ctdef);
+                                  ObDASIRScanCtDef &text_ir_scan_ctdef,
+                                  const bool proj_unobserved);
   int check_skip_index_validity(const ObTextRetrievalInfo &tr_info, bool &is_valid) const;
   int generate_text_block_max_scan_ctdef(const ObTextRetrievalInfo &tr_info,
                                          ObDASIRScanCtDef &text_ir_scan_ctdef);
