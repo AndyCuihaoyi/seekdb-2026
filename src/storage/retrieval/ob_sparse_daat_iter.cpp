@@ -106,6 +106,7 @@ ObSRDaaTIterImpl::ObSRDaaTIterImpl()
     buffered_rels_(nullptr),
     next_round_idx_(nullptr),
     emit_datums_(nullptr),
+    emit_vals_(nullptr),
     dim_weight_vals_(nullptr),
     next_round_cnt_(0),
     filter_skip_(nullptr),
@@ -161,10 +162,17 @@ int ObSRDaaTIterImpl::init(
     } else if (OB_ISNULL(emit_datums_ = static_cast<ObDatum *>(
                             iter_allocator_->alloc(max_batch_size * sizeof(ObDatum))))) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else if (OB_ISNULL(emit_vals_ = static_cast<int64_t *>(
+                            iter_allocator_->alloc(max_batch_size * sizeof(int64_t))))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
     } else if (FALSE_IT(MEMSET(emit_datums_, 0, max_batch_size * sizeof(ObDatum)))) {
+    } else if (FALSE_IT(MEMSET(emit_vals_, 0, max_batch_size * sizeof(int64_t)))) {
     } else if (OB_FAIL(merge_cmp_.init(iter_param_->id_proj_expr_->datum_meta_, &iter_domain_ids_))) {
     } else if (OB_FAIL(init_merge_heap(dim_iters_->count()))) {
     } else {
+      for (int64_t i = 0; i < max_batch_size; ++i) {
+        emit_datums_[i].ptr_ = reinterpret_cast<const char *>(emit_vals_ + i);
+      }
       for (int64_t i = 0; i < dim_iters.count(); ++i) {
         next_round_iter_idxes_[i] = i;
       }
@@ -270,6 +278,7 @@ void ObSRDaaTIterImpl::reset()
   buffered_rels_ = nullptr;
   next_round_idx_ = nullptr;
   emit_datums_ = nullptr;
+  emit_vals_ = nullptr;
   if (OB_NOT_NULL(iter_allocator_) && OB_NOT_NULL(dim_weight_vals_)) {
     iter_allocator_->free(dim_weight_vals_);
   }
