@@ -705,8 +705,16 @@ private:
   int fetch_next_fts_index_rows();
   int fill_generated_fts_cols(blocksstable::ObDatumRow *row);
   int get_output_fts_col_expr_by_type(const ObExprOperatorType &type, ObExpr *&expr);
+  int resolve_fts_col_exprs();
   bool is_resume_point_saved();
 protected:
+  // Resolved on the first generated FTS aux row: the output expression list is fixed for the
+  // plan and the build asks for the same four generated columns on every row, so searching the
+  // list again per row is pure overhead in the hottest loop of the inverted-index build.
+  ObExpr *fts_col_exprs_[share::ObFtsIndexBuilderUtil::OB_FTS_INDEX_OR_DOC_WORD_TABLE_COL_CNT] = {};
+  ObExpr *fts_word_segment_expr_ = nullptr;
+  ObExpr *fts_doc_id_expr_ = nullptr;
+  bool fts_col_exprs_resolved_ = false;
   DASOpResultIter scan_result_;
   ObTableScanRtDef tsc_rtdef_;
   bool need_final_limit_;

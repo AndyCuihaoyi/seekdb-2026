@@ -468,6 +468,7 @@ public:
     {
       cmp_start_ = cmp_start;
       cmp_end_ = cmp_end;
+      refresh_cmp_key_ptrs();
     }
 
   public:
@@ -480,6 +481,22 @@ public:
     int64_t cmp_count_;
     int64_t cmp_start_;
     int64_t cmp_end_;
+    // The two key descriptor arrays are contiguous and immutable while the sort runs, so the
+    // range base pointers are resolved once here instead of a bounds-checked at() per key on
+    // every comparison; an in-memory sort of an aux table does millions of those.
+    const ObSortFieldCollation *collations_base_;
+    const ObSortCmpFunc *cmp_funcs_base_;
+  private:
+    void refresh_cmp_key_ptrs()
+    {
+      if (is_inited() && cmp_end_ > cmp_start_ && cmp_end_ <= sort_cmp_funs_->count()) {
+        collations_base_ = &sort_collations_->at(cmp_start_);
+        cmp_funcs_base_ = &sort_cmp_funs_->at(cmp_start_);
+      } else {
+        collations_base_ = nullptr;
+        cmp_funcs_base_ = nullptr;
+      }
+    }
   private:
     int64_t cnt_;
     DISALLOW_COPY_AND_ASSIGN(Compare);
