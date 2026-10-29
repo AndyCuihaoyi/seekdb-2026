@@ -86,8 +86,6 @@ int ObExprTokenize::tokenize_fulltext(const TokenizeParam &param,
   int64_t doc_len = 0;
   storage::ObFTWordMap token_map;
 
-  ObArenaAllocator tmp_parse_alloc(ObMemAttr("Tmp buffer"));
-
   if (TokenizeParam::OUTPUT_MODE::DEFAULT != mode && TokenizeParam::OUTPUT_MODE::ALL != mode) {
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_FAIL(tokenize_helper.init(&allocator, param.parser_name_, param.properties_))) {
@@ -203,9 +201,7 @@ int ObExprTokenize::parse_param(const ObExpr &expr,
   ObDatum *parser_params_datum;
   ObString raw_parser_name = ObString::make_string(OB_DEFAULT_FULLTEXT_PARSER_NAME);
 
-  ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
-  
-  MultimodeAlloctor temp_allocator(tmp_alloc_g.get_allocator());
+  MultimodeAlloctor temp_allocator(allocator);
 
   if (OB_UNLIKELY(expr.arg_cnt_ < 1 || expr.arg_cnt_ > 3)) {
     ret = OB_INVALID_ARGUMENT;
@@ -400,9 +396,12 @@ int ObExprTokenize::TokenizeParam::reform_parser_properties(const ObString &prop
   storage::ObFTParserJsonProps parser_properties;
   storage::ObFTParseData *parse_data = storage::ObFTParseData::try_instance();
   bool cache_hit = false;
+  // properties usually aliases properties_, which the cache lookup below overwrites;
+  // keep the raw input so cache keys stay stable across calls.
+  const ObString raw_properties = properties;
 
   if (OB_NOT_NULL(parse_data)) {
-    int tmp_ret = parse_data->get_cached_reformed_props(parser_name_, properties, properties_);
+    int tmp_ret = parse_data->get_cached_reformed_props(parser_name_, raw_properties, properties_);
     if (OB_SUCCESS == tmp_ret) {
       cache_hit = true;
     } else if (OB_ENTRY_NOT_EXIST != tmp_ret) {
@@ -413,14 +412,14 @@ int ObExprTokenize::TokenizeParam::reform_parser_properties(const ObString &prop
   if (OB_FAIL(ret) || cache_hit) {
     // done
   } else if (OB_FAIL(parser_properties.init())) {
-  } else if (OB_FAIL(parser_properties.parse_from_valid_str(properties))) {
+  } else if (OB_FAIL(parser_properties.parse_from_valid_str(raw_properties))) {
     LOG_USER_ERROR(OB_INVALID_ARGUMENT, "parser properties invalid.");
   } else if (OB_FAIL(parser_properties.rebuild_props_for_ddl(parser_name_,
                                                              ObCollationType::CS_TYPE_UTF8MB4_BIN,
                                                              true))) {
   } else if (OB_FAIL(parser_properties.to_format_json(allocator_, properties_))) {
   } else if (OB_NOT_NULL(parse_data)) {
-    int tmp_ret = parse_data->put_cached_reformed_props(parser_name_, properties, properties_);
+    int tmp_ret = parse_data->put_cached_reformed_props(parser_name_, raw_properties, properties_);
     if (OB_SUCCESS != tmp_ret && OB_SIZE_OVERFLOW != tmp_ret
         && OB_ALLOCATE_MEMORY_FAILED != tmp_ret) {
       LOG_WARN("failed to cache reformed parser properties", K(tmp_ret));
