@@ -40,7 +40,8 @@ int ObSRMergeCmp::init(
     ret = OB_ERR_UNEXPECTED;
   } else {
     id_datums_ = iter_ids->get_data();
-    is_binary_id_ = (id_meta.cs_type_ == common::CS_TYPE_BINARY);
+    is_binary_id_ = (id_meta.cs_type_ == common::CS_TYPE_BINARY)
+        && common::ObDatumFuncs::is_string_type(id_meta.type_);
     common::ObDatumBasicFuncs *basic_funcs = ObDatumFuncs::get_basic_func(id_meta.type_, id_meta.cs_type_);
     cmp_func_ = basic_funcs->null_first_cmp_;
     if (OB_ISNULL(cmp_func_)) {
@@ -74,11 +75,7 @@ int ObSRMergeCmp::cmp_datum(const ObDatum &l_id, const ObDatum &r_id, int64_t &c
   } else if (OB_LIKELY(is_binary_id_) && OB_LIKELY(!l_id.is_null()) && OB_LIKELY(!r_id.is_null())) {
     // bit-identical to strcmpsp(CS_TYPE_BINARY, ..., cmp_endspace), which for binary
     // collation is memcmp over the common prefix with length-difference tiebreak
-    const int64_t min_len = MIN(l_id.len_, r_id.len_);
-    const int memcmp_ret = min_len > 0 ? memcmp(l_id.ptr_, r_id.ptr_, min_len) : 0;
-    cmp_ret = memcmp_ret < 0 ? -1
-            : (memcmp_ret > 0 ? 1
-            : (l_id.len_ < r_id.len_ ? -1 : (l_id.len_ > r_id.len_ ? 1 : 0)));
+    cmp_ret = ob_binary_key_cmp(l_id.ptr_, l_id.len_, r_id.ptr_, r_id.len_);
   } else {
     int tmp_ret = 0;
     if (OB_FAIL(cmp_func_(l_id, r_id, tmp_ret, nullptr))) {
