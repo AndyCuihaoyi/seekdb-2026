@@ -17,6 +17,8 @@
 #ifndef _OCEANBASE_STORAGE_FTS_DICT_OB_FT_DICT_HUB_H_
 #define _OCEANBASE_STORAGE_FTS_DICT_OB_FT_DICT_HUB_H_
 
+#include <atomic>
+
 #include "lib/charset/ob_charset.h"
 #include "lib/lock/ob_bucket_lock.h"
 #include "lib/lock/ob_tc_rwlock.h"
@@ -107,6 +109,12 @@ public:
   ObFTCachedRangeDict() : alloc_(lib::ObMemAttr("FTCachedDict")), container_(alloc_), dict_(nullptr) {}
   ~ObFTCachedRangeDict() { reset(); }
 
+  // Also reached from ObFTDictHub::destroy(), i.e. from deinit_fts(), which
+  // ObServer::destroy() runs after ObDictCache::destroy() and ObKVGlobalCache::destroy()
+  // have already completed. That stays safe only because container_.reset() merely drops
+  // ObKVCacheHandle protection: ~ObKVCacheHandle clears the hazard pointer and returns it
+  // to the thread-local free list, without calling any ObDictCache/ObKVGlobalCache API.
+  // Do not add cache-facing calls (erase/revert/destroy_cache) to this path.
   void reset()
   {
     if (OB_NOT_NULL(dict_)) {
@@ -133,11 +141,16 @@ public:
   ObFTDictHub() : is_inited_(false), dict_map_(), rw_dict_lock_(), dict_cache_lock_()
   {
     MEMSET(cached_dicts_, 0, sizeof(cached_dicts_));
+    for (int64_t i = 0; i < FT_DICT_TYPE_CNT; ++i) {
+      ready_[i].store(false, std::memory_order_relaxed);
+    }
   }
   ~ObFTDictHub() {}
 
   int init();
 
+  // Requires a quiescent server: no thread may be inside get_cached_dict(). ObServer::destroy()
+  // satisfies this by stopping all tenant/SQL workers before deinit_fts() reaches here.
   int destroy();
 
   int build_cache(const ObFTDictDesc &desc, ObFTCacheRangeContainer &container);
@@ -162,6 +175,12 @@ private:
   ObBucketLock rw_dict_lock_;
   common::TCRWLock dict_cache_lock_;
   ObFTCachedRangeDict *cached_dicts_[FT_DICT_TYPE_CNT];
+  // Publication protocol: build_cached_dict() fills entry->dict_ under dict_cache_lock_,
+  // then get_cached_dict() publishes ready_[i] with release. Fast-path readers acquire-load
+  // ready_ and dereference entry->dict_ without the lock, so the dict (and the KV cache
+  // entries pinned by its container) must stay valid until destroy(), and destroy() must
+  // not run concurrently with any reader (see destroy()).
+  std::atomic<bool> ready_[FT_DICT_TYPE_CNT];
 };
 
 } //  namespace storage
