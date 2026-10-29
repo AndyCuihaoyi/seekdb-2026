@@ -30,6 +30,10 @@ namespace oceanbase
 namespace storage
 {
 class ObFTDictHub;
+class ObIKLetterProcessor;
+class ObIKQuantifierProcessor;
+class ObIKCJKProcessor;
+class ObIKSurrogateProcessor;
 
 class ObIKFTParser final : public ObITokenIterator
 {
@@ -40,10 +44,12 @@ public:
         coll_type_(ObCollationType::CS_TYPE_INVALID),
         ctx_(nullptr),
         hub_(hub),
-        segmenters_(allocator_),
+        letter_seg_(nullptr),
+        cnqsg_(nullptr),
+        cjksg_(nullptr),
+        surrogate_seg_(nullptr),
         dict_main_(nullptr),
-        dict_quan_(nullptr),
-        dict_stop_(nullptr)
+        dict_quan_(nullptr)
   {
   }
 
@@ -85,13 +91,17 @@ private:
   ObCollationType coll_type_;
   TokenizeContext *ctx_;
   ObFTDictHub *hub_;
-  ObList<ObIIKProcessor *, ObIAllocator> segmenters_;
+  // Called in this order for every character; the concrete types let the calls be
+  // devirtualized and avoid re-fetching the current character from the context.
+  ObIKLetterProcessor *letter_seg_;
+  ObIKQuantifierProcessor *cnqsg_;
+  ObIKCJKProcessor *cjksg_;
+  ObIKSurrogateProcessor *surrogate_seg_;
 
   // Dictionaries are process-global immutable instances owned by ObFTDictHub, so they
   // are only borrowed here and must not be destroyed by the parser.
   ObIFTDict *dict_main_;
   ObIFTDict *dict_quan_;
-  ObIFTDict *dict_stop_;
 
   DISABLE_COPY_ASSIGN(ObIKFTParser);
 };
