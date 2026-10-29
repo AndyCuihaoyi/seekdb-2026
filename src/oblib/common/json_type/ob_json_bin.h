@@ -595,7 +595,10 @@ public:
     return (meta_.get_type() == static_cast<uint8_t>(ObJsonNodeType::J_ARRAY) || meta_.get_type() == static_cast<uint8_t>(ObJsonNodeType::J_OBJECT)) ?
       element_count() : 1;
   }
-  
+
+  int print(ObJsonBuffer &j_buf, bool is_quoted, uint64_t reserve_len = 0,
+            bool is_pretty = false, uint64_t depth = 0) const override;
+
   int get_array_element(uint64_t index, ObIJsonBase *&value) const override;
   int get_object_value(uint64_t index, ObIJsonBase *&value) const override;
   int get_object_value(const ObString &key, ObIJsonBase *&value) const override;

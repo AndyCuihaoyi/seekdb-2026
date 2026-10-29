@@ -322,6 +322,61 @@ int ObJsonBin::get_total_value(ObStringBuffer &result) const
   return ret;
 }
 
+// The generic ObIJsonBase::print_array materializes a child ObJsonBin per element
+// via get_array_element(), and create_new_binary() re-parses this array's header
+// for every one of them.  Arrays of plain strings (TOKENIZE output is one) can be
+// rendered by walking the value entries in place, so parse the header once and
+// keep the generic path for everything else.
+int ObJsonBin::print(ObJsonBuffer &j_buf, bool is_quoted, uint64_t reserve_len,
+                     bool is_pretty, uint64_t depth) const
+{
+  INIT_SUCC(ret);
+  if (ObJsonNodeType::J_ARRAY != json_type() || is_pretty || is_empty_data()
+      || !meta_.is_continuous()) {
+    ret = ObIJsonBase::print(j_buf, is_quoted, reserve_len, is_pretty, depth);
+  } else {
+    const uint64_t count = meta_.element_count();
+    bool all_strings = true;
+    for (uint64_t i = 0; OB_SUCC(ret) && all_strings && i < count; ++i) {
+      uint64_t value_offset = 0;
+      uint8_t value_type = 0;
+      if (OB_FAIL(get_value_entry(static_cast<int>(i), value_offset, value_type))) {
+      } else if (ObJBVerType::J_STRING_V0 != value_type) {
+        all_strings = false;
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (!all_strings) {
+      ret = ObIJsonBase::print(j_buf, is_quoted, reserve_len, is_pretty, depth);
+    } else if (reserve_len > 0 && OB_FAIL(j_buf.reserve(reserve_len * 1.2))) {
+    } else if (OB_FAIL(j_buf.append("["))) {
+    } else {
+      for (uint64_t i = 0; OB_SUCC(ret) && i < count; ++i) {
+        uint64_t value_offset = 0;
+        uint8_t value_type = 0;
+        int64_t str_len = 0;
+        int64_t str_offset = 0;
+        ObString data;
+        if (i > 0 && OB_FAIL(j_buf.append(", "))) {
+        } else if (OB_FAIL(get_value_entry(static_cast<int>(i), value_offset, value_type))) {
+        } else if (OB_FALSE_IT(str_offset = pos_ + value_offset + sizeof(uint8_t))) {
+        } else if (OB_FAIL(cursor_->decode_vi64(str_offset, &str_len))) {
+        } else if (OB_UNLIKELY(str_len < 0)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (0 == str_len) {
+          if (OB_FAIL(j_buf.append("\"\"", 2, 0))) {
+          }
+        } else if (OB_FAIL(cursor_->get(str_offset, str_len, data))) {
+        } else if (OB_FAIL(ObJsonBaseUtil::append_string(j_buf, true, data.ptr(), str_len))) {
+        }
+      }
+      if (OB_SUCC(ret) && OB_FAIL(j_buf.append("]"))) {
+      }
+    }
+  }
+  return ret;
+}
+
 int ObJsonBin::get_array_element(uint64_t index, ObIJsonBase *&value) const
 {
   INIT_SUCC(ret);
