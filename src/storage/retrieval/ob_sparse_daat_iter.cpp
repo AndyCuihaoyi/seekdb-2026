@@ -548,48 +548,46 @@ int ObSRDaaTIterImpl::fast_fill_dims()
 
 // same min-docid selection and consumed-dim marking as fast_collect_dims, without the
 // relevance collector: only used when the collector accepts every merged doc
+//
+// One pass over the dim registers instead of two: dims tying with the running minimum are
+// recorded as they are found. A strictly smaller id is smaller than every id seen before it,
+// so the recorded set can be restarted and stays ascending by dim index, exactly like the
+// ascending second pass it replaces.
 int ObSRDaaTIterImpl::fast_pick_min(const ObDatum *&id_datum, bool &got_valid_id)
 {
   int ret = OB_SUCCESS;
   got_valid_id = false;
   int64_t min_d = -1;
+  const ObDatum *min_id = nullptr;
+  next_round_cnt_ = 0;
   for (int64_t d = 0; OB_SUCC(ret) && d < dim_cnt_; ++d) {
     if (!dim_states_[d].active_) {
       continue;
     } else if (min_d < 0) {
       min_d = d;
+      min_id = dim_states_[d].id_;
+      next_round_idx_[next_round_cnt_++] = d;
     } else {
       int64_t cmp_ret = 0;
-      if (OB_FAIL(merge_cmp_.cmp_datum(*dim_states_[d].id_, *dim_states_[min_d].id_, cmp_ret))) {
+      if (OB_FAIL(merge_cmp_.cmp_datum(*dim_states_[d].id_, *min_id, cmp_ret))) {
       } else if (cmp_ret < 0) {
+        next_round_cnt_ = 0;
         min_d = d;
+        min_id = dim_states_[d].id_;
+        next_round_idx_[next_round_cnt_++] = d;
+      } else if (0 == cmp_ret) {
+        next_round_idx_[next_round_cnt_++] = d;
       }
     }
   }
   if (OB_FAIL(ret)) {
   } else if (min_d < 0) {
     ret = OB_ITER_END;
+  } else if (OB_ISNULL(min_id)) {
+    ret = OB_ERR_UNEXPECTED;
   } else {
-    const ObDatum *min_id = dim_states_[min_d].id_;
-    next_round_cnt_ = 0;
-    for (int64_t d = 0; OB_SUCC(ret) && d < dim_cnt_; ++d) {
-      if (!dim_states_[d].active_) {
-        continue;
-      }
-      int64_t cmp_ret = 0;
-      if (OB_FAIL(merge_cmp_.cmp_datum(*dim_states_[d].id_, *min_id, cmp_ret))) {
-      } else if (0 == cmp_ret) {
-        next_round_idx_[next_round_cnt_++] = d;
-      }
-    }
-    if (OB_SUCC(ret)) {
-      if (OB_ISNULL(min_id)) {
-        ret = OB_ERR_UNEXPECTED;
-      } else {
-        id_datum = min_id;
-        got_valid_id = true;
-      }
-    }
+    id_datum = min_id;
+    got_valid_id = true;
   }
   return ret;
 }
@@ -600,50 +598,48 @@ int ObSRDaaTIterImpl::fast_collect_dims(const ObDatum *&id_datum, double &releva
   relevance = 0.0;
   got_valid_id = false;
   int64_t min_d = -1;
+  const ObDatum *min_id = nullptr;
+  next_round_cnt_ = 0;
+  // one compare pass, see fast_pick_min: the collected dims stay ascending by index, so the
+  // relevance sum is taken in the same order as before
   for (int64_t d = 0; OB_SUCC(ret) && d < dim_cnt_; ++d) {
     if (!dim_states_[d].active_) {
       continue;
     } else if (min_d < 0) {
       min_d = d;
+      min_id = dim_states_[d].id_;
+      next_round_idx_[next_round_cnt_++] = d;
     } else {
       int64_t cmp_ret = 0;
-      if (OB_FAIL(merge_cmp_.cmp_datum(*dim_states_[d].id_, *dim_states_[min_d].id_, cmp_ret))) {
+      if (OB_FAIL(merge_cmp_.cmp_datum(*dim_states_[d].id_, *min_id, cmp_ret))) {
       } else if (cmp_ret < 0) {
+        next_round_cnt_ = 0;
         min_d = d;
+        min_id = dim_states_[d].id_;
+        next_round_idx_[next_round_cnt_++] = d;
+      } else if (0 == cmp_ret) {
+        next_round_idx_[next_round_cnt_++] = d;
       }
     }
   }
   if (OB_FAIL(ret)) {
   } else if (min_d < 0) {
     ret = OB_ITER_END;
+  } else if (OB_ISNULL(min_id)) {
+    ret = OB_ERR_UNEXPECTED;
   } else {
-    const ObDatum *min_id = dim_states_[min_d].id_;
-    next_round_cnt_ = 0;
-    for (int64_t d = 0; OB_SUCC(ret) && d < dim_cnt_; ++d) {
-      if (!dim_states_[d].active_) {
-        continue;
-      }
-      int64_t cmp_ret = 0;
-      if (OB_FAIL(merge_cmp_.cmp_datum(*dim_states_[d].id_, *min_id, cmp_ret))) {
-      } else if (0 != cmp_ret) {
-        // stays in the merge with its current row, not re-fetched next round
-      } else if (merge_emit_all_) {
-        next_round_idx_[next_round_cnt_++] = d;
-      } else if (OB_FAIL(relevance_collector_->collect_one_dim(d, dim_states_[d].rel_))) {
-      } else {
-        next_round_idx_[next_round_cnt_++] = d;
+    id_datum = min_id;
+    for (int64_t i = 0; !merge_emit_all_ && OB_SUCC(ret) && i < next_round_cnt_; ++i) {
+      const int64_t d = next_round_idx_[i];
+      if (OB_FAIL(relevance_collector_->collect_one_dim(d, dim_states_[d].rel_))) {
       }
     }
-    if (OB_SUCC(ret)) {
-      id_datum = min_id;
-      if (OB_ISNULL(id_datum)) {
-        ret = OB_ERR_UNEXPECTED;
-      } else if (merge_emit_all_) {
-        // the collector accepts every merged doc and its score is not observed
-        got_valid_id = true;
-      } else if (OB_FAIL(relevance_collector_->get_result(relevance, got_valid_id))) {
-      } else if (got_valid_id && OB_FAIL(process_collected_row(*id_datum, relevance))) {
-      }
+    if (OB_FAIL(ret)) {
+    } else if (merge_emit_all_) {
+      // the collector accepts every merged doc and its score is not observed
+      got_valid_id = true;
+    } else if (OB_FAIL(relevance_collector_->get_result(relevance, got_valid_id))) {
+    } else if (got_valid_id && OB_FAIL(process_collected_row(*id_datum, relevance))) {
     }
   }
   return ret;
