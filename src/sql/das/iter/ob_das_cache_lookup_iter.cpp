@@ -151,6 +151,7 @@ int ObDASCacheLookupIter::inner_reuse()
   if (OB_FAIL(ObDASLocalLookupIter::inner_reuse())) {
   } else {
     index_proj_rows_.reuse();
+    lookahead_row_count_ = 0;
   }
   return ret;
 }
@@ -256,6 +257,16 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
   int ret = OB_SUCCESS;
   bool get_next_rows = false;
   const bool need_index_proj = index_proj_rows_.index_scan_proj_exprs_.count() > 0;
+  // A caller asking for less than a full batch is limit-throttled, so look ahead only to what
+  // it consumes. A full-batch call may still be limited (its limit may equal the batch size),
+  // so ramp the look-ahead instead of jumping to the whole default batch: a limit-free scan
+  // converges to the default batch within a few cycles, and a small limit over-reads at most
+  // one previous cycle.
+  int64_t batch_row_count = capacity;
+  if (capacity >= max_size_) {
+    batch_row_count = std::min(default_batch_row_count_, std::max(capacity, lookahead_row_count_ * 2));
+    lookahead_row_count_ = batch_row_count;
+  }
 
   do {
     switch (state_) {
@@ -263,9 +274,9 @@ int ObDASCacheLookupIter::inner_get_next_rows(int64_t &count, int64_t capacity)
         reset_lookup_state();
         int64_t storage_count = 0;
         int64_t index_capacity = 0;
-        while (OB_SUCC(ret) && !index_end_ && lookup_rowkey_cnt_ < default_batch_row_count_) {
+        while (OB_SUCC(ret) && !index_end_ && lookup_rowkey_cnt_ < batch_row_count) {
           storage_count = 0;
-          index_capacity = std::min(capacity, std::min(max_size_, default_batch_row_count_ - lookup_rowkey_cnt_));
+          index_capacity = std::min(capacity, std::min(max_size_, batch_row_count - lookup_rowkey_cnt_));
           index_table_iter_->clear_evaluated_flag();
           if (OB_FAIL(index_table_iter_->get_next_rows(storage_count, index_capacity))) {
             if (OB_UNLIKELY(OB_ITER_END != ret)) {

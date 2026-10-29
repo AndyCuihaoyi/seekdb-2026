@@ -90,7 +90,8 @@ public:
   ObDASCacheLookupIter(const ObDASIterType type = ObDASIterType::DAS_ITER_LOCAL_LOOKUP)
     : ObDASLocalLookupIter(type),
       store_allocator_("SqlCacheLookup", OB_MALLOC_NORMAL_BLOCK_SIZE, ObCtxIds::DEFAULT_CTX_ID),
-      index_proj_rows_()
+      index_proj_rows_(),
+      lookahead_row_count_(0)
   {}
   virtual ~ObDASCacheLookupIter() {}
 
@@ -107,6 +108,7 @@ private:
   // for store rows
   common::ObArenaAllocator store_allocator_;
   IndexProjRowStore index_proj_rows_;
+  int64_t lookahead_row_count_;
 };
 
 }  // namespace sql
