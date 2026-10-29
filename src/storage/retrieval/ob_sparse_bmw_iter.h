@@ -105,6 +105,14 @@ protected:
   ObDomainIdCmp domain_id_cmp_;
   ObFixedArray<ObDocIdExt, ObIAllocator> id_cache_;
   BMWStatus status_;
+  // A block-max range test that never rejects is pure overhead, and how often it rejects
+  // depends on how the corpus bounds compare to the running top-k threshold, so it is
+  // learned per query: skip after enough consecutive accepts, re-probe while skipping.
+  bool skip_pivot_range_test_;
+  int64_t pivot_range_accept_cnt_;
+  int64_t pivot_range_skip_cnt_;
+  static const int64_t PIVOT_RANGE_ADAPT_ACCEPT_CNT = 256;
+  static const int64_t PIVOT_RANGE_REPROBE_SKIP_CNT = 256;
 };
 
 
