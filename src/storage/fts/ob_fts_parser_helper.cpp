@@ -639,7 +639,11 @@ int ObFTParseHelper::segment(
   } else if (OB_ISNULL(cs = common::ObCharset::get_charset(type))) {
     ret = OB_ERR_UNEXPECTED;
   } else {
-    words.reuse();
+    // Clearing an already empty map still visits every bucket, so skip it for the
+    // one-shot maps built per TOKENIZE/query; reused build maps are non-empty.
+    if (!words.empty()) {
+      words.reuse();
+    }
     ObAddWord add_word(parser_property_, meta, add_word_flag_, *allocator_, words);
     if (OB_FAIL(segment(
                     parser_property_,

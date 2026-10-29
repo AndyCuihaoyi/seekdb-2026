@@ -52,6 +52,14 @@ public:
                                  const uint8_t char_len,
                                  CharType &type);
 
+  // Decodes the first character once and classifies it, avoiding the double decode of
+  // ObCharset::first_valid_char() followed by classify_first_char().
+  static int classify_first_char_with_len(ObCollationType coll_type,
+                                          const char *input,
+                                          const int64_t input_len,
+                                          int64_t &char_len,
+                                          CharType &type);
+
   static int check_cn_number(ObCollationType coll_type,
                              const char *input,
                              const uint8_t char_len,
@@ -76,6 +84,33 @@ public:
 private:
   template <ObCharsetType CS_TYPE>
   static int do_classify(const char *input, const uint8_t char_len, CharType &type);
+
+  // ASCII fast path: single-byte characters can be classified from the byte alone
+  static CharType classify_ascii(const unsigned char c)
+  {
+    CharType type = CharType::USELESS;
+    if ((c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a)) {
+      type = CharType::ENGLISH_LETTER;
+    } else if (c >= 0x30 && c <= 0x39) {
+      type = CharType::ARABIC_LETTER;
+    }
+    return type;
+  }
+
+  static CharType classify_unicode(const ob_wc_t unicode)
+  {
+    CharType type = CharType::USELESS;
+    if (ObUnicodeBlockUtils::is_alpha(unicode)) {
+      type = CharType::ENGLISH_LETTER;
+    } else if (ObUnicodeBlockUtils::is_arabic(unicode)) {
+      type = CharType::ARABIC_LETTER;
+    } else if (ObUnicodeBlockUtils::is_chinese(unicode)) {
+      type = CharType::CHINESE;
+    } else if (ObUnicodeBlockUtils::is_other_cjk(unicode)) {
+      type = CharType::OTHER_CJK;
+    }
+    return type;
+  }
 
 private:
   /*************************  Alpha: english letter abc *********************/
@@ -495,6 +530,50 @@ inline int ObFTCharUtil::classify_first_char(ObCollationType coll_type,
     ret = OB_NOT_SUPPORTED;
     STORAGE_FTS_LOG(WARN, "Not supported charset type", K(ret), K(cs_type));
     break;
+  }
+  return ret;
+}
+
+inline int ObFTCharUtil::classify_first_char_with_len(ObCollationType coll_type,
+                                                      const char *input,
+                                                      const int64_t input_len,
+                                                      int64_t &char_len,
+                                                      CharType &type)
+{
+  int ret = OB_SUCCESS;
+  char_len = 0;
+  type = CharType::USELESS;
+  const ObCharsetType cs_type = ObCharset::charset_type_by_coll(coll_type);
+  if (CHARSET_UTF8MB4 == cs_type && OB_NOT_NULL(input) && input_len > 0) {
+    const unsigned char *ustart = reinterpret_cast<const unsigned char *>(input);
+    if (ustart[0] < 0x80) {
+      char_len = 1;
+      type = classify_ascii(ustart[0]);
+    } else {
+      ob_wc_t unicode = 0;
+      const int code_size
+          = common::ob_charset_decode_unicode<CHARSET_UTF8MB4>(ustart, ustart + input_len, unicode);
+      if (code_size > 0) {
+        char_len = code_size;
+        type = classify_unicode(unicode);
+      } else {
+        // Not well formed: let first_valid_char() report the same error as before, or
+        // classify the character it accepts (both paths used to run unconditionally).
+        int64_t len = 0;
+        if (OB_FAIL(ObCharset::first_valid_char(coll_type, input, input_len, len))) {
+        } else if (OB_FAIL(classify_first_char(coll_type, input, static_cast<uint8_t>(len), type))) {
+        } else {
+          char_len = len;
+        }
+      }
+    }
+  } else {
+    int64_t len = 0;
+    if (OB_FAIL(ObCharset::first_valid_char(coll_type, input, input_len, len))) {
+    } else if (OB_FAIL(classify_first_char(coll_type, input, static_cast<uint8_t>(len), type))) {
+    } else {
+      char_len = len;
+    }
   }
   return ret;
 }

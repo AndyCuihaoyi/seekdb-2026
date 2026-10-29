@@ -158,6 +158,36 @@ bool ObAddWord::is_min_max_word(const int64_t c_len) const
   return flag_.min_max_word() && (c_len < min_token_size_ || c_len > max_token_size_);
 }
 
+namespace
+{
+// Mixed Chinese/English text is the common case: ASCII letters fold with a constant
+// offset and the CJK ideograph block (U+4000..U+9FFF, lead byte E4..E9) has no case
+// mapping, so both fit in one pass. Returns false as soon as a character outside those
+// sets appears, in which case the charset lower-casing must be used instead.
+bool fold_case_ascii_cjk(const char *src, const int64_t len, char *dst)
+{
+  bool done = true;
+  int64_t i = 0;
+  while (done && i < len) {
+    const unsigned char c = static_cast<unsigned char>(src[i]);
+    if (c < 0x80) {
+      dst[i] = (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : static_cast<char>(c);
+      i += 1;
+    } else if (c >= 0xE4 && c <= 0xE9 && i + 2 < len
+               && 0x80 == (static_cast<unsigned char>(src[i + 1]) & 0xC0)
+               && 0x80 == (static_cast<unsigned char>(src[i + 2]) & 0xC0)) {
+      dst[i] = src[i];
+      dst[i + 1] = src[i + 1];
+      dst[i + 2] = src[i + 2];
+      i += 3;
+    } else {
+      done = false;
+    }
+  }
+  return done;
+}
+} // namespace
+
 int ObAddWord::casedown_word(const ObFTWord &src, ObFTWord &dst)
 {
   int ret = OB_SUCCESS;
@@ -165,6 +195,7 @@ int ObAddWord::casedown_word(const ObFTWord &src, ObFTWord &dst)
     ret = OB_INVALID_ARGUMENT;
   } else if (flag_.casedown()) {
     const ObString src_str = src.get_word().get_string();
+    const ObCollationType collation_type = word_meta_.get_collation_type();
     // Pure-ASCII tokens without uppercase letters are lowercased into an identical byte
     // sequence, so reference the token buffer directly instead of copying it.
     bool need_casedown = false;
@@ -172,18 +203,27 @@ int ObAddWord::casedown_word(const ObFTWord &src, ObFTWord &dst)
       const unsigned char c = static_cast<unsigned char>(src_str.ptr()[i]);
       need_casedown = c >= 0x80 || (c >= 'A' && c <= 'Z');
     }
-    if (!need_casedown && ObCharset::is_valid_collation(word_meta_.get_collation_type())) {
+    if (!need_casedown && ObCharset::is_valid_collation(collation_type)) {
       dst = src;
     } else {
-      ObString dst_str;
-      if (OB_FAIL(ObCharset::tolower(
-                      word_meta_.get_collation_type(),
-                      src.get_word().get_string(),
-                      dst_str,
-                      allocator_))) {
-      } else {
-        ObFTWord tmp(dst_str.length(), dst_str.ptr(), word_meta_);
+      char *buf = nullptr;
+      if (CHARSET_UTF8MB4 == ObCharset::charset_type_by_coll(collation_type)
+          && !ObCharset::is_bin_sort(collation_type)
+          && OB_NOT_NULL(buf = static_cast<char *>(allocator_.alloc(src_str.length())))
+          && fold_case_ascii_cjk(src_str.ptr(), src_str.length(), buf)) {
+        ObFTWord tmp(src_str.length(), buf, word_meta_);
         dst = tmp;
+      } else {
+        ObString dst_str;
+        if (OB_FAIL(ObCharset::tolower(
+                        collation_type,
+                        src_str,
+                        dst_str,
+                        allocator_))) {
+        } else {
+          ObFTWord tmp(dst_str.length(), dst_str.ptr(), word_meta_);
+          dst = tmp;
+        }
       }
     }
   } else {
@@ -210,21 +250,26 @@ int ObAddWord::check_stopword(const ObFTWord &ft_word, bool &is_stopword)
 int ObAddWord::groupby_word(const ObFTWord &word, const int64_t word_freq)
 {
   int ret = OB_SUCCESS;
-  int64_t word_count = 0;
+  // A repeated word keeps the count of its first occurrence and accumulates the
+  // frequency of the later ones. Doing that in place needs one hash computation
+  // and one bucket walk, where the previous lookup-then-overwrite needed two.
+  struct ObFTWordFreqUpdater
+  {
+    explicit ObFTWordFreqUpdater(const int64_t added) : added_(added) {}
+    void operator()(common::hash::HashMapPair<ObFTWord, int64_t> &entry)
+    {
+      entry.second += added_;
+    }
+    int64_t added_;
+  };
   if (OB_UNLIKELY(word.empty() || word_freq <= 0)) {
     ret = OB_INVALID_ARGUMENT;
   } else if (!flag_.groupby_word()) {
     if (OB_FAIL(word_map_.set_refactored(word, 1/*word count*/))) {
     }
-  } else if (OB_FAIL(word_map_.get_refactored(word, word_count)) && OB_HASH_NOT_EXIST != ret) {
   } else {
-    if (OB_HASH_NOT_EXIST == ret) {
-      word_count = 1;
-    } else {
-      word_count += word_freq;
-    }
-    if (OB_FAIL(word_map_.set_refactored(word, word_count, 1/*overwrite*/))) {
-    }
+    ObFTWordFreqUpdater updater(word_freq);
+    ret = word_map_.set_or_update(word, 1/*word count*/, updater);
   }
   return ret;
 }
