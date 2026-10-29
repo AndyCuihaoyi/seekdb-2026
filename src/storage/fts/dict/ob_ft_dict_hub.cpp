@@ -55,7 +55,17 @@ int ObFTDictHub::destroy()
     ObMemAttr attr("FTCachedDict");
     common::TCWLockGuard guard(dict_cache_lock_);
     for (int64_t i = 0; i < FT_DICT_TYPE_CNT; ++i) {
+      // Order matters: unpublish before freeing. A caller that enters after this store
+      // sees ready_ == false, falls into the slow path and finds cached_dicts_[i] == nullptr.
+      // A caller that already loaded ready_ == true before the store may still be using
+      // entry->dict_, so destroy() requires quiescence: in ObServer::destroy() the service
+      // and SQL engine (owners of statement execution threads) are destroyed well before
+      // deinit_fts() -> ~ObFTParseData() -> ObFTDictHub::destroy().
+      ready_[i].store(false, std::memory_order_release);
       if (OB_NOT_NULL(cached_dicts_[i])) {
+        // Releasing the pinned KV handles here happens after ObDictCache/ObKVGlobalCache
+        // were destroyed (ob_server.cpp shutdown order); see ObFTCachedRangeDict::reset()
+        // for why dropping the handles does not touch either cache.
         OB_DELETE(ObFTCachedRangeDict, attr, cached_dicts_[i]);
         cached_dicts_[i] = nullptr;
       }
@@ -144,11 +154,11 @@ int ObFTDictHub::get_cached_dict(const ObFTDictDesc &desc, ObIFTDict *&dict)
     ret = OB_INVALID_ARGUMENT;
   } else {
     ObFTCachedRangeDict *entry = cached_dicts_[type_idx];
-    {
-      common::TCRLockGuard guard(dict_cache_lock_);
+    if (ready_[type_idx].load(std::memory_order_acquire)) {
+      // dict_ is written before ready_ is published, so the store/load pair hands over a
+      // fully initialized dict without taking the lock on the hot path
       dict = entry->dict_;
-    }
-    if (OB_ISNULL(dict)) {
+    } else {
       common::TCWLockGuard guard(dict_cache_lock_);
       if (OB_ISNULL(entry->dict_)) {
         if (OB_FAIL(build_cached_dict(desc, *entry))) {
@@ -157,6 +167,9 @@ int ObFTDictHub::get_cached_dict(const ObFTDictDesc &desc, ObIFTDict *&dict)
         }
       } else {
         dict = entry->dict_;
+      }
+      if (OB_SUCC(ret) && OB_NOT_NULL(dict)) {
+        ready_[type_idx].store(true, std::memory_order_release);
       }
     }
   }
