@@ -356,7 +356,8 @@ int ObSortOpImpl::ObAdaptiveQS::compare_vals(int64_t l, int64_t r,
 
 ObSortOpImpl::Compare::Compare()
   : ret_(OB_SUCCESS), sort_collations_(nullptr), sort_cmp_funs_(nullptr),
-    exec_ctx_(nullptr), access_ctx_(nullptr), cmp_count_(0), cmp_start_(0), cmp_end_(0)
+    exec_ctx_(nullptr), access_ctx_(nullptr), cmp_count_(0), cmp_start_(0), cmp_end_(0),
+    collations_base_(nullptr), cmp_funcs_base_(nullptr)
 {
 }
 
@@ -380,6 +381,7 @@ int ObSortOpImpl::Compare::init(
     cmp_start_ = 0;
     cmp_end_ = sort_cmp_funs_->count();
     enable_encode_sortkey_ = enable_encode_sortkey;
+    refresh_cmp_key_ptrs();
   }
   return ret;
 }
@@ -417,14 +419,9 @@ bool ObSortOpImpl::Compare::operator()(
     const ObDatum *lcells = l->cells();
     const ObDatum *rcells = r->cells();
     int cmp = 0;
-    // the two key descriptor arrays are contiguous and immutable while the sort runs:
-    // resolve them once per comparison instead of a bounds-checked at() per key
-    const ObSortFieldCollation *collations = nullptr;
-    const ObSortCmpFunc *cmp_funcs = nullptr;
-    if (cmp_end_ > cmp_start_) {
-      collations = &sort_collations_->at(cmp_start_);
-      cmp_funcs = &sort_cmp_funs_->at(cmp_start_);
-    }
+    // resolved once in init()/set_cmp_range(); the arrays are immutable while the sort runs
+    const ObSortFieldCollation *collations = collations_base_;
+    const ObSortCmpFunc *cmp_funcs = cmp_funcs_base_;
     for (int64_t i = cmp_start_; 0 == cmp && i < cmp_end_ && OB_SUCC(ret); i++) {
       const ObSortFieldCollation& sort_collation = collations[i - cmp_start_];
       const int64_t idx = sort_collation.field_idx_;
