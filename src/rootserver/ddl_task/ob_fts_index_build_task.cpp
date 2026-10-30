@@ -407,12 +407,16 @@ int ObFtsIndexBuildTask::prepare()
 {
   int ret = OB_SUCCESS;
   bool state_finished = false;
+  bool use_merged_path = false;
   if (OB_UNLIKELY(!is_inited_)) {
     ret = OB_NOT_INIT;
   } else if (ObDDLTaskStatus::PREPARE != task_status_) {
     ret = OB_STATE_NOT_MATCH;
   } else {
     state_finished = true;
+    // merge rowkey_doc/doc_rowkey/domain/doc_word into one wave: the aux build
+    // sql only scans the data table, rowkey_doc is a schema-level dependency.
+    use_merged_path = is_fts_task() && use_doc_id_;
   }
 #ifdef ERRSIM
   if (OB_SUCC(ret)) {
@@ -423,11 +427,18 @@ int ObFtsIndexBuildTask::prepare()
 #endif
   DEBUG_SYNC(BUILD_FTS_INDEX_PREPARE_STATUS);
 
+  if (OB_SUCC(ret) && state_finished && use_merged_path) {
+    if (OB_FAIL(prepare_aux_index_tables_merged(state_finished))) {
+    }
+  }
+
   if (state_finished || OB_FAIL(ret)) {
     ObDDLTaskStatus next_status = static_cast<ObDDLTaskStatus>(task_status_);
     ObDDLTaskStatus old_status = static_cast<ObDDLTaskStatus>(task_status_);
     if (OB_FAIL(ret)) {
       next_status = ObIDDLTask::in_ddl_retry_white_list(ret) ? next_status : ObDDLTaskStatus::FAIL;
+    } else if (use_merged_path) {
+      next_status = ObDDLTaskStatus::WAIT_AUX_TABLE_COMPLEMENT;
     } else if (OB_FAIL(get_next_status(next_status))) {
       next_status = ObDDLTaskStatus::FAIL;
     }
@@ -638,6 +649,148 @@ int ObFtsIndexBuildTask::prepare_aux_index_tables()
   if (state_finished || OB_FAIL(ret)) {
     (void)switch_status(next_status, true, ret);
     LOG_INFO("generate schema finished", K(ret), K(parent_task_id_), K(task_id_), K(*this));
+  }
+  return ret;
+}
+
+// create all four aux index schemas in one wave, so that their data complement
+// tasks can build in parallel with rowkey_doc.
+int ObFtsIndexBuildTask::prepare_aux_index_tables_merged(bool &all_submitted)
+{
+  int ret = OB_SUCCESS;
+  const ObIndexType rowkey_doc_type = ObIndexType::INDEX_TYPE_ROWKEY_DOC_ID_LOCAL;
+  const ObIndexType doc_rowkey_type = ObIndexType::INDEX_TYPE_DOC_ID_ROWKEY_LOCAL;
+  const ObIndexType domain_index_aux_type = create_index_arg_.index_type_;
+  const ObIndexType fts_doc_word_type = ObIndexType::INDEX_TYPE_FTS_DOC_WORD_LOCAL;
+  const ObString &parser_name = create_index_arg_.index_option_.parser_name_;
+  bool need_to_load_dic = false;
+  ObDicLoaderHandle dic_loader_handle;
+  ObCharsetType charset_type = ObCharsetType::CHARSET_ANY;
+  ObTableLockOwnerID owner_id;
+  all_submitted = false;
+  if (OB_UNLIKELY(!is_inited_)) {
+    ret = OB_NOT_INIT;
+  } else if (ObDDLTaskStatus::PREPARE != task_status_) {
+    ret = OB_STATE_NOT_MATCH;
+  } else if (OB_UNLIKELY(!is_fts_task() || !use_doc_id_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(ObFtsIndexBuilderUtil::check_need_to_load_dic(parser_name, need_to_load_dic))) {
+  } else if (!need_to_load_dic) {
+    // nothing to load
+  } else {
+    // same as the LOAD_DICTIONARY handler, but stay in PREPARE: a crash before
+    // the schema wave finishes simply re-runs the merged prepare path, and
+    // try_load_dictionary_in_trans is idempotent.
+    ObMySQLTransaction load_trans;
+    ObTimeoutCtx timeout_ctx;
+    const int64_t default_timeout = ObDicLoader::DEFAULT_TIMEOUT_US;
+    const int64_t timeout = MIN(config::_ob_ddl_timeout(), MAX(default_timeout, config::internal_sql_execute_timeout()));
+    if (OB_FAIL(get_charset_type(charset_type))) {
+    } else if (OB_FAIL(ObGenDicLoader::get_instance().get_dic_loader(
+                                                                     parser_name,
+                                                                     charset_type,
+                                                                     dic_loader_handle))) {
+    } else if (OB_UNLIKELY(!dic_loader_handle.is_valid())) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_ISNULL(GCTX.sql_proxy_)) {
+      ret = OB_INVALID_ARGUMENT;
+    } else if (OB_FAIL(timeout_ctx.set_trx_timeout_us(timeout))) {
+    } else if (OB_FAIL(timeout_ctx.set_timeout(timeout))) {
+    } else if (OB_FAIL(load_trans.start(GCTX.sql_proxy_))) {
+    } else if (OB_FAIL(dic_loader_handle.get_loader()->try_load_dictionary_in_trans(load_trans))) {
+    }
+    if (load_trans.is_started()) {
+      int tmp_ret = OB_SUCCESS;
+      if (OB_SUCCESS != (tmp_ret = load_trans.end(OB_SUCC(ret)))) {
+        LOG_ERROR("failed to commit trans", K(ret), K(tmp_ret));
+        ret = OB_SUCC(ret) ? tmp_ret : ret;
+      }
+    }
+    // same as the GENERATE_DOC_AUX_SCHEMA handler: take the dictionary table
+    // lock (owned by this task) before any aux schema is generated.
+    ObMySQLTransaction lock_trans;
+    if (OB_FAIL(ret)) {
+    } else if (OB_ISNULL(GCTX.sql_proxy_)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(lock_trans.start(GCTX.sql_proxy_))) {
+    } else if (OB_FAIL(get_charset_type(charset_type))) {
+    } else if (OB_FAIL(ObGenDicLoader::get_instance().get_dic_loader(
+                                                                     parser_name,
+                                                                     charset_type,
+                                                                     dic_loader_handle))) {
+    } else if (OB_UNLIKELY(!dic_loader_handle.is_valid())) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(owner_id.convert_from_value(ObLockOwnerType::DEFAULT_OWNER_TYPE, task_id_))) {
+    } else if (OB_FAIL(ObDicLock::lock_dic_tables_out_trans(*dic_loader_handle.get_loader(),
+                                                            transaction::tablelock::SHARE,
+                                                            owner_id,
+                                                            lock_trans))) {
+    } else if (OB_FAIL(update_task_message(lock_trans))) {
+    }
+    if (lock_trans.is_started()) {
+      int tmp_ret = OB_SUCCESS;
+      if (OB_SUCCESS != (tmp_ret = lock_trans.end(OB_SUCC(ret)))) {
+        LOG_ERROR("failed to commit trans", K(ret), K(tmp_ret));
+        ret = OB_SUCC(ret) ? tmp_ret : ret;
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    DEBUG_SYNC(CREATE_TFS_INDEX_ROWKEY_DOC_STATUS);
+    if (OB_FAIL(prepare_aux_table(rowkey_doc_type,
+                                  rowkey_doc_task_submitted_,
+                                  rowkey_doc_aux_table_id_,
+                                  rowkey_doc_task_id_))) {
+    }
+#ifdef ERRSIM
+    if (OB_SUCC(ret)) {
+      ret = OB_E(EventTable::EN_FTS_INDEX_BUILD_DOC_ROWKEY_FAILED) OB_SUCCESS;
+      if (OB_FAIL(ret)) {
+      }
+    }
+#endif
+    DEBUG_SYNC(BEFOR_PREPARE_CREATE_TFS_INDEX_DOC_ROWKEY);
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(prepare_aux_table(doc_rowkey_type,
+                                         doc_rowkey_task_submitted_,
+                                         doc_rowkey_aux_table_id_,
+                                         doc_rowkey_task_id_))) {
+    }
+#ifdef ERRSIM
+    if (OB_SUCC(ret)) {
+      ret = OB_E(EventTable::EN_FTS_INDEX_BUILD_INDEX_FAILED) OB_SUCCESS;
+      if (OB_FAIL(ret)) {
+      }
+    }
+#endif
+    DEBUG_SYNC(BEFOR_PREPARE_CREATE_TFS_INDEX_WORD_DOC);
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(prepare_aux_table(domain_index_aux_type,
+                                         domain_index_aux_task_submitted_,
+                                         domain_index_aux_table_id_,
+                                         domain_index_aux_task_id_))) {
+    }
+#ifdef ERRSIM
+    if (OB_SUCC(ret)) {
+      ret = OB_E(EventTable::EN_FTS_INDEX_BUILD_DOC_WORD_FAILED) OB_SUCCESS;
+      if (OB_FAIL(ret)) {
+      }
+    }
+#endif
+    DEBUG_SYNC(BEFOR_PREPARE_CREATE_TFS_INDEX_DOC_WORD);
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(prepare_aux_table(fts_doc_word_type,
+                                         fts_doc_word_task_submitted_,
+                                         fts_doc_word_aux_table_id_,
+                                         fts_doc_word_task_id_))) {
+    }
+    if (OB_SUCC(ret)) {
+      all_submitted = rowkey_doc_task_submitted_ && doc_rowkey_task_submitted_ &&
+                      domain_index_aux_task_submitted_ && fts_doc_word_task_submitted_;
+      if (all_submitted) {
+        LOG_INFO("prepare all aux index schemas finished", K(ret), K(parent_task_id_), K(task_id_), K(*this));
+      }
+    }
   }
   return ret;
 }

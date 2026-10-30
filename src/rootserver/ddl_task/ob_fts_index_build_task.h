@@ -131,6 +131,7 @@ private:
       int64_t &task_id);
   int prepare_rowkey_doc_table();
   int prepare_aux_index_tables();
+  int prepare_aux_index_tables_merged(bool &all_submitted);
   int construct_create_index_arg(
       const ObIndexType index_type,
       obcall::ObCreateIndexArg &arg);
