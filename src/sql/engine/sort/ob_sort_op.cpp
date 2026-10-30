@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX SQL_ENG
 
 #include "sql/engine/sort/ob_sort_op.h"
+#include "sql/engine/sort/ob_fts_sort_profile.h"
 #include "sql/engine/px/ob_px_util.h"
 #include "sql/engine/aggregate/ob_hash_groupby_op.h"
 #include "sql/engine/expr/ob_expr_topn_filter.h"
@@ -25,6 +26,51 @@ namespace oceanbase
 {
 namespace sql
 {
+
+namespace
+{
+void ob_fts_prof_print_sort(ObFtsSortProfile &p)
+{
+  int ret = OB_SUCCESS;
+  UNUSED(ret);
+  LOG_WARN("[FTS_SORT_PROF] SORT",
+      "tid", p.tid_,
+      "rows", p.sort_rows_,
+      "cmp", p.cmp_count_,
+      "add_rows", p.add_rows_, "add_cyc", p.add_tsc_,
+      "refill_rows", p.refill_rows_, "refill_cyc", p.refill_tsc_,
+      "prescan_calls", p.prescan_calls_, "prescan_rows", p.prescan_rows_,
+      "prescan_cyc", p.prescan_tsc_, "prescan_refill_cyc", p.prescan_refill_tsc_,
+      "prescan_dump", p.prescan_dumps_, "prescan_file", p.prescan_file_size_,
+      "sort_cyc", p.sort_tsc_, "proc_cyc", p.proc_tsc_,
+      "path", p.sort_path_, "enc", p.encode_sortkey_,
+      "ctype", p.compress_type_, "cformat", p.compact_format_,
+      "chunks", p.sort_chunks_, "store_rows", p.store_rows_, "dumps", p.dump_calls_);
+  const int64_t c0_n = p.add_rows_ + p.refill_rows_ - p.cell0_null_;
+  const int64_t c1_n = p.add_rows_ + p.refill_rows_ - p.cell1_null_;
+  LOG_WARN("[FTS_SORT_PROF] ROWSHAPE",
+      "tid", p.tid_,
+      "row_bytes", p.row_bytes_,
+      "c0_min", (INT64_MAX == p.cell0_min_) ? -1 : p.cell0_min_,
+      "c0_avg", (c0_n > 0) ? (p.cell0_sum_ / c0_n) : 0,
+      "c0_max", p.cell0_max_, "c0_null", p.cell0_null_, "c0_x16", p.cell0_16_,
+      "c1_min", (INT64_MAX == p.cell1_min_) ? -1 : p.cell1_min_,
+      "c1_avg", (c1_n > 0) ? (p.cell1_sum_ / c1_n) : 0,
+      "c1_max", p.cell1_max_, "c1_null", p.cell1_null_, "c1_x16", p.cell1_16_);
+}
+
+void ob_fts_prof_print_out(ObFtsSortProfile &p)
+{
+  int ret = OB_SUCCESS;
+  UNUSED(ret);
+  LOG_WARN("[FTS_SORT_PROF] OUT",
+      "tid", p.tid_,
+      "rows", p.out_rows_, "out_cyc", p.out_tsc_, "op_cyc", p.op_tsc_,
+      "add_rows", p.add_rows_, "refill_rows", p.refill_rows_,
+      "sort_rows", p.sort_rows_, "sort_cyc", p.sort_tsc_,
+      "path", p.sort_path_, "c0_x16", p.cell0_16_, "c1_x16", p.cell1_16_);
+}
+} // anonymous namespace
 
 ObSortSpec::ObSortSpec(common::ObIAllocator &alloc, const ObPhyOperatorType type)
   : ObOpSpec(alloc, type),
@@ -202,6 +248,12 @@ int ObSortOp::get_topn_count(int64_t &topn_cnt)
 int ObSortOp::process_sort()
 {
   int ret = OB_SUCCESS;
+  const bool fts_prof = ob_fts_sort_prof_on();
+  if (fts_prof) {
+    ObFtsSortProfile &p = ob_fts_sort_prof();
+    p.reset();
+    p.op_start_tsc_ = static_cast<int64_t>(ob_fts_sort_tsc());
+  }
   if (read_func_ == &ObSortOp::prefix_sort_impl_next) {
     // prefix sort get child row in it's own wrap, do nothing here
   } else if (read_func_ == &ObSortOp::sort_impl_next) {
@@ -234,12 +286,24 @@ int ObSortOp::process_sort()
   } else {
     ret = OB_ERR_UNEXPECTED;
   }
+  if (fts_prof) {
+    ObFtsSortProfile &p = ob_fts_sort_prof();
+    p.proc_tsc_ = static_cast<int64_t>(ob_fts_sort_tsc()) - p.op_start_tsc_;
+    p.sort_rows_ = sort_row_count_;
+    ob_fts_prof_print_sort(p);
+  }
   return ret;
 }
 
 int ObSortOp::process_sort_batch()
 {
   int ret = OB_SUCCESS;
+  const bool fts_prof = ob_fts_sort_prof_on();
+  if (fts_prof) {
+    ObFtsSortProfile &p = ob_fts_sort_prof();
+    p.reset();
+    p.op_start_tsc_ = static_cast<int64_t>(ob_fts_sort_tsc());
+  }
   if (read_batch_func_ == &ObSortOp::prefix_sort_impl_next_batch) {
     // prefix sort get child row in it's own wrap, do nothing here
   } else if (read_batch_func_ == &ObSortOp::sort_impl_next_batch) {
@@ -274,6 +338,12 @@ int ObSortOp::process_sort_batch()
   } else {
     ret = OB_ERR_UNEXPECTED;
   }
+  if (fts_prof) {
+    ObFtsSortProfile &p = ob_fts_sort_prof();
+    p.proc_tsc_ = static_cast<int64_t>(ob_fts_sort_tsc()) - p.op_start_tsc_;
+    p.sort_rows_ = sort_row_count_;
+    ob_fts_prof_print_sort(p);
+  }
   return ret;
 }
 
@@ -284,6 +354,8 @@ int ObSortOp::process_sort_batch()
 int ObSortOp::scan_all_then_sort()
 {
   int ret = OB_SUCCESS;
+  const bool fts_prof = ob_fts_sort_prof_on();
+  const uint64_t fts_fill_t0 = fts_prof ? ob_fts_sort_tsc() : 0;
   SMART_VAR(ObCompactStore, cache_store) {
     if (OB_FAIL(cache_store.init(2 * 1024 * 1024,
         ObCtxIds::DEFAULT_CTX_ID, "SORT_CACHE_CTX", true/*enable dump*/, 0, true,
@@ -309,7 +381,16 @@ int ObSortOp::scan_all_then_sort()
 
     if (OB_SUCC(ret)) {
       if (OB_FAIL(cache_store.finish_add_row(false))) {
-      } else {
+      } else if (fts_prof) {
+        ObFtsSortProfile &p = ob_fts_sort_prof();
+        ++p.prescan_calls_;
+        p.prescan_rows_ += cache_store.get_row_cnt();
+        p.prescan_tsc_ += static_cast<int64_t>(ob_fts_sort_tsc() - fts_fill_t0);
+        p.prescan_dumps_ += cache_store.has_dumped() ? 1 : 0;
+        p.prescan_file_size_ += cache_store.get_file_size();
+      }
+      if (OB_SUCC(ret)) {
+        const uint64_t fts_refill_t0 = fts_prof ? ob_fts_sort_tsc() : 0;
         const ObChunkDatumStore::StoredRow *store_row = NULL;
         bool has_next = false;
         while (OB_SUCC(ret) && OB_SUCC(cache_store.has_next(has_next)) && has_next) {
@@ -322,6 +403,10 @@ int ObSortOp::scan_all_then_sort()
             OZ(sort_impl_.add_stored_row(*store_row));
           }
         }
+        if (fts_prof) {
+          ob_fts_sort_prof().prescan_refill_tsc_ +=
+              static_cast<int64_t>(ob_fts_sort_tsc() - fts_refill_t0);
+        }
       }
     }
   }
@@ -331,6 +416,8 @@ int ObSortOp::scan_all_then_sort()
 int ObSortOp::scan_all_then_sort_batch()
 {
   int ret = OB_SUCCESS;
+  const bool fts_prof = ob_fts_sort_prof_on();
+  const uint64_t fts_fill_t0 = fts_prof ? ob_fts_sort_tsc() : 0;
   SMART_VAR(ObCompactStore, cache_store) {
     if (OB_FAIL(cache_store.init(16 * 1024,
         ObCtxIds::DEFAULT_CTX_ID, "SORT_CACHE_CTX", true/*enable dump*/, 0, true,
@@ -364,7 +451,16 @@ int ObSortOp::scan_all_then_sort_batch()
     op_monitor_info_.otherstat_7_value_ = sort_row_count_; 
     if (OB_SUCC(ret)) {
       if (OB_FAIL(cache_store.finish_add_row(false))) {
-      } else {
+      } else if (fts_prof) {
+        ObFtsSortProfile &p = ob_fts_sort_prof();
+        ++p.prescan_calls_;
+        p.prescan_rows_ += cache_store.get_row_cnt();
+        p.prescan_tsc_ += static_cast<int64_t>(ob_fts_sort_tsc() - fts_fill_t0);
+        p.prescan_dumps_ += cache_store.has_dumped() ? 1 : 0;
+        p.prescan_file_size_ += cache_store.get_file_size();
+      }
+      if (OB_SUCC(ret)) {
+        const uint64_t fts_refill_t0 = fts_prof ? ob_fts_sort_tsc() : 0;
         const ObChunkDatumStore::StoredRow *store_row = NULL;
         bool has_next = false;
         while (OB_SUCC(ret) && OB_SUCC(cache_store.has_next(has_next)) && has_next) {
@@ -378,6 +474,10 @@ int ObSortOp::scan_all_then_sort_batch()
           } else {
             OZ(sort_impl_.add_stored_row(*store_row));
           }
+        }
+        if (fts_prof) {
+          ob_fts_sort_prof().prescan_refill_tsc_ +=
+              static_cast<int64_t>(ob_fts_sort_tsc() - fts_refill_t0);
         }
       }
     }
@@ -472,6 +572,8 @@ int ObSortOp::inner_get_next_row()
 
   if (OB_SUCC(ret)) {
     clear_evaluated_flag();
+    const bool fts_prof = ob_fts_sort_prof_on();
+    const uint64_t fts_t0 = fts_prof ? ob_fts_sort_tsc() : 0;
     if (OB_FAIL((this->*read_func_)())) {
       if (OB_ITER_END != ret) {
         LOG_WARN("get next row failed");
@@ -480,10 +582,21 @@ int ObSortOp::inner_get_next_row()
           ret = OB_CHECKSUM_ERROR;
         }
         iter_end_ = true;
+        if (fts_prof) {
+          ObFtsSortProfile &p = ob_fts_sort_prof();
+          p.out_tsc_ += static_cast<int64_t>(ob_fts_sort_tsc() - fts_t0);
+          p.op_tsc_ = static_cast<int64_t>(ob_fts_sort_tsc()) - p.op_start_tsc_;
+          ob_fts_prof_print_out(p);
+        }
         reset();
       }
     } else {
       ++ret_row_count_;
+      if (fts_prof) {
+        ObFtsSortProfile &p = ob_fts_sort_prof();
+        p.out_tsc_ += static_cast<int64_t>(ob_fts_sort_tsc() - fts_t0);
+        ++p.out_rows_;
+      }
       LOG_DEBUG("finish ObSortOp::inner_get_next_row", K(ObToStringExprRow(eval_ctx_, MY_SPEC.output_)), K(ret_row_count_), K(MY_SPEC.output_));
     }
   }
@@ -522,12 +635,24 @@ int ObSortOp::inner_get_next_batch(const int64_t max_row_cnt)
 
   if (OB_SUCC(ret) && !brs_.end_) {
     clear_evaluated_flag();
+    const bool fts_prof = ob_fts_sort_prof_on();
+    const uint64_t fts_t0 = fts_prof ? ob_fts_sort_tsc() : 0;
     if (OB_FAIL((this->*read_batch_func_)(std::min(max_row_cnt, MY_SPEC.max_batch_size_)))) {
     } else {
       ret_row_count_ += brs_.size_;
+      if (fts_prof) {
+        ObFtsSortProfile &p = ob_fts_sort_prof();
+        p.out_tsc_ += static_cast<int64_t>(ob_fts_sort_tsc() - fts_t0);
+        p.out_rows_ += brs_.size_;
+      }
       if (brs_.end_) {
         if (ctx_.get_my_session()->get_ddl_info().is_ddl() && ret_row_count_ != sort_row_count_) {
           ret = OB_CHECKSUM_ERROR;
+        }
+        if (fts_prof) {
+          ObFtsSortProfile &p = ob_fts_sort_prof();
+          p.op_tsc_ = static_cast<int64_t>(ob_fts_sort_tsc()) - p.op_start_tsc_;
+          ob_fts_prof_print_out(p);
         }
       }
     }

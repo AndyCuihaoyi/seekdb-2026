@@ -21,12 +21,54 @@
 #include "query/engine/basic/ob_encoded_sort_row.h"
 #include "data_plane/encoding/ob_cpu_features.h"
 #include "sql/engine/px/p2p_datahub/ob_pushdown_topn_filter_msg.h"
+#include "sql/engine/sort/ob_fts_sort_profile.h"
 
 namespace oceanbase
 {
 using namespace common;
 namespace sql
 {
+
+namespace
+{
+void ob_fts_prof_record_row(const ObChunkDatumStore::StoredRow *sr, const bool refill)
+{
+  if (OB_ISNULL(sr)) {
+  } else {
+    ObFtsSortProfile &p = ob_fts_sort_prof();
+    if (refill) {
+      ++p.refill_rows_;
+    } else {
+      ++p.add_rows_;
+    }
+    p.row_bytes_ += sr->row_size_;
+    if (sr->cnt_ > 0) {
+      const ObDatum &cell = sr->cells()[0];
+      if (cell.is_null()) {
+        ++p.cell0_null_;
+      } else {
+        const int64_t len = static_cast<int64_t>(cell.len_);
+        p.cell0_sum_ += len;
+        if (len < p.cell0_min_) { p.cell0_min_ = len; }
+        if (len > p.cell0_max_) { p.cell0_max_ = len; }
+        if (16 == len) { ++p.cell0_16_; }
+      }
+    }
+    if (sr->cnt_ > 1) {
+      const ObDatum &cell = sr->cells()[1];
+      if (cell.is_null()) {
+        ++p.cell1_null_;
+      } else {
+        const int64_t len = static_cast<int64_t>(cell.len_);
+        p.cell1_sum_ += len;
+        if (len < p.cell1_min_) { p.cell1_min_ = len; }
+        if (len > p.cell1_max_) { p.cell1_max_ = len; }
+        if (16 == len) { ++p.cell1_16_; }
+      }
+    }
+  }
+}
+} // anonymous namespace
 
 /************************************* start ObSortOpImpl *********************************/
 ObSortOpImpl::ObAdaptiveQS::ObAdaptiveQS(common::ObIArray<ObChunkDatumStore::StoredRow *> &sort_rows,
@@ -1166,11 +1208,19 @@ int ObSortOpImpl::add_quick_sort_row(const common::ObIArray<ObExpr*> &exprs,
 {
   int ret = OB_SUCCESS;
   ObChunkDatumStore::StoredRow *sr = NULL;
+  const bool fts_prof = ob_fts_sort_prof_on();
+  const uint64_t fts_t0 = fts_prof ? ob_fts_sort_tsc() : 0;
   if (OB_FAIL(before_add_row())) {
   } else if (OB_FAIL(datum_store_.add_row(exprs, eval_ctx_, &sr))) {
   } else if (OB_FAIL(after_add_row(sr))) {
   } else {
     store_row = sr;
+  }
+  if (fts_prof) {
+    ob_fts_sort_prof().add_tsc_ += static_cast<int64_t>(ob_fts_sort_tsc() - fts_t0);
+    if (OB_SUCC(ret)) {
+      ob_fts_prof_record_row(sr, false);
+    }
   }
   return ret;
 }
@@ -1223,6 +1273,8 @@ int ObSortOpImpl::add_quick_sort_batch(const common::ObIArray<ObExpr *> &exprs,
 {
   int ret = OB_SUCCESS;
   int64_t stored_rows_cnt = 0;
+  const bool fts_prof = ob_fts_sort_prof_on();
+  const uint64_t fts_t0 = fts_prof ? ob_fts_sort_tsc() : 0;
   if (OB_FAIL(before_add_row())) {
   } else if (OB_FAIL(datum_store_.add_batch(exprs, *eval_ctx_, skip, batch_size,
                                             stored_rows_cnt, stored_rows_, start_pos))) {
@@ -1233,6 +1285,14 @@ int ObSortOpImpl::add_quick_sort_batch(const common::ObIArray<ObExpr *> &exprs,
     }
     if (OB_NOT_NULL(append_row_count)) {
       *append_row_count = stored_rows_cnt;
+    }
+  }
+  if (fts_prof) {
+    ob_fts_sort_prof().add_tsc_ += static_cast<int64_t>(ob_fts_sort_tsc() - fts_t0);
+    if (OB_SUCC(ret)) {
+      for (int64_t i = 0; i < stored_rows_cnt; i++) {
+        ob_fts_prof_record_row(stored_rows_[i], false);
+      }
     }
   }
   return ret;
@@ -1270,12 +1330,22 @@ int ObSortOpImpl::add_quick_sort_batch(const common::ObIArray<ObExpr *> &exprs,
 {
   int ret = OB_SUCCESS;
   int64_t stored_rows_cnt = size;
+  const bool fts_prof = ob_fts_sort_prof_on();
+  const uint64_t fts_t0 = fts_prof ? ob_fts_sort_tsc() : 0;
   if (OB_FAIL(before_add_row())) {
   } else if (OB_FAIL(datum_store_.add_batch(exprs, *eval_ctx_, skip, batch_size,
                                             selector, size, stored_rows_))) {
   } else {
     for (int64_t i = 0; OB_SUCC(ret) && i < stored_rows_cnt; i++) {
       if (OB_FAIL(after_add_row(stored_rows_[i]))) {
+      }
+    }
+  }
+  if (fts_prof) {
+    ob_fts_sort_prof().add_tsc_ += static_cast<int64_t>(ob_fts_sort_tsc() - fts_t0);
+    if (OB_SUCC(ret)) {
+      for (int64_t i = 0; i < stored_rows_cnt; i++) {
+        ob_fts_prof_record_row(stored_rows_[i], false);
       }
     }
   }
@@ -1306,9 +1376,17 @@ int ObSortOpImpl::add_stored_row(const ObChunkDatumStore::StoredRow &input_row)
 {
   int ret = OB_SUCCESS;
   ObChunkDatumStore::StoredRow *sr = NULL;
+  const bool fts_prof = ob_fts_sort_prof_on();
+  const uint64_t fts_t0 = fts_prof ? ob_fts_sort_tsc() : 0;
   if (OB_FAIL(before_add_row())) {
   } else if (OB_FAIL(datum_store_.add_row(input_row, &sr))) {
   } else if (OB_FAIL(after_add_row(sr))) {
+  }
+  if (fts_prof) {
+    ob_fts_sort_prof().refill_tsc_ += static_cast<int64_t>(ob_fts_sort_tsc() - fts_t0);
+    if (OB_SUCC(ret)) {
+      ob_fts_prof_record_row(sr, true);
+    }
   }
   return ret;
 }
@@ -1537,6 +1615,9 @@ int ObSortOpImpl::do_partition_topn_sort() {
 int ObSortOpImpl::do_dump()
 {
   int ret = OB_SUCCESS;
+  if (ob_fts_sort_prof_on()) {
+    ++ob_fts_sort_prof().dump_calls_;
+  }
   ObSEArray<std::pair<int64_t, int64_t>, 4> pt_bucket_cnts;
   int64_t pt_bucket_dumped = 0;
   if (!is_inited()) {
@@ -1841,6 +1922,9 @@ int ObSortOpImpl::part_topn_heap_next(int64_t &cur_heap_idx,
 int ObSortOpImpl::sort_inmem_data()
 {
   int ret = OB_SUCCESS;
+  const bool fts_prof = ob_fts_sort_prof_on();
+  const uint64_t fts_t0 = fts_prof ? ob_fts_sort_tsc() : 0;
+  int64_t fts_path = 4; // already ordered / no sort
   const int64_t curr_time = ObTimeUtility::fast_current_time();
   if (!is_inited()) {
     ret = OB_NOT_INIT;
@@ -1850,21 +1934,26 @@ int ObSortOpImpl::sort_inmem_data()
       // row already in order, do nothing.
     } else {
       int64_t begin = 0;
+      fts_path = 0;
       if (use_partition_topn_sort_) {
         heap_nodes_.reuse();
         do_partition_topn_sort();
+        fts_path = 3;
       } else if (part_cnt_ > 0) {
         OZ(do_partition_sort(*rows_, begin, rows_->count()));
+        fts_path = 3;
       } else if (enable_encode_sortkey_) {
         bool can_encode = true;
         ObAdaptiveQS aqs(*rows_, mem_context_->get_malloc_allocator());
         if (OB_FAIL(aqs.init(*rows_, mem_context_->get_malloc_allocator(), begin, rows_->count(), can_encode))) {
         } else if (can_encode) {
           aqs.sort(begin, rows_->count());
+          fts_path = 1;
         } else {
           enable_encode_sortkey_ = false;
           comp_.enable_encode_sortkey_ = false;
           lib::ob_sort(&rows_->at(begin), &rows_->at(0) + rows_->count(), CopyableComparer(comp_));
+          fts_path = 2;
         }
       } else {
         lib::ob_sort(&rows_->at(begin), &rows_->at(0) + rows_->count(), CopyableComparer(comp_));
@@ -1915,6 +2004,18 @@ int ObSortOpImpl::sort_inmem_data()
     const int64_t sort_cpu_time = ObTimeUtility::fast_current_time() - curr_time;
     op_monitor_info_->otherstat_3_id_ = ObSqlMonitorStatIds::SORT_INMEM_SORT_TIME;
     op_monitor_info_->otherstat_3_value_ += sort_cpu_time;
+  }
+  if (fts_prof) {
+    ObFtsSortProfile &p = ob_fts_sort_prof();
+    p.sort_tsc_ += static_cast<int64_t>(ob_fts_sort_tsc() - fts_t0);
+    p.sort_rows_ = (NULL != rows_) ? rows_->count() : 0;
+    p.cmp_count_ = comp_.cmp_count_;
+    p.compress_type_ = static_cast<int64_t>(compress_type_);
+    p.compact_format_ = use_compact_format_ ? 1 : 0;
+    p.encode_sortkey_ = enable_encode_sortkey_ ? 1 : 0;
+    p.store_rows_ = datum_store_.get_row_cnt();
+    p.sort_chunks_ = sort_chunks_.get_size();
+    p.sort_path_ = fts_path;
   }
   return ret;
 }
