@@ -62,6 +62,10 @@ struct ObFtsSortProfile
   int64_t compact_format_;
   int64_t encode_sortkey_;
   int64_t sort_path_;
+  // C2 encoded-key sort: rows keyed, key bytes built, whole-batch fallbacks.
+  int64_t fts_key_rows_;
+  int64_t fts_key_bytes_;
+  int64_t fts_key_fallback_;
   bool sort_printed_;
   bool out_printed_;
 

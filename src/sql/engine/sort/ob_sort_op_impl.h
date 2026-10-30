@@ -403,6 +403,9 @@ public:
   void set_input_rows(int64_t input_rows) { input_rows_ = input_rows; }
   void set_input_width(int64_t input_width) { input_width_ = input_width; }
   void set_cache_floor(int64_t cache_floor) { cache_floor_ = cache_floor; }
+  // C2: only set for FTS aux DDL sorts, and never together with
+  // enable_encode_sortkey_opt_ (that path keeps its own AQS key handling).
+  void set_fts_key_sort(bool enable) { fts_key_sort_ = enable; }
   void set_operator_type(ObPhyOperatorType op_type) { op_type_ = op_type; }
   void set_operator_id(uint64_t op_id) { op_id_ = op_id; }
   void collect_memory_dump_info(ObMonitorNode &info)
@@ -701,6 +704,10 @@ protected:
            && rows_->count() > datum_store_.get_row_cnt();
   }
   int sort_inmem_data();
+  // Build order-preserving keys from the stored sort cells and sort the rows
+  // by prefix+memcmp. Returns sorted=false (whole-batch fallback to the legacy
+  // comparator) when a key cannot be encoded or the key memory cap is hit.
+  int try_sort_by_encoded_key(bool &sorted);
   int do_dump();
   int inner_dump_part_topn_heap();
 
@@ -839,6 +846,7 @@ protected:
   bool got_first_row_;
   bool sorted_;
   bool enable_encode_sortkey_;
+  bool fts_key_sort_;
   ModulePageAllocator page_allocator_;
   lib::MemoryContext mem_context_;
   MemEntifyFreeGuard mem_entify_guard_;

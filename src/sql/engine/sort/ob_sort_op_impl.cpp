@@ -20,6 +20,7 @@
 #include "ob_sort_op_impl.h"
 #include "query/engine/basic/ob_encoded_sort_row.h"
 #include "data_plane/encoding/ob_cpu_features.h"
+#include "data_plane/ob_order_perserving_encoder.h"
 #include "sql/engine/px/p2p_datahub/ob_pushdown_topn_filter_msg.h"
 #include "sql/engine/sort/ob_fts_sort_profile.h"
 
@@ -642,7 +643,7 @@ bool ObSortOpImpl::Compare::operator()(
 
 ObSortOpImpl::ObSortOpImpl() :
   inited_(false), local_merge_sort_(false), need_rewind_(false), got_first_row_(false),
-  sorted_(false), enable_encode_sortkey_(false),
+  sorted_(false), enable_encode_sortkey_(false), fts_key_sort_(false),
   page_allocator_("PartSortBucket", ObCtxIds::WORK_AREA), mem_context_(NULL),
   mem_entify_guard_(mem_context_), sort_collations_(nullptr),
   sort_cmp_funs_(nullptr), eval_ctx_(nullptr), datum_access_ctx_(nullptr),
@@ -662,7 +663,7 @@ ObSortOpImpl::ObSortOpImpl() :
 
 ObSortOpImpl::ObSortOpImpl(ObMonitorNode &op_monitor_info)
   : inited_(false), local_merge_sort_(false), need_rewind_(false),
-    got_first_row_(false), sorted_(false), enable_encode_sortkey_(false),
+    got_first_row_(false), sorted_(false), enable_encode_sortkey_(false), fts_key_sort_(false),
     page_allocator_("PartSortBucket", ObCtxIds::WORK_AREA), mem_context_(NULL),
     mem_entify_guard_(mem_context_), sort_collations_(nullptr),
     sort_cmp_funs_(nullptr), eval_ctx_(nullptr), datum_access_ctx_(nullptr),
@@ -957,6 +958,7 @@ void ObSortOpImpl::reset()
   ties_array_pos_ = 0;
   compress_type_ = NONE_COMPRESSOR;
   use_compact_format_ = false;
+  fts_key_sort_ = false;
   sort_exprs_ = nullptr;
   // for partition topn sort
   cur_heap_idx_ = 0;
@@ -1960,6 +1962,257 @@ int ObSortOpImpl::part_topn_heap_next(int64_t &cur_heap_idx,
   return ret;
 }
 
+namespace
+{
+// C2 encoded-key sort for FTS aux DDL. Keys are built from the stored sort
+// cells with the order-preserving encoder in memcmp mode; the hard cap bounds
+// the extra key memory per operator (largest observed aux sort is ~813k rows
+// x ~40B). Over-cap or unencodable batches fall back to the legacy comparator.
+const int64_t FTS_KEY_SORT_MEM_CAP = 256LL << 20;
+const int64_t FTS_KEY_MAX_COLUMNS = 8;
+const int64_t FTS_KEY_CHUNK_SIZE = 1LL << 20;
+
+struct FtsKeyEntry
+{
+  const char *key_;
+  uint32_t len_;
+  uint32_t reserved_;
+  ObChunkDatumStore::StoredRow *row_;
+};
+
+struct FtsKeyChunk
+{
+  FtsKeyChunk *prev_;
+  char data_[0];
+};
+
+// can_encode_sortkey() omits ObVarcharType although the encoder handles it;
+// FTS aux sort keys are varchar, so extend the gate for the validated
+// collations only (anything else falls back to the legacy comparator).
+inline bool is_fts_key_encodable(const ObObjType type, const ObCollationType cs)
+{
+  return share::ObOrderPerservingEncoder::can_encode_sortkey(type, cs)
+         || (ObVarcharType == type
+             && (CS_TYPE_COLLATION_FREE == cs || CS_TYPE_BINARY == cs
+                 || CS_TYPE_UTF8MB4_BIN == cs || CS_TYPE_UTF8MB4_GENERAL_CI == cs));
+}
+
+struct FtsKeyCmp
+{
+  int *ret_;
+  int64_t *cmp_count_;
+  ObExecContext *exec_ctx_;
+  bool operator()(const FtsKeyEntry &l, const FtsKeyEntry &r) const
+  {
+    bool less = false;
+    int &ret = *ret_;
+    if (OB_UNLIKELY(OB_SUCCESS != ret)) {
+      // keep strict weak ordering after an error, as the legacy comparator does
+      less = l.row_ < r.row_;
+    } else if (OB_UNLIKELY(0 == ((*cmp_count_)++ & 8191))
+               && OB_FAIL(exec_ctx_->check_status())) {
+      less = l.row_ < r.row_;
+    } else {
+      const uint32_t cmp_len = l.len_ < r.len_ ? l.len_ : r.len_;
+      const int cmp = (cmp_len > 0) ? MEMCMP(l.key_, r.key_, cmp_len) : 0;
+      less = (0 != cmp) ? (cmp < 0) : (l.len_ < r.len_);
+    }
+    return less;
+  }
+};
+
+int encode_fts_sort_key(ObChunkDatumStore::StoredRow &sr,
+                        const ObIArray<ObSortFieldCollation> &collations,
+                        share::ObEncParam *params,
+                        const int64_t col_cnt,
+                        unsigned char *buf,
+                        const int64_t buf_len,
+                        int64_t &key_len)
+{
+  int ret = OB_SUCCESS;
+  ObDatum *cells = sr.cells();
+  key_len = 0;
+  for (int64_t i = 0; OB_SUCC(ret) && i < col_cnt; ++i) {
+    int64_t part_len = 0;
+    if (OB_UNLIKELY(buf_len - key_len < 1)) {
+      ret = OB_BUF_NOT_ENOUGH;
+    } else if (OB_FAIL(share::ObSortkeyConditioner::process_key_conditioning(
+                   cells[collations.at(i).field_idx_], buf + key_len,
+                   buf_len - key_len, part_len, params[i]))) {
+    } else if (OB_UNLIKELY(!params[i].is_valid_uni_)) {
+      ret = OB_NOT_SUPPORTED;
+    } else {
+      key_len += part_len;
+    }
+  }
+  return ret;
+}
+} // namespace
+
+int ObSortOpImpl::try_sort_by_encoded_key(bool &sorted)
+{
+  int ret = OB_SUCCESS;
+  sorted = false;
+  int64_t key_rows = 0;
+  int64_t key_bytes = 0;
+  bool fallback = false;
+  const int64_t row_cnt = (NULL != rows_) ? rows_->count() : 0;
+  const int64_t col_cnt = (NULL != sort_collations_) ? sort_collations_->count() : 0;
+  if (row_cnt <= 1) {
+    sorted = true;
+  } else if (col_cnt <= 0 || col_cnt > FTS_KEY_MAX_COLUMNS || NULL == sort_exprs_) {
+    fallback = true;
+  } else {
+    ObIAllocator &alloc = mem_context_->get_malloc_allocator();
+    share::ObEncParam params[FTS_KEY_MAX_COLUMNS];
+    bool encodable = true;
+    for (int64_t i = 0; encodable && OB_SUCC(ret) && i < col_cnt; ++i) {
+      const ObSortFieldCollation &sc = sort_collations_->at(i);
+      const ObExpr *expr = NULL;
+      if (OB_UNLIKELY(sc.field_idx_ >= static_cast<uint32_t>(sort_exprs_->count()))) {
+        encodable = false;
+      } else if (OB_ISNULL(expr = sort_exprs_->at(sc.field_idx_))) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (!is_fts_key_encodable(expr->datum_meta_.type_, sc.cs_type_)) {
+        encodable = false;
+      } else {
+        share::ObEncParam &param = params[i];
+        param.type_ = expr->datum_meta_.type_;
+        param.cs_type_ = sc.cs_type_;
+        param.is_var_len_ = false;
+        param.is_memcmp_ = true;
+        param.is_nullable_ = true;
+        param.is_null_first_ = (NULL_FIRST == sc.null_pos_);
+        param.is_asc_ = sc.is_ascending_;
+        param.is_valid_uni_ = true;
+        param.is_simdopt_ = true;
+        param.enc_mod_ = share::OB_NONE;
+      }
+    }
+    FtsKeyEntry *entries = NULL;
+    if (OB_SUCC(ret) && encodable) {
+      if (OB_ISNULL(entries = static_cast<FtsKeyEntry *>(alloc.alloc(
+                        row_cnt * static_cast<int64_t>(sizeof(FtsKeyEntry)))))) {
+        encodable = false;
+      }
+    }
+    FtsKeyChunk *chunks = NULL;
+    char *chunk_cur = NULL;
+    int64_t chunk_left = 0;
+    unsigned char *big_buf = NULL;
+    int64_t big_cap = 0;
+    unsigned char stack_buf[512];
+    for (int64_t i = 0; encodable && OB_SUCC(ret) && i < row_cnt; ++i) {
+      ObChunkDatumStore::StoredRow *sr = rows_->at(i);
+      const unsigned char *key_ptr = stack_buf;
+      int64_t key_len = 0;
+      int rc = OB_SUCCESS;
+      if (OB_ISNULL(sr)) {
+        encodable = false;
+      } else {
+        rc = encode_fts_sort_key(*sr, *sort_collations_, params, col_cnt,
+                                 stack_buf, static_cast<int64_t>(sizeof(stack_buf)), key_len);
+        if (OB_BUF_NOT_ENOUGH == rc) {
+          int64_t need = 64;
+          const ObDatum *cells = sr->cells();
+          for (int64_t c = 0; c < col_cnt; ++c) {
+            need += 7 * cells[sort_collations_->at(c).field_idx_].len_ + 32;
+          }
+          if (need > big_cap) {
+            if (NULL != big_buf) {
+              alloc.free(big_buf);
+              big_buf = NULL;
+              big_cap = 0;
+            }
+            if (OB_NOT_NULL(big_buf = static_cast<unsigned char *>(alloc.alloc(need)))) {
+              big_cap = need;
+            }
+          }
+          if (NULL != big_buf) {
+            rc = encode_fts_sort_key(*sr, *sort_collations_, params, col_cnt,
+                                     big_buf, big_cap, key_len);
+            key_ptr = big_buf;
+          }
+        }
+      }
+      if (!encodable) {
+      } else if (OB_SUCCESS != rc) {
+        if (OB_NOT_SUPPORTED != rc && OB_BUF_NOT_ENOUGH != rc) {
+          LOG_WARN("failed to encode fts sort key, fall back to legacy sort", K(rc), K(i));
+        }
+        encodable = false;
+      } else if (OB_UNLIKELY(key_len <= 0 || key_len > static_cast<int64_t>(UINT32_MAX)
+                             || key_bytes + key_len > FTS_KEY_SORT_MEM_CAP)) {
+        encodable = false;
+      } else {
+        if (chunk_left < key_len) {
+          const int64_t chunk_size = key_len > FTS_KEY_CHUNK_SIZE ? key_len : FTS_KEY_CHUNK_SIZE;
+          FtsKeyChunk *chunk = static_cast<FtsKeyChunk *>(
+              alloc.alloc(sizeof(FtsKeyChunk) + static_cast<int64_t>(chunk_size)));
+          if (OB_ISNULL(chunk)) {
+            encodable = false;
+          } else {
+            chunk->prev_ = chunks;
+            chunks = chunk;
+            chunk_cur = chunk->data_;
+            chunk_left = chunk_size;
+          }
+        }
+        if (encodable) {
+          MEMCPY(chunk_cur, key_ptr, key_len);
+          entries[i].key_ = chunk_cur;
+          entries[i].len_ = static_cast<uint32_t>(key_len);
+          entries[i].row_ = sr;
+          chunk_cur += key_len;
+          chunk_left -= key_len;
+          key_bytes += key_len;
+          ++key_rows;
+        }
+      }
+    }
+    if (OB_SUCC(ret) && encodable) {
+      int cmp_ret = OB_SUCCESS;
+      int64_t cmp_count = 0;
+      FtsKeyCmp cmp;
+      cmp.ret_ = &cmp_ret;
+      cmp.cmp_count_ = &cmp_count;
+      cmp.exec_ctx_ = exec_ctx_;
+      lib::ob_sort(entries, entries + row_cnt, cmp);
+      if (OB_FAIL(cmp_ret)) {
+        ret = cmp_ret;
+      } else {
+        for (int64_t i = 0; i < row_cnt; ++i) {
+          rows_->at(i) = entries[i].row_;
+        }
+        sorted = true;
+      }
+    }
+    if (!sorted && OB_SUCC(ret)) {
+      fallback = true;
+    }
+    if (NULL != entries) {
+      alloc.free(entries);
+    }
+    if (NULL != big_buf) {
+      alloc.free(big_buf);
+    }
+    while (NULL != chunks) {
+      FtsKeyChunk *prev = chunks->prev_;
+      alloc.free(chunks);
+      chunks = prev;
+    }
+  }
+  if (ob_fts_sort_prof_on()) {
+    ObFtsSortProfile &p = ob_fts_sort_prof();
+    p.fts_key_rows_ += key_rows;
+    p.fts_key_bytes_ += key_bytes;
+    if (fallback) {
+      ++p.fts_key_fallback_;
+    }
+  }
+  return ret;
+}
+
 int ObSortOpImpl::sort_inmem_data()
 {
   int ret = OB_SUCCESS;
@@ -1995,6 +2248,16 @@ int ObSortOpImpl::sort_inmem_data()
           comp_.enable_encode_sortkey_ = false;
           lib::ob_sort(&rows_->at(begin), &rows_->at(0) + rows_->count(), CopyableComparer(comp_));
           fts_path = 2;
+        }
+      } else if (fts_key_sort_ && !use_heap_sort_ && !use_partition_topn_sort_) {
+        bool key_sorted = false;
+        if (OB_FAIL(try_sort_by_encoded_key(key_sorted))) {
+        } else if (key_sorted) {
+          fts_path = 5;
+        } else {
+          // whole-batch fallback: this operator keeps the legacy comparator
+          fts_key_sort_ = false;
+          lib::ob_sort(&rows_->at(begin), &rows_->at(0) + rows_->count(), CopyableComparer(comp_));
         }
       } else {
         lib::ob_sort(&rows_->at(begin), &rows_->at(0) + rows_->count(), CopyableComparer(comp_));

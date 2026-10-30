@@ -40,6 +40,7 @@ void ob_fts_prof_print_sort(ObFtsSortProfile &p)
       "prescan_dump=%ld prescan_file=%ld sort_cyc=%ld proc_cyc=%ld child_cyc=%ld "
       "prescan_child_cyc=%ld prescan_add_cyc=%ld prescan_finish_cyc=%ld prescan_read_cyc=%ld "
       "path=%ld enc=%ld ctype=%ld cformat=%ld chunks=%ld store_rows=%ld dumps=%ld "
+      "key_rows=%ld key_bytes=%ld key_fb=%ld "
       "row_bytes=%ld c0_min=%ld c0_avg=%ld c0_max=%ld c0_null=%ld c0_x16=%ld "
       "c1_min=%ld c1_avg=%ld c1_max=%ld c1_null=%ld c1_x16=%ld",
       (long)p.tid_, (long)p.sort_rows_, (long)p.cmp_count_,
@@ -51,7 +52,9 @@ void ob_fts_prof_print_sort(ObFtsSortProfile &p)
       (long)p.prescan_finish_tsc_, (long)p.prescan_read_tsc_,
       (long)p.sort_path_, (long)p.encode_sortkey_,
       (long)p.compress_type_, (long)p.compact_format_, (long)p.sort_chunks_,
-      (long)p.store_rows_, (long)p.dump_calls_, (long)p.row_bytes_,
+      (long)p.store_rows_, (long)p.dump_calls_,
+      (long)p.fts_key_rows_, (long)p.fts_key_bytes_, (long)p.fts_key_fallback_,
+      (long)p.row_bytes_,
       (long)((INT64_MAX == p.cell0_min_) ? -1 : p.cell0_min_),
       (long)((c0_n > 0) ? (p.cell0_sum_ / c0_n) : 0), (long)p.cell0_max_,
       (long)p.cell0_null_, (long)p.cell0_16_,
@@ -580,6 +583,9 @@ int ObSortOp::init_sort(int64_t row_count,
   sort_impl_.set_input_width(MY_SPEC.width_ + aqs_head);
   if (MY_SPEC.fts_aux_ddl_) {
     sort_impl_.set_cache_floor(FTS_AUX_DDL_SORT_CACHE_FLOOR);
+    if (!MY_SPEC.enable_encode_sortkey_opt_) {
+      sort_impl_.set_fts_key_sort(true);
+    }
   }
   sort_impl_.set_operator_type(MY_SPEC.type_);
   sort_impl_.set_operator_id(MY_SPEC.id_);
