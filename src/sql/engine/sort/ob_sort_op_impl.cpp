@@ -68,6 +68,43 @@ void ob_fts_prof_record_row(const ObChunkDatumStore::StoredRow *sr, const bool r
     }
   }
 }
+
+void ob_fts_prof_dump_rows(const ObIArray<ObChunkDatumStore::StoredRow *> *rows)
+{
+  static thread_local int64_t seq = 0;
+  if (OB_ISNULL(rows) || rows->count() <= 0) {
+  } else {
+    char path[160];
+    ::snprintf(path, sizeof(path), "/tmp/fts_aux_dump.%ld.%ld.bin",
+               static_cast<long>(::syscall(SYS_gettid)), static_cast<long>(seq++));
+    FILE *fp = ::fopen(path, "wb");
+    if (NULL != fp) {
+      int64_t n = 0;
+      for (int64_t i = 0; i < rows->count(); ++i) {
+        const ObChunkDatumStore::StoredRow *sr = rows->at(i);
+        if (NULL == sr || sr->cnt_ < 2) {
+          continue;
+        }
+        for (int64_t c = 0; c < 2; ++c) {
+          const ObDatum &d = sr->cells()[c];
+          const uint8_t is_null = d.is_null() ? 1 : 0;
+          const uint32_t len = is_null ? 0 : static_cast<uint32_t>(d.len_);
+          ::fwrite(&is_null, 1, 1, fp);
+          ::fwrite(&len, 4, 1, fp);
+          if (!is_null) {
+            ::fwrite(d.ptr_, 1, len, fp);
+          }
+        }
+        ++n;
+      }
+      ::fclose(fp);
+      char buf[256];
+      ::snprintf(buf, sizeof(buf), "DUMP file=%s rows=%ld",
+                 path, static_cast<long>(n));
+      ob_fts_prof_append(buf);
+    }
+  }
+}
 } // anonymous namespace
 
 /************************************* start ObSortOpImpl *********************************/
@@ -2016,6 +2053,9 @@ int ObSortOpImpl::sort_inmem_data()
     p.store_rows_ = datum_store_.get_row_cnt();
     p.sort_chunks_ = sort_chunks_.get_size();
     p.sort_path_ = fts_path;
+  }
+  if (ob_fts_sort_dump_on()) {
+    ob_fts_prof_dump_rows(rows_);
   }
   return ret;
 }

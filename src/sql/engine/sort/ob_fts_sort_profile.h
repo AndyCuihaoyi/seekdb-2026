@@ -6,6 +6,7 @@
 #define OCEANBASE_SQL_ENGINE_SORT_OB_FTS_SORT_PROFILE_H_
 
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -69,6 +70,21 @@ struct ObFtsSortProfile
     tid_ = static_cast<int64_t>(::syscall(SYS_gettid));
   }
 };
+
+inline bool ob_fts_sort_dump_on()
+{
+  static const bool on = (nullptr != ::getenv("OB_FTS_SORT_DUMP"));
+  return on;
+}
+
+inline void ob_fts_prof_append(const char *line)
+{
+  FILE *fp = ::fopen("/tmp/fts_sort_prof.txt", "a");
+  if (NULL != fp) {
+    ::fprintf(fp, "%s\n", line);
+    ::fclose(fp);
+  }
+}
 
 inline bool ob_fts_sort_prof_on()
 {

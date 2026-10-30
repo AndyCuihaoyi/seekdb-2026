@@ -31,45 +31,44 @@ namespace
 {
 void ob_fts_prof_print_sort(ObFtsSortProfile &p)
 {
-  int ret = OB_SUCCESS;
-  UNUSED(ret);
-  LOG_WARN("[FTS_SORT_PROF] SORT",
-      "tid", p.tid_,
-      "rows", p.sort_rows_,
-      "cmp", p.cmp_count_,
-      "add_rows", p.add_rows_, "add_cyc", p.add_tsc_,
-      "refill_rows", p.refill_rows_, "refill_cyc", p.refill_tsc_,
-      "prescan_calls", p.prescan_calls_, "prescan_rows", p.prescan_rows_,
-      "prescan_cyc", p.prescan_tsc_, "prescan_refill_cyc", p.prescan_refill_tsc_,
-      "prescan_dump", p.prescan_dumps_, "prescan_file", p.prescan_file_size_,
-      "sort_cyc", p.sort_tsc_, "proc_cyc", p.proc_tsc_,
-      "path", p.sort_path_, "enc", p.encode_sortkey_,
-      "ctype", p.compress_type_, "cformat", p.compact_format_,
-      "chunks", p.sort_chunks_, "store_rows", p.store_rows_, "dumps", p.dump_calls_);
+  char buf[2048];
   const int64_t c0_n = p.add_rows_ + p.refill_rows_ - p.cell0_null_;
   const int64_t c1_n = p.add_rows_ + p.refill_rows_ - p.cell1_null_;
-  LOG_WARN("[FTS_SORT_PROF] ROWSHAPE",
-      "tid", p.tid_,
-      "row_bytes", p.row_bytes_,
-      "c0_min", (INT64_MAX == p.cell0_min_) ? -1 : p.cell0_min_,
-      "c0_avg", (c0_n > 0) ? (p.cell0_sum_ / c0_n) : 0,
-      "c0_max", p.cell0_max_, "c0_null", p.cell0_null_, "c0_x16", p.cell0_16_,
-      "c1_min", (INT64_MAX == p.cell1_min_) ? -1 : p.cell1_min_,
-      "c1_avg", (c1_n > 0) ? (p.cell1_sum_ / c1_n) : 0,
-      "c1_max", p.cell1_max_, "c1_null", p.cell1_null_, "c1_x16", p.cell1_16_);
+  ::snprintf(buf, sizeof(buf),
+      "SORT tid=%ld rows=%ld cmp=%ld add_rows=%ld add_cyc=%ld refill_rows=%ld refill_cyc=%ld "
+      "prescan_calls=%ld prescan_rows=%ld prescan_cyc=%ld prescan_refill_cyc=%ld "
+      "prescan_dump=%ld prescan_file=%ld sort_cyc=%ld proc_cyc=%ld "
+      "path=%ld enc=%ld ctype=%ld cformat=%ld chunks=%ld store_rows=%ld dumps=%ld "
+      "row_bytes=%ld c0_min=%ld c0_avg=%ld c0_max=%ld c0_null=%ld c0_x16=%ld "
+      "c1_min=%ld c1_avg=%ld c1_max=%ld c1_null=%ld c1_x16=%ld",
+      (long)p.tid_, (long)p.sort_rows_, (long)p.cmp_count_,
+      (long)p.add_rows_, (long)p.add_tsc_, (long)p.refill_rows_, (long)p.refill_tsc_,
+      (long)p.prescan_calls_, (long)p.prescan_rows_, (long)p.prescan_tsc_,
+      (long)p.prescan_refill_tsc_, (long)p.prescan_dumps_, (long)p.prescan_file_size_,
+      (long)p.sort_tsc_, (long)p.proc_tsc_, (long)p.sort_path_, (long)p.encode_sortkey_,
+      (long)p.compress_type_, (long)p.compact_format_, (long)p.sort_chunks_,
+      (long)p.store_rows_, (long)p.dump_calls_, (long)p.row_bytes_,
+      (long)((INT64_MAX == p.cell0_min_) ? -1 : p.cell0_min_),
+      (long)((c0_n > 0) ? (p.cell0_sum_ / c0_n) : 0), (long)p.cell0_max_,
+      (long)p.cell0_null_, (long)p.cell0_16_,
+      (long)((INT64_MAX == p.cell1_min_) ? -1 : p.cell1_min_),
+      (long)((c1_n > 0) ? (p.cell1_sum_ / c1_n) : 0), (long)p.cell1_max_,
+      (long)p.cell1_null_, (long)p.cell1_16_);
+  ob_fts_prof_append(buf);
 }
 
 void ob_fts_prof_print_out(ObFtsSortProfile &p)
 {
-  int ret = OB_SUCCESS;
-  UNUSED(ret);
-  LOG_WARN("[FTS_SORT_PROF] OUT",
-      "tid", p.tid_,
-      "rows", p.out_rows_, "out_cyc", p.out_tsc_, "op_cyc", p.op_tsc_,
-      "add_rows", p.add_rows_, "refill_rows", p.refill_rows_,
-      "sort_rows", p.sort_rows_, "sort_cyc", p.sort_tsc_,
-      "path", p.sort_path_, "c0_x16", p.cell0_16_, "c1_x16", p.cell1_16_);
+  char buf[512];
+  ::snprintf(buf, sizeof(buf),
+      "OUT tid=%ld rows=%ld out_cyc=%ld op_cyc=%ld add_rows=%ld refill_rows=%ld "
+      "sort_rows=%ld sort_cyc=%ld path=%ld c0_x16=%ld c1_x16=%ld",
+      (long)p.tid_, (long)p.out_rows_, (long)p.out_tsc_, (long)p.op_tsc_,
+      (long)p.add_rows_, (long)p.refill_rows_, (long)p.sort_rows_, (long)p.sort_tsc_,
+      (long)p.sort_path_, (long)p.cell0_16_, (long)p.cell1_16_);
+  ob_fts_prof_append(buf);
 }
+
 } // anonymous namespace
 
 ObSortSpec::ObSortSpec(common::ObIAllocator &alloc, const ObPhyOperatorType type)
