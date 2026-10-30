@@ -128,6 +128,7 @@ ObSortOp::ObSortOp(ObExecContext &ctx_, const ObOpSpec &spec, ObOpInput *input)
   : ObOperator(ctx_, spec, input),
   sort_impl_(op_monitor_info_),
   prefix_sort_impl_(op_monitor_info_),
+  fts_aux_sort_impl_(op_monitor_info_),
   read_func_(&ObSortOp::sort_impl_next),
   read_batch_func_(&ObSortOp::sort_impl_next_batch),
   sort_row_count_(0),
@@ -170,6 +171,7 @@ void ObSortOp::reset()
 {
   sort_impl_.reset();
   prefix_sort_impl_.reset();
+  fts_aux_sort_impl_.reset();
   read_func_ = &ObSortOp::sort_impl_next;
   read_batch_func_ = &ObSortOp::sort_impl_next_batch;
   sort_row_count_ = 0;
@@ -183,6 +185,8 @@ void ObSortOp::destroy()
   sort_impl_.~ObSortOpImpl();
   prefix_sort_impl_.unregister_profile_if_necessary();
   prefix_sort_impl_.~ObPrefixSortImpl();
+  fts_aux_sort_impl_.unregister_profile_if_necessary();
+  fts_aux_sort_impl_.~FtsAuxRadixSortImpl();
   read_func_ = nullptr;
   read_batch_func_ = nullptr;
   sort_row_count_ = 0;
@@ -196,6 +200,7 @@ int ObSortOp::inner_close()
   sort_impl_.collect_memory_dump_info(op_monitor_info_);
   sort_impl_.unregister_profile();
   prefix_sort_impl_.unregister_profile();
+  fts_aux_sort_impl_.unregister_profile();
   return OB_SUCCESS;
 }
 
@@ -302,6 +307,8 @@ int ObSortOp::process_sort()
     }
     OZ(sort_impl_.sort());
     sort_impl_.collect_memory_dump_info(op_monitor_info_);
+  } else if (read_func_ == &ObSortOp::fts_aux_sort_impl_next) {
+    OZ(process_fts_aux_sort());
   } else {
     ret = OB_ERR_UNEXPECTED;
   }
@@ -358,6 +365,8 @@ int ObSortOp::process_sort_batch()
     op_monitor_info_.otherstat_7_value_ = sort_row_count_; 
     OZ(sort_impl_.sort());
     sort_impl_.collect_memory_dump_info(op_monitor_info_);
+  } else if (read_batch_func_ == &ObSortOp::fts_aux_sort_impl_next_batch) {
+    OZ(process_fts_aux_sort_batch());
   } else {
     ret = OB_ERR_UNEXPECTED;
   }
@@ -593,6 +602,115 @@ int ObSortOp::init_sort(int64_t row_count,
   return ret;
 }
 
+// The radix route only replaces the FTS aux DDL encoded-key comparison sort, so the
+// same spec flags that gated C2's set_fts_key_sort() gate it, plus the sort shapes
+// whose row order the radix pass cannot produce (topn/ties/partition/local merge).
+// Anything decided at run time (spill, tiny batch, unencodable key, over-cap key
+// memory) is re-checked inside FtsAuxRadixSortImpl::sort(), which delegates.
+bool ObSortOp::fts_aux_sort_eligible(const int64_t topn_cnt) const
+{
+  return MY_SPEC.fts_aux_ddl_
+      && !MY_SPEC.enable_encode_sortkey_opt_
+      && 0 == MY_SPEC.prefix_pos_
+      && 0 == MY_SPEC.part_cnt_
+      && !MY_SPEC.is_fetch_with_ties_
+      && !MY_SPEC.is_local_merge_sort_
+      && !MY_SPEC.enable_pd_topn_filter()
+      && INT64_MAX == topn_cnt;
+}
+
+int ObSortOp::init_fts_aux_sort(int64_t row_count,
+                                bool is_batch,
+                                int64_t topn_cnt)
+{
+  int ret = OB_SUCCESS;
+  int64_t est_rows = MY_SPEC.rows_;
+  if (OB_FAIL(ObPxEstimateSizeUtil::get_px_size(
+      &ctx_, MY_SPEC.px_est_size_factor_, est_rows, est_rows))) {
+  }
+  OZ(fts_aux_sort_impl_.init(&MY_SPEC.sort_collations_, &MY_SPEC.sort_cmp_funs_, &eval_ctx_,
+                             &ctx_, MY_SPEC.enable_encode_sortkey_opt_,
+                             MY_SPEC.is_local_merge_sort_,
+                             false /* need_rewind */, MY_SPEC.part_cnt_, topn_cnt,
+                             MY_SPEC.is_fetch_with_ties_, ObChunkDatumStore::BLOCK_SIZE,
+                             MY_SPEC.compress_type_, &MY_SPEC.all_exprs_, est_rows,
+                             MY_SPEC.prescan_enabled_, &MY_SPEC.pd_topn_filter_info_));
+  if (is_batch) {
+    read_batch_func_ = &ObSortOp::fts_aux_sort_impl_next_batch;
+  } else {
+    read_func_ = &ObSortOp::fts_aux_sort_impl_next;
+  }
+  int aqs_head = MY_SPEC.enable_encode_sortkey_opt_ ? sizeof(oceanbase::sql::ObSortOpImpl::AQSItem) : 0;
+  fts_aux_sort_impl_.set_input_rows(row_count);
+  fts_aux_sort_impl_.set_input_width(MY_SPEC.width_ + aqs_head);
+  if (MY_SPEC.fts_aux_ddl_) {
+    fts_aux_sort_impl_.set_cache_floor(FTS_AUX_DDL_SORT_CACHE_FLOOR);
+    if (!MY_SPEC.enable_encode_sortkey_opt_) {
+      fts_aux_sort_impl_.set_fts_key_sort(true);
+    }
+  }
+  fts_aux_sort_impl_.set_operator_type(MY_SPEC.type_);
+  fts_aux_sort_impl_.set_operator_id(MY_SPEC.id_);
+  fts_aux_sort_impl_.set_io_event_observer(&io_event_observer_);
+  return ret;
+}
+
+// Same as the sort_impl_ arm of process_sort() minus the prescan refill shortcut: the
+// rows of an over-sized aux sort are dumped by the impl itself and merged by the
+// external merge sort it delegates to, so none of them are pushed into sort_impl_.
+int ObSortOp::process_fts_aux_sort()
+{
+  int ret = OB_SUCCESS;
+  while (OB_SUCC(ret)) {
+    clear_evaluated_flag();
+    if (OB_FAIL(try_check_status())) {
+    } else if (OB_FAIL(child_->get_next_row())) {
+      if (OB_ITER_END != ret) {
+        LOG_WARN("failed to get next row", K(ret));
+      }
+    } else {
+      sort_row_count_++;
+      OZ(fts_aux_sort_impl_.add_row(MY_SPEC.all_exprs_));
+      fts_aux_sort_impl_.collect_memory_dump_info(op_monitor_info_);
+    }
+  }
+  if (OB_ITER_END == ret) {
+    ret = OB_SUCCESS;
+  }
+  OZ(fts_aux_sort_impl_.sort());
+  fts_aux_sort_impl_.collect_memory_dump_info(op_monitor_info_);
+  return ret;
+}
+
+int ObSortOp::process_fts_aux_sort_batch()
+{
+  int ret = OB_SUCCESS;
+  bool need_dump = false;
+  while (OB_SUCC(ret)) {
+    clear_evaluated_flag();
+    const ObBatchRows *input_brs = NULL;
+    if (OB_FAIL(try_check_status())) {
+    } else if (OB_FAIL(child_->get_next_batch(MY_SPEC.max_batch_size_, input_brs))) {
+    } else {
+      if (input_brs->size_ > 0) {
+        sort_row_count_ += input_brs->size_
+            - input_brs->skip_->accumulate_bit_cnt(input_brs->size_);
+        OZ(fts_aux_sort_impl_.add_batch(MY_SPEC.all_exprs_, *input_brs->skip_,
+                                        input_brs->size_, need_dump));
+        fts_aux_sort_impl_.collect_memory_dump_info(op_monitor_info_);
+      }
+      if (input_brs->end_) {
+        break;
+      }
+    }
+  }
+  op_monitor_info_.otherstat_7_id_ = ObSqlMonitorStatIds::ROW_COUNT;
+  op_monitor_info_.otherstat_7_value_ = sort_row_count_;
+  OZ(fts_aux_sort_impl_.sort());
+  fts_aux_sort_impl_.collect_memory_dump_info(op_monitor_info_);
+  return ret;
+}
+
 int ObSortOp::inner_get_next_row()
 {
   int ret = OB_SUCCESS;
@@ -613,6 +731,9 @@ int ObSortOp::inner_get_next_row()
       ret = OB_ITER_END;
     } else if (MY_SPEC.prefix_pos_ > 0) {
       if (OB_FAIL(init_prefix_sort(row_count, false, topn_cnt))) {
+      }
+    } else if (fts_aux_sort_eligible(topn_cnt)) {
+      if (OB_FAIL(init_fts_aux_sort(row_count, false, topn_cnt))) {
       }
     } else {
       if (OB_FAIL(init_sort(row_count, false, topn_cnt))) {
@@ -678,6 +799,9 @@ int ObSortOp::inner_get_next_batch(const int64_t max_row_cnt)
       brs_.size_ = 0;
     } else if (MY_SPEC.prefix_pos_ > 0) {
       if (OB_FAIL(init_prefix_sort(row_count, true, topn_cnt))) {
+      }
+    } else if (fts_aux_sort_eligible(topn_cnt)) {
+      if (OB_FAIL(init_fts_aux_sort(row_count, true, topn_cnt))) {
       }
     } else {
       if (OB_FAIL(init_sort(row_count, true, topn_cnt))) {

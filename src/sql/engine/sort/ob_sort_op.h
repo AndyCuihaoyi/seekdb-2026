@@ -25,6 +25,7 @@
 #include "sql/engine/basic/chunk_store/ob_compact_store.h"
 #include "sql/engine/basic/ob_chunk_datum_store.h"
 #include "sql/engine/px/p2p_datahub/ob_pushdown_topn_filter_msg.h"
+#include "sql/engine/sort/ob_fts_aux_sort_impl.h"
 
 namespace oceanbase
 {
@@ -127,6 +128,16 @@ private:
     return sort_component_next_batch(prefix_sort_impl_, max_cnt);
   }
 
+  int fts_aux_sort_impl_next()
+  {
+    return sort_component_next(fts_aux_sort_impl_);
+  }
+
+  int fts_aux_sort_impl_next_batch(const int64_t max_cnt)
+  {
+    return sort_component_next_batch(fts_aux_sort_impl_, max_cnt);
+  }
+
   int get_int_value(const ObExpr *in_val, int64_t &out_val);
   int get_topn_count(int64_t &topn_cnt);
   int process_sort();
@@ -139,10 +150,19 @@ private:
   int init_sort(int64_t row_count,
                 bool is_batch,
                 int64_t topn_cnt = INT64_MAX);
+  // FTS aux DDL radix route: eligible is decided from the spec only, the rest of
+  // the gating (spill, tiny batch, unencodable key) happens inside the impl.
+  bool fts_aux_sort_eligible(const int64_t topn_cnt) const;
+  int init_fts_aux_sort(int64_t row_count,
+                        bool is_batch,
+                        int64_t topn_cnt = INT64_MAX);
+  int process_fts_aux_sort();
+  int process_fts_aux_sort_batch();
   void reset_pd_topn_filter_expr_ctx();
 private:
   ObSortOpImpl sort_impl_;
   ObPrefixSortImpl prefix_sort_impl_;
+  FtsAuxRadixSortImpl fts_aux_sort_impl_;
   int (ObSortOp::*read_func_)();
   int (ObSortOp::*read_batch_func_)(const int64_t max_cnt);
   int64_t sort_row_count_;
