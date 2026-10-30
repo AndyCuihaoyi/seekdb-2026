@@ -71,7 +71,8 @@ public:
     int64_t cache_size,
     const ObPhyOperatorType op_type,
     const uint64_t op_id,
-    ObSqlProfileExecInfo exec_info);
+    ObSqlProfileExecInfo exec_info,
+    const int64_t min_mem_size = 0);
 
   void destroy()
   {

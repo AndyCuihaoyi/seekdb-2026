@@ -649,7 +649,7 @@ ObSortOpImpl::ObSortOpImpl() :
   datum_store_(ObModIds::OB_SQL_SORT_ROW),
   inmem_row_size_(0), mem_check_interval_mask_(1), row_idx_(0), heap_iter_begin_(false),
   imms_heap_(NULL), ems_heap_(NULL), next_stored_row_func_(&ObSortOpImpl::array_next_stored_row),
-  input_rows_(OB_INVALID_ID), input_width_(OB_INVALID_ID),
+  input_rows_(OB_INVALID_ID), input_width_(OB_INVALID_ID), cache_floor_(0),
   profile_(ObSqlWorkAreaType::SORT_WORK_AREA), self_monitor_info_(),
   op_monitor_info_(&self_monitor_info_), sql_mem_processor_(profile_, *op_monitor_info_),
   op_type_(PHY_INVALID), op_id_(UINT64_MAX), exec_ctx_(nullptr), stored_rows_(nullptr),
@@ -669,7 +669,7 @@ ObSortOpImpl::ObSortOpImpl(ObMonitorNode &op_monitor_info)
     datum_store_(ObModIds::OB_SQL_SORT_ROW), inmem_row_size_(0), mem_check_interval_mask_(1),
     row_idx_(0), heap_iter_begin_(false), imms_heap_(NULL), ems_heap_(NULL),
     next_stored_row_func_(&ObSortOpImpl::array_next_stored_row),
-    input_rows_(OB_INVALID_ID), input_width_(OB_INVALID_ID),
+    input_rows_(OB_INVALID_ID), input_width_(OB_INVALID_ID), cache_floor_(0),
     profile_(ObSqlWorkAreaType::SORT_WORK_AREA), self_monitor_info_(),
     op_monitor_info_(&op_monitor_info), sql_mem_processor_(profile_, *op_monitor_info_),
     op_type_(PHY_INVALID), op_id_(UINT64_MAX), exec_ctx_(nullptr), stored_rows_(nullptr),
@@ -1167,9 +1167,13 @@ int ObSortOpImpl::before_add_row()
     } else {
       got_first_row_ = true;
       int64_t size = OB_INVALID_ID == input_rows_ ? 0 : input_rows_ * input_width_;
+      if (size < cache_floor_) {
+        size = cache_floor_;
+      }
       if (OB_FAIL(sql_mem_processor_.init(
                   &mem_context_->get_malloc_allocator(),
-                  size, op_monitor_info_->op_type_, op_monitor_info_->op_id_, exec_ctx_))) {
+                  size, op_monitor_info_->op_type_, op_monitor_info_->op_id_, exec_ctx_,
+                  cache_floor_))) {
       } else {
         datum_store_.set_dir_id(sql_mem_processor_.get_dir_id());
         datum_store_.set_callback(&sql_mem_processor_);

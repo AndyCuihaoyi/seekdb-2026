@@ -1460,6 +1460,9 @@ int ObStaticEngineCG::generate_spec(ObLogSort &op, ObSortSpec &spec, const bool 
         if (op.get_plan()->get_optimizer_context().is_online_ddl()) {
           spec.prescan_enabled_ = true;
         }
+        if (spec.prescan_enabled_ && opt_ctx_->is_insert_stmt_in_online_ddl()) {
+          OZ(mark_fts_aux_ddl_sort(spec));
+        }
         spec.enable_encode_sortkey_opt_ = op.enable_encode_sortkey_opt();
         spec.part_cnt_ = op.get_part_cnt();
         LOG_TRACE("trace order by", K(spec.all_exprs_.count()), K(spec.all_exprs_));
@@ -1476,6 +1479,35 @@ int ObStaticEngineCG::generate_spec(ObLogSort &op, ObSortSpec &spec, const bool 
         }
       }
     }
+  }
+  return ret;
+}
+
+int ObStaticEngineCG::mark_fts_aux_ddl_sort(ObSortSpec &spec)
+{
+  int ret = OB_SUCCESS;
+  // The DDL plan estimates this aux sort at zero rows and zero width, so its
+  // work area never registers and the runtime falls back to the 2MB bound.
+  // Mark the sort; the executor then seeds a real initial cache size. Only FTS
+  // aux index builds reach here: the caller already requires an insert stmt in
+  // online DDL and we additionally match the ddl target table type.
+  const TableItem *insert_table_item = nullptr;
+  const share::schema::ObTableSchema *ddl_table_schema = nullptr;
+  ObSqlSchemaGuard *schema_guard = opt_ctx_->get_sql_schema_guard();
+  if (OB_ISNULL(schema_guard)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null schema guard", K(ret));
+  } else if (OB_ISNULL(insert_table_item = opt_ctx_->get_root_stmt()->get_table_item(0))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null insert table item", K(ret));
+  } else if (OB_FAIL(schema_guard->get_table_schema(insert_table_item->ddl_table_id_,
+                                                    ddl_table_schema))) {
+    LOG_WARN("failed to get ddl table schema", K(ret), K(insert_table_item->ddl_table_id_));
+  } else if (OB_ISNULL(ddl_table_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null ddl table schema", K(ret));
+  } else if (ddl_table_schema->is_fts_index_aux() || ddl_table_schema->is_fts_doc_word_aux()) {
+    spec.fts_aux_ddl_ = true;
   }
   return ret;
 }

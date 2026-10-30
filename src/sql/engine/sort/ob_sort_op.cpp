@@ -73,6 +73,13 @@ void ob_fts_prof_print_out(ObFtsSortProfile &p)
   ob_fts_prof_append(buf);
 }
 
+// The FTS aux build sort gets a zero row/width estimate from the DDL plan, so it
+// would fall back to the 2MB bound and prescan-dump almost every row. This is
+// applied as a manual-style per-op bound (the AUTO global cap here is ~50MB);
+// probes showed 256MB still prescans the largest aux sort, 512MB covers all.
+// Dump stays enabled, so oversized inputs still spill instead of failing.
+const int64_t FTS_AUX_DDL_SORT_CACHE_FLOOR = 512LL << 20;
+
 } // anonymous namespace
 
 ObSortSpec::ObSortSpec(common::ObIAllocator &alloc, const ObPhyOperatorType type)
@@ -90,6 +97,7 @@ ObSortSpec::ObSortSpec(common::ObIAllocator &alloc, const ObPhyOperatorType type
   is_fetch_with_ties_(false),
   prescan_enabled_(false),
   enable_encode_sortkey_opt_(false),
+  fts_aux_ddl_(false),
   part_cnt_(0),
   pd_topn_filter_info_(alloc)
 {}
@@ -107,6 +115,7 @@ OB_SERIALIZE_MEMBER((ObSortSpec, ObOpSpec),
                     is_local_merge_sort_,
                     is_fetch_with_ties_,
                     prescan_enabled_,
+                    fts_aux_ddl_,
                     enable_encode_sortkey_opt_,
                     part_cnt_,
                     compress_type_,
@@ -569,6 +578,9 @@ int ObSortOp::init_sort(int64_t row_count,
   int aqs_head = MY_SPEC.enable_encode_sortkey_opt_ ? sizeof(oceanbase::sql::ObSortOpImpl::AQSItem) : 0;
   sort_impl_.set_input_rows(row_count);
   sort_impl_.set_input_width(MY_SPEC.width_ + aqs_head);
+  if (MY_SPEC.fts_aux_ddl_) {
+    sort_impl_.set_cache_floor(FTS_AUX_DDL_SORT_CACHE_FLOOR);
+  }
   sort_impl_.set_operator_type(MY_SPEC.type_);
   sort_impl_.set_operator_id(MY_SPEC.id_);
   sort_impl_.set_io_event_observer(&io_event_observer_);

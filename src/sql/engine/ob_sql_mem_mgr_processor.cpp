@@ -30,13 +30,18 @@ int ObSqlMemMgrProcessor::init(
   int64_t cache_size,
   const ObPhyOperatorType op_type,
   const uint64_t op_id,
-  ObSqlProfileExecInfo exec_info)
+  ObSqlProfileExecInfo exec_info,
+  const int64_t min_mem_size)
 {
   int ret = OB_SUCCESS;
   bool tmp_enable_auto_mem_mgr = false;
   ObSqlMemoryManager *sql_mem_mgr = get_sql_mem_mgr();
   is_auto_mgr_ = false;
   reset();
+  // A positive floor means the caller knows better than the auto manager
+  // (e.g. a zero-estimate DDL sort): use a manual-style bound of at least
+  // min_mem_size for this operator only, leaving the global policy untouched.
+  const bool force_bound = min_mem_size > 0;
   profile_.set_operator_type(op_type);
   profile_.set_operator_id(op_id);
   profile_.set_exec_info(exec_info);
@@ -50,7 +55,7 @@ int ObSqlMemMgrProcessor::init(
   } else if (OB_FAIL(alloc_dir_id(dir_id_))) {
   } else if (OB_NOT_NULL(sql_mem_mgr)) {
     profile_.disable_auto_mem_mgr_ = exec_info.get_disable_auto_mem_mgr();
-    if (sql_mem_mgr->enable_auto_memory_mgr()) {
+    if (sql_mem_mgr->enable_auto_memory_mgr() && !force_bound) {
       tmp_enable_auto_mem_mgr = true;
       if (profile_.get_auto_policy()) {
         // update
@@ -95,6 +100,9 @@ int ObSqlMemMgrProcessor::init(
   } else if (OB_FAIL(ObSqlWorkareaUtil::get_workarea_size(
       profile_.get_work_area_type(), exec_info, max_mem_size))) {
   }
+  if (max_mem_size < min_mem_size) {
+    max_mem_size = min_mem_size;
+  }
   if (!profile_.get_auto_policy()) {
     profile_.set_max_bound(max_mem_size);
   }
@@ -107,6 +115,9 @@ int ObSqlMemMgrProcessor::init(
   // If sql memory manager is enabled, but the estimated data volume is relatively small, there is no need to register it with the manager, here it is limited to MAX_SQL_MEM_SIZE
   origin_max_mem_size_ = max_mem_size;
   default_available_mem_size_ = tmp_enable_auto_mem_mgr ? MAX_SQL_MEM_SIZE : max_mem_size;
+  if (default_available_mem_size_ < min_mem_size) {
+    default_available_mem_size_ = min_mem_size;
+  }
   return ret;
 }
 

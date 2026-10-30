@@ -411,6 +411,7 @@ private:
     const ObIArray<ObExpr*> &sort_exprs);
 
   int fill_compress_type(ObLogSort &op, ObCompressorType &compr_type);
+  int mark_fts_aux_ddl_sort(ObSortSpec &spec);
   int get_query_compress_type(const ObLogPlan &log_plan, ObCompressorType &compress_type);
   int check_not_support_cmp_type(const ObExpr *expr);
   int check_not_support_cmp_type(

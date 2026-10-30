@@ -402,6 +402,7 @@ public:
 
   void set_input_rows(int64_t input_rows) { input_rows_ = input_rows; }
   void set_input_width(int64_t input_width) { input_width_ = input_width; }
+  void set_cache_floor(int64_t cache_floor) { cache_floor_ = cache_floor; }
   void set_operator_type(ObPhyOperatorType op_type) { op_type_ = op_type; }
   void set_operator_id(uint64_t op_id) { op_id_ = op_id; }
   void collect_memory_dump_info(ObMonitorNode &info)
@@ -862,6 +863,7 @@ protected:
   NextStoredRowFunc next_stored_row_func_;
   int64_t input_rows_;
   int64_t input_width_;
+  int64_t cache_floor_;
   ObSqlWorkAreaProfile profile_;
   ObMonitorNode self_monitor_info_;
   ObMonitorNode *op_monitor_info_;
