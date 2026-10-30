@@ -37,7 +37,8 @@ void ob_fts_prof_print_sort(ObFtsSortProfile &p)
   ::snprintf(buf, sizeof(buf),
       "SORT tid=%ld rows=%ld cmp=%ld add_rows=%ld add_cyc=%ld refill_rows=%ld refill_cyc=%ld "
       "prescan_calls=%ld prescan_rows=%ld prescan_cyc=%ld prescan_refill_cyc=%ld "
-      "prescan_dump=%ld prescan_file=%ld sort_cyc=%ld proc_cyc=%ld "
+      "prescan_dump=%ld prescan_file=%ld sort_cyc=%ld proc_cyc=%ld child_cyc=%ld "
+      "prescan_child_cyc=%ld prescan_add_cyc=%ld prescan_finish_cyc=%ld prescan_read_cyc=%ld "
       "path=%ld enc=%ld ctype=%ld cformat=%ld chunks=%ld store_rows=%ld dumps=%ld "
       "row_bytes=%ld c0_min=%ld c0_avg=%ld c0_max=%ld c0_null=%ld c0_x16=%ld "
       "c1_min=%ld c1_avg=%ld c1_max=%ld c1_null=%ld c1_x16=%ld",
