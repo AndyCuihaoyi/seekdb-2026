@@ -45,7 +45,10 @@ void ob_fts_prof_print_sort(ObFtsSortProfile &p)
       (long)p.add_rows_, (long)p.add_tsc_, (long)p.refill_rows_, (long)p.refill_tsc_,
       (long)p.prescan_calls_, (long)p.prescan_rows_, (long)p.prescan_tsc_,
       (long)p.prescan_refill_tsc_, (long)p.prescan_dumps_, (long)p.prescan_file_size_,
-      (long)p.sort_tsc_, (long)p.proc_tsc_, (long)p.sort_path_, (long)p.encode_sortkey_,
+      (long)p.sort_tsc_, (long)p.proc_tsc_, (long)p.child_tsc_,
+      (long)p.prescan_child_tsc_, (long)p.prescan_add_tsc_,
+      (long)p.prescan_finish_tsc_, (long)p.prescan_read_tsc_,
+      (long)p.sort_path_, (long)p.encode_sortkey_,
       (long)p.compress_type_, (long)p.compact_format_, (long)p.sort_chunks_,
       (long)p.store_rows_, (long)p.dump_calls_, (long)p.row_bytes_,
       (long)((INT64_MAX == p.cell0_min_) ? -1 : p.cell0_min_),
@@ -259,11 +262,15 @@ int ObSortOp::process_sort()
     bool need_dump = false;
     while (OB_SUCC(ret)) {
       clear_evaluated_flag();
+      const uint64_t fts_c0 = fts_prof ? ob_fts_sort_tsc() : 0;
       if (OB_FAIL(try_check_status())) {
       } else if (OB_FAIL(child_->get_next_row())) {
         if (OB_ITER_END != ret) {
         }
       } else {
+        if (fts_prof) {
+          ob_fts_sort_prof().child_tsc_ += static_cast<int64_t>(ob_fts_sort_tsc() - fts_c0);
+        }
         sort_row_count_++;
         OZ(sort_impl_.add_row(MY_SPEC.all_exprs_, need_dump));
         sort_impl_.collect_memory_dump_info(op_monitor_info_);
@@ -309,11 +316,15 @@ int ObSortOp::process_sort_batch()
     bool need_dump = false;
     while (OB_SUCC(ret)) {
       clear_evaluated_flag();
+      const uint64_t fts_c0 = fts_prof ? ob_fts_sort_tsc() : 0;
       const ObBatchRows *input_brs = NULL;
       if (OB_FAIL(try_check_status())) {
       } else if (OB_FAIL(child_->get_next_batch(MY_SPEC.max_batch_size_, input_brs))) {
       } else {
         if (input_brs->size_ > 0) {
+          if (fts_prof) {
+            ob_fts_sort_prof().child_tsc_ += static_cast<int64_t>(ob_fts_sort_tsc() - fts_c0);
+          }
           sort_row_count_ += input_brs->size_
               - input_brs->skip_->accumulate_bit_cnt(input_brs->size_);
           OZ(sort_impl_.add_batch(MY_SPEC.all_exprs_, *input_brs->skip_,
@@ -363,13 +374,21 @@ int ObSortOp::scan_all_then_sort()
     }
     while (OB_SUCC(ret)) {
       clear_evaluated_flag();
+      const uint64_t fts_c0 = fts_prof ? ob_fts_sort_tsc() : 0;
       if (OB_FAIL(try_check_status())) {
       } else if (OB_FAIL(child_->get_next_row())) {
         if (OB_ITER_END != ret) {
         }
       } else {
+        if (fts_prof) {
+          ObFtsSortProfile &p = ob_fts_sort_prof();
+          p.prescan_child_tsc_ += static_cast<int64_t>(ob_fts_sort_tsc() - fts_c0);
+        }
         sort_row_count_++;
+        const uint64_t fts_s0 = fts_prof ? ob_fts_sort_tsc() : 0;
         if (OB_FAIL(cache_store.add_row(MY_SPEC.all_exprs_, eval_ctx_))) {
+        } else if (fts_prof) {
+          ob_fts_sort_prof().prescan_add_tsc_ += static_cast<int64_t>(ob_fts_sort_tsc() - fts_s0);
         }
       }
     }
@@ -379,8 +398,10 @@ int ObSortOp::scan_all_then_sort()
     }
 
     if (OB_SUCC(ret)) {
+      const uint64_t fts_f0 = fts_prof ? ob_fts_sort_tsc() : 0;
       if (OB_FAIL(cache_store.finish_add_row(false))) {
       } else if (fts_prof) {
+        ob_fts_sort_prof().prescan_finish_tsc_ += static_cast<int64_t>(ob_fts_sort_tsc() - fts_f0);
         ObFtsSortProfile &p = ob_fts_sort_prof();
         ++p.prescan_calls_;
         p.prescan_rows_ += cache_store.get_row_cnt();
@@ -393,12 +414,16 @@ int ObSortOp::scan_all_then_sort()
         const ObChunkDatumStore::StoredRow *store_row = NULL;
         bool has_next = false;
         while (OB_SUCC(ret) && OB_SUCC(cache_store.has_next(has_next)) && has_next) {
+          const uint64_t fts_r0 = fts_prof ? ob_fts_sort_tsc() : 0;
           if (OB_FAIL(cache_store.get_next_row(store_row))) {
             if (OB_ITER_END != ret) {
             }
           } else if (OB_ISNULL(store_row)) {
             ret = OB_ERR_UNEXPECTED;
           } else {
+            if (fts_prof) {
+              ob_fts_sort_prof().prescan_read_tsc_ += static_cast<int64_t>(ob_fts_sort_tsc() - fts_r0);
+            }
             OZ(sort_impl_.add_stored_row(*store_row));
           }
         }
@@ -425,16 +450,23 @@ int ObSortOp::scan_all_then_sort_batch()
     }
     while (OB_SUCC(ret)) {
       clear_evaluated_flag();
+      const uint64_t fts_c0 = fts_prof ? ob_fts_sort_tsc() : 0;
       const ObBatchRows *input_brs = NULL;
       if (OB_FAIL(try_check_status())) {
       } else if (OB_FAIL(child_->get_next_batch(MY_SPEC.max_batch_size_, input_brs))) {
       } else {
         if (input_brs->size_ > 0) {
+          if (fts_prof) {
+            ob_fts_sort_prof().prescan_child_tsc_ += static_cast<int64_t>(ob_fts_sort_tsc() - fts_c0);
+          }
           sort_row_count_ += input_brs->size_
               - input_brs->skip_->accumulate_bit_cnt(input_brs->size_);
           int64_t stored_row_count = -1;
+          const uint64_t fts_s0 = fts_prof ? ob_fts_sort_tsc() : 0;
           if (OB_FAIL(cache_store.add_batch(MY_SPEC.all_exprs_, eval_ctx_,
               *input_brs->skip_, input_brs->size_, stored_row_count))) {
+          } else if (fts_prof) {
+            ob_fts_sort_prof().prescan_add_tsc_ += static_cast<int64_t>(ob_fts_sort_tsc() - fts_s0);
           }
         }
         if (input_brs->end_) {
@@ -449,12 +481,14 @@ int ObSortOp::scan_all_then_sort_batch()
     op_monitor_info_.otherstat_7_id_ = ObSqlMonitorStatIds::ROW_COUNT;
     op_monitor_info_.otherstat_7_value_ = sort_row_count_; 
     if (OB_SUCC(ret)) {
+      const uint64_t fts_f0 = fts_prof ? ob_fts_sort_tsc() : 0;
       if (OB_FAIL(cache_store.finish_add_row(false))) {
       } else if (fts_prof) {
         ObFtsSortProfile &p = ob_fts_sort_prof();
         ++p.prescan_calls_;
         p.prescan_rows_ += cache_store.get_row_cnt();
         p.prescan_tsc_ += static_cast<int64_t>(ob_fts_sort_tsc() - fts_fill_t0);
+        p.prescan_finish_tsc_ += static_cast<int64_t>(ob_fts_sort_tsc() - fts_f0);
         p.prescan_dumps_ += cache_store.has_dumped() ? 1 : 0;
         p.prescan_file_size_ += cache_store.get_file_size();
       }
@@ -463,6 +497,7 @@ int ObSortOp::scan_all_then_sort_batch()
         const ObChunkDatumStore::StoredRow *store_row = NULL;
         bool has_next = false;
         while (OB_SUCC(ret) && OB_SUCC(cache_store.has_next(has_next)) && has_next) {
+          const uint64_t fts_r0 = fts_prof ? ob_fts_sort_tsc() : 0;
           if (OB_FAIL(cache_store.get_next_row(store_row))) {
             if (OB_ITER_END != ret) {
               LOG_WARN("failed to get next row");
@@ -471,6 +506,9 @@ int ObSortOp::scan_all_then_sort_batch()
             ret = OB_ERR_UNEXPECTED;
             LOG_WARN("failed to get next row");
           } else {
+            if (fts_prof) {
+              ob_fts_sort_prof().prescan_read_tsc_ += static_cast<int64_t>(ob_fts_sort_tsc() - fts_r0);
+            }
             OZ(sort_impl_.add_stored_row(*store_row));
           }
         }

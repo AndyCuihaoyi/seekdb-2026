@@ -25,11 +25,16 @@ struct ObFtsSortProfile
   int64_t proc_tsc_;
   int64_t add_rows_;
   int64_t add_tsc_;
+  int64_t child_tsc_;
   int64_t refill_rows_;
   int64_t refill_tsc_;
   int64_t prescan_calls_;
   int64_t prescan_rows_;
   int64_t prescan_tsc_;
+  int64_t prescan_child_tsc_;
+  int64_t prescan_add_tsc_;
+  int64_t prescan_finish_tsc_;
+  int64_t prescan_read_tsc_;
   int64_t prescan_refill_tsc_;
   int64_t prescan_dumps_;
   int64_t prescan_file_size_;
