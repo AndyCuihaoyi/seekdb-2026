@@ -167,6 +167,7 @@ SQL_UNITY_GROUPS = [
             "src/sql/engine/sort/ob_sort_basic_info.cpp",
             "src/sql/engine/sort/ob_sort_op.cpp",
             "src/sql/engine/sort/ob_sort_op_impl.cpp",
+            "src/sql/engine/sort/ob_fts_aux_sort_impl.cpp",
             "src/sql/engine/subquery/ob_subplan_filter_op.cpp",
             "src/sql/engine/subquery/ob_subplan_scan_op.cpp",
             "src/sql/engine/user_defined_function/ob_pl_user_defined_agg_function.cpp",
