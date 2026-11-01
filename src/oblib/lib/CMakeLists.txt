@@ -90,7 +90,24 @@ else()
       libfmt.a)
     # [hipVS/cuVS] optional GPU vector-index backend bridge
     # enable: -DOB_BUILD_CUVS=ON -DCUVS_BRIDGE_LIB=/path/to/libseekdb_cuvs_bridge.so
-    if (OB_BUILD_CUVS AND EXISTS "${CUVS_BRIDGE_LIB}")
+    # If no prebuilt bridge is supplied we build it from tools/hipvs_bridge so the
+    # tree still links on its own; when CUVS_BRIDGE_LIB is given (the documented
+    # pipeline) that artifact is used unchanged.
+    if (OB_BUILD_CUVS)
+      if (NOT EXISTS "${CUVS_BRIDGE_LIB}")
+        set(_seekdb_cuvs_bridge "${CMAKE_BINARY_DIR}/hipvs_bridge/libseekdb_cuvs_bridge.so")
+        add_custom_command(
+          OUTPUT ${_seekdb_cuvs_bridge}
+          COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/hipvs_bridge"
+          COMMAND ${CMAKE_SOURCE_DIR}/tools/hipvs_bridge/build.sh ${_seekdb_cuvs_bridge}
+          DEPENDS ${CMAKE_SOURCE_DIR}/tools/hipvs_bridge/seekdb_cuvs_bridge.c
+                  ${CMAKE_SOURCE_DIR}/tools/hipvs_bridge/seekdb_cuvs_bridge.h
+          COMMENT "Building hipVS bridge (CUVS_BRIDGE_LIB not supplied)"
+          VERBATIM)
+        add_custom_target(seekdb_cuvs_bridge ALL DEPENDS ${_seekdb_cuvs_bridge})
+        add_dependencies(oblib_lib seekdb_cuvs_bridge)
+        set(CUVS_BRIDGE_LIB ${_seekdb_cuvs_bridge})
+      endif()
       target_link_libraries(oblib_lib PUBLIC ${CUVS_BRIDGE_LIB})
     endif()
   elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
