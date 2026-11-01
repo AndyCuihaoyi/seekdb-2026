@@ -25,6 +25,8 @@ typedef struct {
   float*    d_dev;
   long      cap_nq;
   long      cap_topk;
+  long      itopk_fixed;  /* <0: derive from k per call */
+  long      width_fixed;  /* <0: default 4 */
 } sk_cuvs_index;
 
 static long env_long(const char* name, long dflt)
@@ -84,15 +86,27 @@ int seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
 
   if (h->sp == 0) {
     if (cuvsCagraSearchParamsCreate(&h->sp) != CUVS_SUCCESS) { return 14; }
-    /* Query-side knobs: the CAGRA search implementation itself is fixed by the
-     * contest, but its supported parameters may be tuned. Defaults reproduce the
-     * V5 baseline (itopk = max(4*topk, 512), width 4) so behaviour only changes
-     * when a value is set explicitly. */
-    long itopk_env = env_long("SEEKDB_CUVS_ITOPK", 0);
-    size_t itopk = itopk_env > 0 ? (size_t)itopk_env : (size_t)topk * 4;
-    if (itopk_env <= 0 && itopk < 512) { itopk = 512; }
+    h->itopk_fixed = env_long("SEEKDB_CUVS_ITOPK", -1);
+    h->width_fixed = env_long("SEEKDB_CUVS_SEARCH_WIDTH", -1);
+  }
+  {
+    /* The CAGRA search implementation itself is fixed by the contest, but the
+     * parameters it supports may be tuned. The candidate list is sized per call
+     * from k: the V5 baseline always asked for max(4k, 512), which over-searches
+     * small k by a wide margin. Bounding it to [64, 128] keeps Recall at the
+     * measured level while cutting per-query work.
+     * These must be set on every call, not once per handle: the evaluator runs
+     * Top-10 and Top-100 against the same index in one session. */
+    size_t itopk;
+    if (h->itopk_fixed > 0) {
+      itopk = (size_t)h->itopk_fixed;
+    } else {
+      itopk = (size_t)topk * 4;
+      if (itopk < 64) { itopk = 64; }
+      if (itopk > 128) { itopk = 128; }
+    }
     h->sp->itopk_size = itopk;
-    h->sp->search_width = (size_t)env_long("SEEKDB_CUVS_SEARCH_WIDTH", 4);
+    h->sp->search_width = (h->width_fixed > 0) ? (size_t)h->width_fixed : 4;
   }
 
   if (nq > h->cap_nq || topk > h->cap_topk) {
