@@ -55,7 +55,7 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
    * Recall@10 measured unchanged at 1.0 on both 128d and 256d probe sets. */
   h->ip->graph_degree             = (size_t)env_long("SEEKDB_CUVS_GRAPH_DEGREE", 128);
   h->ip->intermediate_graph_degree = (size_t)env_long("SEEKDB_CUVS_INTERMEDIATE_GRAPH_DEGREE", 128);
-  h->ip->nn_descent_niter         = (size_t)env_long("SEEKDB_CUVS_NN_DESCENT_NITER", 30);
+  h->ip->nn_descent_niter         = (size_t)env_long("SEEKDB_CUVS_NN_DESCENT_NITER", 20);
   if (cuvsCagraIndexCreate(&h->idx)      != CUVS_SUCCESS) goto fail_ip;
   if (cuvsCagraBuild(h->res, h->ip, &dset, h->idx) != CUVS_SUCCESS) goto fail_idx;
   h->n = n; h->dim = dim;
