@@ -84,10 +84,15 @@ int seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
 
   if (h->sp == 0) {
     if (cuvsCagraSearchParamsCreate(&h->sp) != CUVS_SUCCESS) { return 14; }
-    size_t itopk = (size_t)topk * 4;
-    if (itopk < 512) { itopk = 512; }
-    if (h->sp->itopk_size < itopk) { h->sp->itopk_size = itopk; }
-    h->sp->search_width = 4;
+    /* Query-side knobs: the CAGRA search implementation itself is fixed by the
+     * contest, but its supported parameters may be tuned. Defaults reproduce the
+     * V5 baseline (itopk = max(4*topk, 512), width 4) so behaviour only changes
+     * when a value is set explicitly. */
+    long itopk_env = env_long("SEEKDB_CUVS_ITOPK", 0);
+    size_t itopk = itopk_env > 0 ? (size_t)itopk_env : (size_t)topk * 4;
+    if (itopk_env <= 0 && itopk < 512) { itopk = 512; }
+    h->sp->itopk_size = itopk;
+    h->sp->search_width = (size_t)env_long("SEEKDB_CUVS_SEARCH_WIDTH", 4);
   }
 
   if (nq > h->cap_nq || topk > h->cap_topk) {
