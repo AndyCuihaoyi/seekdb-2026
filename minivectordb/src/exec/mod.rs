@@ -48,6 +48,9 @@ impl Engine {
             .log_ddl(table_id, def.name.as_bytes(), &schema)
             .map_err(|e| SqlError::internal(format!("wal write failed: {e}")))?;
         self.install_table(table_id, def.name.clone(), def)?;
+        // The catalog is written after the log record, so that a crash in
+        // between leaves the table known through the log.
+        self.write_catalog()?;
         Ok(QueryResult::ok())
     }
 
@@ -69,6 +72,36 @@ impl Engine {
                 "the index column must be the table's vector column",
             ));
         }
+        let dim = state.def.vector_dim().unwrap_or(0);
+        let pk_index = state.def.pk_index;
+        let table_id = state.id;
+        let nlist = self.config.ann_nlist;
+
+        // Build the index over the rows that are currently visible.
+        let index = {
+            let state = self
+                .tables
+                .get_mut(&key)
+                .ok_or_else(|| SqlError::no_such_table(&ci.table))?;
+            crate::vector::index::build_index(
+                dim,
+                nlist,
+                &mut state.store,
+                pk_index,
+                vec_idx,
+            )?
+        };
+
+        // Record the existence of the index so that it is rebuilt after a
+        // restart. The index itself is not persisted: the statement allows
+        // it to be rebuilt from the persisted records.
+        let dir = self.table_dir(&ci.table);
+        crate::vector::index::write_marker(&dir)?;
+
+        if let Some(state) = self.tables.get_mut(&key) {
+            state.index = Some(index);
+        }
+        let _ = table_id;
         Ok(QueryResult::ok())
     }
 

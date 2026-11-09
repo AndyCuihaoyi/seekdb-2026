@@ -140,6 +140,11 @@ pub struct TableState {
     pub store: TableStore,
     /// Stable identifier of the table, used in the write-ahead log.
     pub id: u32,
+    /// The vector index of the table, when one has been created.
+    ///
+    /// The index is not persisted; it is rebuilt from the table data at
+    /// startup, which happens before the server reports readiness.
+    pub index: Option<crate::vector::ann::IvfIndex>,
 }
 
 impl Engine {
@@ -166,12 +171,21 @@ impl Engine {
             next_table_id: 1,
             pk_index: HashMap::new(),
         };
+        // The tables are restored from the catalog file first, so that the
+        // replay of the log finds them: the log may have been folded into
+        // the data files by an earlier recovery, in which case it describes
+        // the rows but not the tables.
+        engine.restore_catalog()?;
         engine.recover()?;
+        // Rebuild the vector indexes before the server is ready: the
+        // statement requires that the database does not report readiness
+        // while an index is still being rebuilt.
+        engine.rebuild_vector_indexes()?;
         Ok(engine)
     }
 
     /// Directory of one table.
-    fn table_dir(&self, name: &str) -> PathBuf {
+    pub(crate) fn table_dir(&self, name: &str) -> PathBuf {
         self.config.data_dir.join(name.to_ascii_lowercase())
     }
 
@@ -473,11 +487,13 @@ impl Engine {
         let slot = (row_id % state.store.block_rows as u64) as u32;
         let image = encode_row(&cols);
         let col_offset = state.store.append_columns(&image)?;
-        if let Some(v) = vec {
+        if let Some(v) = vec.as_ref() {
             state.store.write_vector(block, slot, v.as_slice())?;
         }
         state.store.append_row(pk, col_offset, image.len() as u32, block, slot)?;
         self.pk_index.entry(table_id).or_default().insert(pk, row_id);
+        // Keep the vector index in sync with the committed data.
+        self.index_insert(table_id, row_id, pk, vec.as_ref().map(|v| v.as_slice()));
         Ok(row_id)
     }
 
@@ -497,7 +513,7 @@ impl Engine {
         let slot = (row_id % state.store.block_rows as u64) as u32;
         let image = encode_row(&cols);
         let col_offset = state.store.append_columns(&image)?;
-        if let Some(v) = vec {
+        if let Some(v) = vec.as_ref() {
             state.store.write_vector(block, slot, v.as_slice())?;
         }
         let version = state
@@ -519,6 +535,10 @@ impl Engine {
             },
         )?;
         self.pk_index.entry(table_id).or_default().insert(pk, row_id);
+        // The vector of the row may have changed, so the index entry is
+        // replaced rather than updated in place.
+        self.index_remove(table_id, row_id);
+        self.index_insert(table_id, row_id, pk, vec.as_ref().map(|v| v.as_slice()));
         Ok(())
     }
 
@@ -530,6 +550,86 @@ impl Engine {
             meta.alive = 0;
             state.store.write_meta(row_id, &meta)?;
             self.pk_index.entry(table_id).or_default().remove(&meta.pk);
+        }
+        // A deleted row must not be visible through the index.
+        self.index_remove(table_id, row_id);
+        Ok(())
+    }
+
+    // ------------------------------------------------------------ index upkeep
+
+    /// Add a row to the vector index of a table, if the table has one.
+    fn index_insert(&mut self, table_id: u32, row_id: u64, pk: i64, vec: Option<&[f32]>) {
+        let vec = match vec {
+            Some(v) => v,
+            None => return,
+        };
+        if let Some(state) = self.tables.values_mut().find(|t| t.id == table_id) {
+            if let Some(index) = state.index.as_mut() {
+                index.insert(row_id, pk, vec);
+            }
+        }
+    }
+
+    /// Remove a row from the vector index of a table, if it is present.
+    fn index_remove(&mut self, table_id: u32, row_id: u64) {
+        if let Some(state) = self.tables.values_mut().find(|t| t.id == table_id) {
+            if let Some(index) = state.index.as_mut() {
+                index.remove(row_id);
+            }
+        }
+    }
+
+    /// Rebuild the vector index of every table that is marked as indexed.
+    ///
+    /// This runs during startup, before the server reports readiness, as the
+    /// statement requires: the database must not be ready while an index is
+    /// still being rebuilt.
+    pub(crate) fn rebuild_vector_indexes(&mut self) -> SqlResult<()> {
+        let table_ids: Vec<u32> = self.tables.values().map(|t| t.id).collect();
+        for table_id in table_ids {
+            let dir = {
+                let state = match self.tables.values().find(|t| t.id == table_id) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                state.store.dir.clone()
+            };
+            if !crate::vector::index::has_marker(&dir) {
+                continue;
+            }
+            let (dim, pk_index, vector_index) = {
+                let state = match self.tables.values().find(|t| t.id == table_id) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let dim = match state.def.vector_dim() {
+                    Some(d) => d,
+                    None => continue,
+                };
+                (dim, state.def.pk_index, state.def.vector_column)
+            };
+            let vector_index = match vector_index {
+                Some(i) => i,
+                None => continue,
+            };
+            let nlist = self.config.ann_nlist;
+            let index = {
+                let state = match self.tables.values_mut().find(|t| t.id == table_id) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                crate::vector::index::build_index(
+                    dim,
+                    nlist,
+                    &mut state.store,
+                    pk_index,
+                    vector_index,
+                )?
+            };
+            if let Some(state) = self.tables.values_mut().find(|t| t.id == table_id) {
+                state.index = Some(index);
+            }
         }
         Ok(())
     }
@@ -578,8 +678,47 @@ impl Engine {
         self.catalog.insert(def.clone());
         self.tables.insert(
             name.to_ascii_lowercase(),
-            TableState { def, store, id: table_id },
+            TableState { def, store, id: table_id, index: None },
         );
+        Ok(())
+    }
+
+    /// Path of the catalog file.
+    fn catalog_path(&self) -> PathBuf {
+        self.config.data_dir.join(crate::storage::schema::CATALOG_FILE)
+    }
+
+    /// Write the catalog file.
+    ///
+    /// The catalog is written after every schema change, so that the tables
+    /// are known again after a restart even when the log has been folded
+    /// into the data files.
+    pub(crate) fn write_catalog(&mut self) -> SqlResult<()> {
+        let mut tables: Vec<(u32, TableDef)> =
+            self.tables.values().map(|t| (t.id, t.def.clone())).collect();
+        tables.sort_by_key(|(id, _)| *id);
+        crate::storage::schema::write(&self.catalog_path(), &tables)
+    }
+
+    /// Restore the tables of the data directory from the catalog file.
+    ///
+    /// A table that the log already restored keeps the identifier it had, so
+    /// that the identifiers the log records refer to stay correct.
+    fn restore_catalog(&mut self) -> SqlResult<()> {
+        let path = self.catalog_path();
+        let entries = crate::storage::schema::read(&path)?;
+        for (table_id, def) in entries {
+            let key = def.name.to_ascii_lowercase();
+            if self.tables.contains_key(&key) {
+                // The log described this table already. The identifier of
+                // the log wins, because the log records refer to it.
+                continue;
+            }
+            self.install_table(table_id, def.name.clone(), def)?;
+            if table_id >= self.next_table_id {
+                self.next_table_id = table_id + 1;
+            }
+        }
         Ok(())
     }
 }

@@ -103,6 +103,18 @@ fn main() {
                     cfg.vector_block_rows = n;
                 }
             }
+        } else if a.starts_with("--ann-nlist") {
+            if let Some(v) = take_value(&mut i) {
+                if let Ok(n) = v.parse::<usize>() {
+                    cfg.ann_nlist = n.max(1);
+                }
+            }
+        } else if a.starts_with("--ann-nprobe") {
+            if let Some(v) = take_value(&mut i) {
+                if let Ok(n) = v.parse::<usize>() {
+                    cfg.ann_nprobe = Some(n.max(1));
+                }
+            }
         }
         i += 1;
     }

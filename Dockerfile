@@ -22,11 +22,11 @@ RUN cargo build --release --offline --locked 2>/dev/null \
 # ---- runtime stage -----------------------------------------------------------
 FROM ubuntu:24.04
 
-# `ca-certificates` is not required by the server itself but keeps the image
-# usable for diagnostics. The server opens no network port.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+# No package installation on purpose: the server is a statically-linkable
+# Rust binary that only needs glibc and libgcc, both present in this base
+# image. Keeping the runtime stage free of `apt-get` means the build needs
+# no network access at all, which keeps it reproducible on an isolated
+# builder and avoids depending on an apt mirror being reachable.
 
 COPY --from=builder /build/target/release/minivectordb /usr/local/bin/minivectordb
 

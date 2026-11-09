@@ -4,11 +4,13 @@
 #![allow(dead_code)]
 
 use crate::catalog::TableDef;
+use crate::config::SearchMode;
 use crate::engine::{Engine, LiveRow, QueryResult};
 use crate::error::{SqlError, SqlResult};
 use crate::sql::ast::*;
 use crate::storage::table::ColValue;
 use crate::value::vector::Vector;
+use std::collections::HashSet;
 
 /// How one output column is produced.
 enum Projection {
@@ -16,6 +18,21 @@ enum Projection {
     Column(usize),
     /// An evaluated expression.
     Expr(Expr),
+}
+
+/// A vector TopK request extracted from a SELECT statement.
+///
+/// The statement is recognised when it orders by a single ascending distance
+/// expression and limits the result. That is the shape of every vector search
+/// the evaluation performs, and it is the shape that the approximate index can
+/// answer without materialising the whole table.
+struct DistanceTopK {
+    /// Index of the vector column in the table.
+    vector_index: usize,
+    /// The query vector.
+    query: Vector,
+    /// Number of rows wanted.
+    k: usize,
 }
 
 /// A value produced by evaluating an expression against a row.
@@ -110,6 +127,14 @@ impl Engine {
             .get(&sel.table)
             .ok_or_else(|| SqlError::no_such_table(&sel.table))?
             .clone();
+
+        // A vector TopK is answered through a dedicated path: the exact path
+        // scans the table row by row, the approximate path visits the rows
+        // through the inverted lists of the index. Both produce the same
+        // result, because the pruning of the index is exact.
+        if let Some(topk) = self.detect_distance_topk(sel, &def)? {
+            return self.exec_distance_topk(sel, &def, topk);
+        }
 
         let rows = self.collect_rows(&def)?;
 
@@ -217,6 +242,273 @@ impl Engine {
         Ok(QueryResult { columns, rows: out, affected: None })
     }
 
+    // ------------------------------------------------------------ vector TopK
+
+    /// Recognise a vector TopK request.
+    ///
+    /// The statement must order by a single ascending `L2_DISTANCE` over the
+    /// table's vector column and limit the result. Anything else falls back
+    /// to the general path.
+    fn detect_distance_topk(
+        &self,
+        sel: &Select,
+        def: &TableDef,
+    ) -> SqlResult<Option<DistanceTopK>> {
+        let limit = match sel.limit {
+            Some(l) => l,
+            None => return Ok(None),
+        };
+        if sel.order_by.len() != 1 {
+            return Ok(None);
+        }
+        let (expr, term) = &sel.order_by[0];
+        if *term != OrderTerm::Asc {
+            return Ok(None);
+        }
+        let vector_index = match def.vector_column {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        // The ordering expression must be the distance over the vector
+        // column. It may be wrapped in an output alias.
+        let resolved = match expr {
+            Expr::Column(name) => sel
+                .items
+                .iter()
+                .find(|i| i.alias.as_deref() == Some(name.as_str()))
+                .and_then(|i| i.expr.clone())
+                .unwrap_or_else(|| expr.clone()),
+            other => other.clone(),
+        };
+        let (a, b) = match &resolved {
+            Expr::L2Distance(a, b) => (a.as_ref(), b.as_ref()),
+            _ => return Ok(None),
+        };
+        // One side is the vector column, the other a literal.
+        let (col, lit) = match (a, b) {
+            (Expr::Column(c), other) => (c.as_str(), other),
+            (other, Expr::Column(c)) => (c.as_str(), other),
+            _ => return Ok(None),
+        };
+        if def.column_index(col) != Some(vector_index) {
+            return Ok(None);
+        }
+        let literal = match lit {
+            Expr::Str(s) => s.as_str(),
+            _ => return Ok(None),
+        };
+        let query = Vector::parse_literal(literal)?;
+        // The query vector must have the dimension of the column. Checking it
+        // here keeps a mismatch from reaching the distance kernel, which
+        // assumes two vectors of equal length.
+        let dim = def.vector_dim().unwrap_or(0);
+        query.check_dim(dim)?;
+        Ok(Some(DistanceTopK { vector_index, query, k: limit }))
+    }
+
+    /// Answer a vector TopK request.
+    fn exec_distance_topk(
+        &mut self,
+        sel: &Select,
+        def: &TableDef,
+        topk: DistanceTopK,
+    ) -> SqlResult<QueryResult> {
+        let rows = self.collect_rows(&def)?;
+
+        // Rows that the current transaction changed are not in the index, so
+        // they are handled separately: an updated row replaces the indexed
+        // one, a deleted row is removed, an inserted row is added.
+        let table_id = self
+            .tables
+            .get(&def.name.to_ascii_lowercase())
+            .map(|t| t.id)
+            .unwrap_or(0);
+        let updated: HashSet<u64> = self
+            .txn_buffer
+            .updated_of(table_id)
+            .into_iter()
+            .map(|(row_id, _)| row_id)
+            .collect();
+        let deleted: HashSet<u64> = self
+            .txn_buffer
+            .deleted_of(table_id)
+            .into_iter()
+            .collect();
+        // The number of committed rows. A row whose identifier is below it
+        // exists in the index; the staged rows have identifiers at or above
+        // it.
+        let committed_rows = self
+            .tables
+            .get(&def.name.to_ascii_lowercase())
+            .map(|t| t.store.row_count)
+            .unwrap_or(0);
+
+        // The candidates, with their distance and primary key.
+        let mut candidates: Vec<(i64, f32, u64)> = Vec::new();
+
+        let use_index = self.mode == SearchMode::Ann && self.has_vector_index(table_id);
+        if use_index {
+            // The approximate path: the index visits the rows through its
+            // inverted lists. The pruning of the index is exact, so the
+            // result is the same as the exact path.
+            //
+            // The filter is evaluated *inside* the scan, so that the pruning
+            // bound is compared against the distance of the K-th row that
+            // satisfies the filter. Applying the filter after the scan would
+            // be wrong: it would return fewer than K rows, and the rows it
+            // would return would be the K nearest of the unfiltered set.
+            let index = self.vector_index(table_id).expect("index checked above");
+            let filter = sel.filter.clone();
+            let mut hits: Vec<(i64, f32, u64)> = Vec::new();
+            let rows_ref = &rows;
+            let mut scan_error: Option<SqlError> = None;
+            index.scan_ordered(
+                topk.query.as_slice(),
+                self.config.ann_nprobe,
+                topk.k,
+                |row_id, _pk, _d| {
+                    // Rows changed by the transaction are excluded here; they
+                    // are measured below.
+                    if updated.contains(&row_id) || deleted.contains(&row_id) {
+                        return false;
+                    }
+                    let row = match rows_ref.iter().find(|r| r.row_id == row_id) {
+                        Some(r) => r,
+                        None => return false,
+                    };
+                    match &filter {
+                        Some(f) => match self.eval_predicate(f, row, def) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                if scan_error.is_none() {
+                                    scan_error = Some(e);
+                                }
+                                false
+                            }
+                        },
+                        None => true,
+                    }
+                },
+                &mut hits,
+            );
+            if let Some(e) = scan_error {
+                return Err(e);
+            }
+            candidates.extend(hits);
+        } else {
+            // The exact path: every visible row is measured, and the filter
+            // is applied before the K-th row is chosen.
+            for row in &rows {
+                if let Some(filter) = &sel.filter {
+                    if !self.eval_predicate(filter, row, def)? {
+                        continue;
+                    }
+                }
+                let vec = match row.cols.get(topk.vector_index) {
+                    Some(ColValue::Vector(v)) => v,
+                    _ => continue,
+                };
+                let d = crate::vector::dist::l2_dispatch(vec.as_slice(), topk.query.as_slice());
+                candidates.push((row.pk, d, row.row_id));
+            }
+        }
+
+        // Overlay the rows the index does not describe correctly: the rows
+        // staged by the transaction (inserted or updated) and the rows whose
+        // index entry is stale because their vector changed.
+        //
+        // The stale index copies are dropped first and the fresh values are
+        // added afterwards, so that a row that was updated is not lost
+        // between the two steps.
+        if use_index {
+            // The indexed copy of an updated row is stale: the index still
+            // holds the vector the row had before the transaction.
+            candidates.retain(|(_, _, row_id)| !updated.contains(row_id));
+            for row in &rows {
+                let indexed_and_current = row.row_id < committed_rows
+                    && !updated.contains(&row.row_id)
+                    && !deleted.contains(&row.row_id);
+                if indexed_and_current {
+                    continue;
+                }
+                if let Some(filter) = &sel.filter {
+                    if !self.eval_predicate(filter, row, def)? {
+                        continue;
+                    }
+                }
+                let vec = match row.cols.get(topk.vector_index) {
+                    Some(ColValue::Vector(v)) => v,
+                    _ => continue,
+                };
+                let d = crate::vector::dist::l2_dispatch(vec.as_slice(), topk.query.as_slice());
+                candidates.push((row.pk, d, row.row_id));
+            }
+        }
+
+        // Order by distance, ties broken by ascending primary key, and take
+        // the first K.
+        candidates.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
+        candidates.truncate(topk.k);
+
+        // Render the result.
+        let mut columns: Vec<String> = Vec::new();
+        let mut projections: Vec<Projection> = Vec::new();
+        for item in &sel.items {
+            match &item.expr {
+                None => {
+                    for (i, c) in def.columns.iter().enumerate() {
+                        columns.push(c.name.clone());
+                        projections.push(Projection::Column(i));
+                    }
+                }
+                Some(expr) => {
+                    let name = item.alias.clone().unwrap_or_else(|| describe_expr(expr));
+                    columns.push(name.clone());
+                    projections.push(Projection::Expr(expr.clone()));
+                }
+            }
+        }
+
+        let mut out: Vec<Vec<Option<String>>> = Vec::with_capacity(candidates.len());
+        for (pk, _d, row_id) in &candidates {
+            let row = match rows.iter().find(|r| r.row_id == *row_id) {
+                Some(r) => r,
+                None => continue,
+            };
+            let mut values = Vec::with_capacity(projections.len());
+            for proj in &projections {
+                let v = match proj {
+                    Projection::Column(idx) => self.column_at(row, def, *idx)?,
+                    Projection::Expr(e) => self.eval_expr(e, row, def)?,
+                };
+                values.push(Some(v.render()));
+            }
+            let _ = pk;
+            out.push(values);
+        }
+
+        Ok(QueryResult { columns, rows: out, affected: None })
+    }
+
+    /// Whether a table has a vector index.
+    fn has_vector_index(&self, table_id: u32) -> bool {
+        self.tables
+            .values()
+            .any(|t| t.id == table_id && t.index.is_some())
+    }
+
+    /// The vector index of a table.
+    fn vector_index(&self, table_id: u32) -> Option<&crate::vector::ann::IvfIndex> {
+        self.tables
+            .values()
+            .find(|t| t.id == table_id)
+            .and_then(|t| t.index.as_ref())
+    }
+
     /// Collect the visible rows of a table: committed rows plus the rows
     /// staged in the current transaction, minus the deleted ones.
     pub(crate) fn collect_rows(&mut self, def: &TableDef) -> SqlResult<Vec<LiveRow>> {
@@ -277,7 +569,7 @@ impl Engine {
 
     /// Evaluate an expression against a row.
     pub(crate) fn eval_expr(
-        &mut self,
+        &self,
         expr: &Expr,
         row: &LiveRow,
         def: &TableDef,
@@ -364,7 +656,7 @@ impl Engine {
 
     /// Read one column value of a row.
     pub(crate) fn column_at(
-        &mut self,
+        &self,
         row: &LiveRow,
         _def: &TableDef,
         idx: usize,
@@ -379,7 +671,7 @@ impl Engine {
 
     /// Evaluate a boolean predicate.
     pub(crate) fn eval_predicate(
-        &mut self,
+        &self,
         expr: &Expr,
         row: &LiveRow,
         def: &TableDef,

@@ -7,5 +7,6 @@
 
 pub mod bufferpool;
 pub mod format;
+pub mod schema;
 pub mod table;
 pub mod wal;

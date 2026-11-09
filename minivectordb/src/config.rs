@@ -52,6 +52,13 @@ pub struct Config {
     pub durability: Durability,
     pub buffer_pool_mb: usize,
     pub vector_block_rows: usize,
+    /// Number of coarse cells of a vector index.
+    pub ann_nlist: usize,
+    /// Number of cells visited by an approximate search.
+    ///
+    /// `None` means "visit cells until the distance bound proves that no
+    /// remaining cell can improve the answer", which is an exact search.
+    pub ann_nprobe: Option<usize>,
 }
 
 impl Default for Config {
@@ -65,6 +72,8 @@ impl Default for Config {
             durability: Durability::Os,
             buffer_pool_mb: 64,
             vector_block_rows: 4096,
+            ann_nlist: 64,
+            ann_nprobe: None,
         }
     }
 }
@@ -117,6 +126,12 @@ impl Config {
         }
         if let Some(v) = env_usize("MINIVECDB_VECTOR_BLOCK_ROWS") {
             self.vector_block_rows = v;
+        }
+        if let Some(v) = env_usize("MINIVECDB_ANN_NLIST") {
+            self.ann_nlist = v.max(1);
+        }
+        if let Some(v) = env_usize("MINIVECDB_ANN_NPROBE") {
+            self.ann_nprobe = Some(v.max(1));
         }
     }
 }
