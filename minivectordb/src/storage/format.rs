@@ -88,6 +88,74 @@ pub fn decode_value(buf: &[u8]) -> SqlResult<(ColValue, usize)> {
     }
 }
 
+/// The length of the value at the start of `buf`.
+///
+/// The length is computed from the header of the value alone, so a value
+/// can be skipped without materialising it. That matters for the vector
+/// column, which is `dim` floats long: a scan that only needs the scalar
+/// columns of a row must not copy the vector of every row.
+fn value_span(buf: &[u8]) -> SqlResult<usize> {
+    if buf.is_empty() {
+        return Err(SqlError::internal("truncated row image"));
+    }
+    match buf[0] {
+        TAG_BIGINT => Ok(9),
+        TAG_TEXT => {
+            if buf.len() < 5 {
+                return Err(SqlError::internal("truncated VARCHAR value"));
+            }
+            let len = u32::from_le_bytes(buf[1..5].try_into().unwrap()) as usize;
+            Ok(5 + len)
+        }
+        TAG_VECTOR => {
+            if buf.len() < 5 {
+                return Err(SqlError::internal("truncated VECTOR value"));
+            }
+            let dim = u32::from_le_bytes(buf[1..5].try_into().unwrap()) as usize;
+            Ok(5 + dim * 4)
+        }
+        tag => Err(SqlError::internal(format!("unknown value tag {tag}"))),
+    }
+}
+
+/// The bytes of the value at `index` of a row image.
+///
+/// The value is not copied; the returned slice points into the image.
+pub fn value_slice(buf: &[u8], index: usize) -> SqlResult<&[u8]> {
+    let mut pos = 0usize;
+    for _ in 0..index {
+        let span = value_span(buf.get(pos..).unwrap_or_default())?;
+        pos += span;
+    }
+    let span = value_span(buf.get(pos..).unwrap_or_default())?;
+    Ok(&buf[pos..pos + span])
+}
+
+/// Decode the value at `index` of a row image.
+///
+/// Only the requested column is materialised; the other columns are skipped
+/// with arithmetic alone.
+pub fn decode_value_at(buf: &[u8], index: usize) -> SqlResult<ColValue> {
+    let slice = value_slice(buf, index)?;
+    Ok(decode_value(slice)?.0)
+}
+
+/// The raw bytes of the vector at `index` of a row image.
+///
+/// The bytes are the little endian `f32` values of the vector, without a
+/// copy, so that the distance kernel can be fed from them directly.
+pub fn vector_bytes(buf: &[u8], index: usize) -> SqlResult<&[u8]> {
+    let slice = value_slice(buf, index)?;
+    if slice.is_empty() || slice[0] != TAG_VECTOR {
+        return Err(SqlError::internal("column does not hold a vector"));
+    }
+    if slice.len() < 5 {
+        return Err(SqlError::internal("truncated VECTOR value"));
+    }
+    let dim = u32::from_le_bytes(slice[1..5].try_into().unwrap()) as usize;
+    Ok(&slice[5..5 + dim * 4])
+}
+
 /// Encode a whole row image.
 pub fn encode_row(cols: &[ColValue]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -104,6 +172,36 @@ pub fn decode_row(buf: &[u8]) -> SqlResult<Vec<ColValue>> {
     while pos < buf.len() {
         let (v, used) = decode_value(&buf[pos..])?;
         out.push(v);
+        pos += used;
+    }
+    Ok(out)
+}
+
+/// Decode a whole row image, leaving the vector column undecoded.
+///
+/// The vector column is by far the largest part of an image - `dim` floats
+/// against a few bytes for the other columns - and it is stored a second
+/// time in the vector file. A scan that only needs the scalar columns must
+/// therefore not copy it: this function decodes every value except the
+/// vector, which becomes a `None` at its position. The positions of the
+/// other values are unchanged, so a column is still addressed by its index.
+///
+/// The vector bytes themselves are left in the image, so a caller that does
+/// need the vector can still reach them with [`vector_bytes`].
+pub fn decode_row_scalars(buf: &[u8]) -> SqlResult<Vec<Option<ColValue>>> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos < buf.len() {
+        if buf[pos] == TAG_VECTOR {
+            // The vector is not decoded, but its length is still needed to
+            // step over it.
+            let span = value_span(&buf[pos..])?;
+            out.push(None);
+            pos += span;
+            continue;
+        }
+        let (v, used) = decode_value(&buf[pos..])?;
+        out.push(Some(v));
         pos += used;
     }
     Ok(out)

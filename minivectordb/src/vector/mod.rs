@@ -2,4 +2,5 @@
 
 pub mod ann;
 pub mod dist;
+pub mod exact;
 pub mod index;

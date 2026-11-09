@@ -272,9 +272,16 @@ def check_answers(answers, filtered_flags, rows, queries, k, categories):
     sample = []
     # The sample covers both kinds of query, so that the recall of the
     # filtered and of the unfiltered queries are both measured.
+    #
+    # The two kinds are sampled separately, because they do not alternate
+    # over the whole range: the filtered queries are the ones with an even
+    # index, so a stride that starts at zero would only ever pick filtered
+    # queries.
     step = max(1, len(answers) // 10)
-    sample += [i for i in range(0, len(answers), step) if not filtered_flags[i]]
-    sample += [i for i in range(0, len(answers), step) if filtered_flags[i]]
+    unfiltered = [i for i in range(len(answers)) if not filtered_flags[i]]
+    filtered = [i for i in range(len(answers)) if filtered_flags[i]]
+    sample += unfiltered[:: max(1, len(unfiltered) // 10)][:10]
+    sample += filtered[:: max(1, len(filtered) // 10)][:10]
     sample = sorted(set(sample))
 
     recalls = {True: [], False: []}

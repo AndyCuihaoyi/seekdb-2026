@@ -100,6 +100,34 @@ pub fn l2_dispatch(a: &[f32], b: &[f32]) -> f32 {
     l2_sq_dispatch(a, b).sqrt()
 }
 
+/// L2 distance between a vector that is still in its byte form and a query.
+///
+/// The bytes are the little endian `f32` values of the vector, as they are
+/// stored in a row image. Reading them in place saves a copy of the whole
+/// vector for every row of a scan, which is the difference between one
+/// allocation per row and none.
+///
+/// The summation order is the same as the scalar kernel, so the result is
+/// bit-identical to `l2_distance_sq` of the same values.
+#[inline]
+pub fn l2_sq_bytes(a: &[u8], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len() * 4);
+    let mut sum = 0.0f32;
+    for (i, x) in b.iter().enumerate() {
+        let o = i * 4;
+        let v = f32::from_le_bytes([a[o], a[o + 1], a[o + 2], a[o + 3]]);
+        let d = v - *x;
+        sum += d * d;
+    }
+    sum
+}
+
+/// Dispatching L2 distance between a vector in its byte form and a query.
+#[inline]
+pub fn l2_bytes(a: &[u8], b: &[f32]) -> f32 {
+    l2_sq_bytes(a, b).sqrt()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

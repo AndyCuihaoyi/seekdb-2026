@@ -21,13 +21,29 @@
 //! The file starts with a header that describes the layout. A file whose
 //! header does not match the current one is stale and is rebuilt from the row
 //! images of `col.dat`, which are the authoritative copy of the data.
+//!
+//! # The block cache
+//!
+//! The vector blocks and the directory blocks are read through a bounded
+//! cache, shared by every table of the database. The cache holds the
+//! *decoded* form of a block, because the decoding is the expensive part:
+//! turning the bytes of a vector block into floats costs more than the read
+//! out of the file, and a scan of ten thousand rows repeats that work for
+//! every query.
+//!
+//! A write invalidates the block it touches, so that the cache never holds a
+//! value that is older than the file.
 
 use crate::error::{SqlError, SqlResult};
+use crate::storage::bufferpool::BufferPool;
 use crate::value::vector::Vector;
+use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 
 /// Rows per vector block. Must be a multiple of 8 so the SIMD kernel can
 /// process whole lanes.
@@ -42,6 +58,26 @@ pub const VEC_VERSION: u32 = 1;
 /// Size of the vector file header in bytes: magic, version, dimension and
 /// block size.
 pub const VEC_HEADER_SIZE: usize = 16;
+
+/// The identifier of the next opened table file.
+///
+/// It distinguishes the blocks of different tables inside the shared cache.
+static NEXT_FILE_ID: AtomicU32 = AtomicU32::new(1);
+
+/// The budget of a cache that a table opens on its own.
+///
+/// A table that is opened outside the engine - in a test, for instance - gets
+/// a cache of its own, with this budget.
+const STANDALONE_POOL_MB: usize = 64;
+
+/// The cache of the decoded vector blocks.
+pub type VectorPool = Rc<RefCell<BufferPool<Vec<f32>>>>;
+
+/// The cache of the decoded directory blocks.
+pub type DirectoryPool = Rc<RefCell<BufferPool<Vec<RowMeta>>>>;
+
+/// The cache of the decoded scalar column blocks.
+pub type ScalarPool = Rc<RefCell<BufferPool<ScalarBlock>>>;
 
 /// A stored row: primary key plus the non vector column values.
 #[derive(Debug, Clone, PartialEq)]
@@ -87,6 +123,29 @@ pub struct RowMeta {
 
 pub const ROW_META_SIZE: usize = 48;
 
+impl crate::storage::bufferpool::CacheEntry for Vec<RowMeta> {
+    fn size(&self) -> usize {
+        self.len() * ROW_META_SIZE
+    }
+}
+
+/// The decoded scalar columns of a block.
+///
+/// A block of the scalar columns holds one entry per row, and every entry
+/// holds one value per scalar column. The vector column is not part of it:
+/// the vector lives in its own file, and keeping a second copy of it here
+/// would defeat the purpose of the split.
+pub type ScalarBlock = Vec<Vec<Option<ColValue>>>;
+
+impl crate::storage::bufferpool::CacheEntry for ScalarBlock {
+    fn size(&self) -> usize {
+        // A rough estimate: every value is at most a text of a few dozen
+        // bytes, and the overhead of the allocation is proportional to the
+        // number of values.
+        self.len() * 64
+    }
+}
+
 /// File handles of one table.
 pub struct TableStore {
     pub dir: PathBuf,
@@ -100,10 +159,48 @@ pub struct TableStore {
     pub row_count: u64,
     /// Number of rows per block in the vector file.
     pub blocks: u64,
+    /// Identifier of the table file, used as the cache key.
+    file_id: u32,
+    /// The cache of the decoded vector blocks, shared with the other tables.
+    vector_pool: VectorPool,
+    /// The cache of the decoded directory blocks, shared with the other tables.
+    directory_pool: DirectoryPool,
+    /// The cache of the decoded scalar columns, shared with the other tables.
+    scalar_pool: ScalarPool,
 }
 
 impl TableStore {
     pub fn open(dir: &Path, name: &str, dim: usize, block_rows: usize) -> io::Result<TableStore> {
+        let vector_pool: VectorPool =
+            Rc::new(RefCell::new(BufferPool::new(STANDALONE_POOL_MB)));
+        let directory_pool: DirectoryPool =
+            Rc::new(RefCell::new(BufferPool::new(STANDALONE_POOL_MB)));
+        let scalar_pool: ScalarPool =
+            Rc::new(RefCell::new(BufferPool::new(STANDALONE_POOL_MB)));
+        TableStore::open_with_pools(
+            dir,
+            name,
+            dim,
+            block_rows,
+            vector_pool,
+            directory_pool,
+            scalar_pool,
+        )
+    }
+
+    /// Open a table whose blocks are cached in the given pools.
+    ///
+    /// Every table of a database shares one set of pools, so that the memory
+    /// they use is bounded by one budget rather than by the number of tables.
+    pub fn open_with_pools(
+        dir: &Path,
+        name: &str,
+        dim: usize,
+        block_rows: usize,
+        vector_pool: VectorPool,
+        directory_pool: DirectoryPool,
+        scalar_pool: ScalarPool,
+    ) -> io::Result<TableStore> {
         std::fs::create_dir_all(dir)?;
         let meta = OpenOptions::new().create(true).read(true).write(true).open(dir.join("meta.dat"))?;
         let col = OpenOptions::new().create(true).read(true).write(true).open(dir.join("col.dat"))?;
@@ -118,6 +215,10 @@ impl TableStore {
             vec,
             row_count: 0,
             blocks: 0,
+            file_id: NEXT_FILE_ID.fetch_add(1, AtomicOrdering::Relaxed),
+            vector_pool,
+            directory_pool,
+            scalar_pool,
         };
         store.reload_counts()?;
         // A fresh vector file gets its header right away, so that the file
@@ -166,6 +267,8 @@ impl TableStore {
         self.vec
             .write_at(&head, 0)
             .map_err(|e| SqlError::internal(format!("vec header write failed: {e}")))?;
+        // Every cached vector block is stale now.
+        self.vector_pool.borrow_mut().clear();
         Ok(())
     }
 
@@ -193,6 +296,117 @@ impl TableStore {
             .and_then(|_| self.col.sync_data())
             .and_then(|_| self.vec.sync_data())
             .map_err(|e| SqlError::internal(format!("sync failed: {e}")))
+    }
+
+    /// Read the directory entries of a whole block with one call.
+    ///
+    /// The directory is a fixed size record array, so the entries of a block
+    /// are contiguous. Reading them together turns `block_rows` reads into
+    /// one, which is what makes a block scan cheap.
+    ///
+    /// The returned vector holds one entry per slot of the block; the slots
+    /// beyond the last row are absent, so its length is the number of rows
+    /// the block really holds.
+    pub fn read_meta_block(&mut self, block: u32) -> io::Result<Vec<RowMeta>> {
+        let first = block as u64 * self.block_rows as u64;
+        if first >= self.row_count {
+            return Ok(Vec::new());
+        }
+        let count = (self.row_count - first).min(self.block_rows as u64) as usize;
+        let key = (self.file_id, block as u64);
+        if let Some(hit) = self.directory_pool.borrow_mut().get(key) {
+            return Ok((*hit).clone());
+        }
+        let mut buf = vec![0u8; count * ROW_META_SIZE];
+        let n = read_at_up_to(&self.meta, &mut buf, first * ROW_META_SIZE as u64)?;
+        let mut out = Vec::with_capacity(n / ROW_META_SIZE);
+        for chunk in buf.chunks_exact(ROW_META_SIZE) {
+            if chunk.len() < ROW_META_SIZE {
+                break;
+            }
+            out.push(decode_meta(chunk));
+        }
+        // The block is cached, so that the next scan does not decode it
+        // again. A block that is still being filled changes, so it is only
+        // cached once it is complete.
+        if out.len() == self.block_rows {
+            self.directory_pool.borrow_mut().put(key, out.clone());
+        }
+        Ok(out)
+    }
+
+    /// Read the row images of a whole block with one call.
+    ///
+    /// The row images are appended, and the rows of a block were appended
+    /// one after the other, so the images of a block are contiguous in
+    /// `col.dat` as well. The returned buffer holds the images back to back,
+    /// and the returned offsets hold the position of the image of every slot
+    /// inside it.
+    ///
+    /// A row whose image was replaced by an update is the exception: its
+    /// image was appended at the end of the file, so it does not sit between
+    /// its neighbours. Such a row is read on its own.
+    pub fn read_image_block(&mut self, metas: &[RowMeta]) -> io::Result<(Vec<u8>, Vec<u32>)> {
+        let mut buf = Vec::new();
+        let mut offsets = Vec::with_capacity(metas.len());
+        // The images that follow each other in the file are read together.
+        let mut i = 0usize;
+        while i < metas.len() {
+            let start = metas[i].col_offset;
+            let mut end = start + metas[i].col_len as u64;
+            let mut j = i + 1;
+            while j < metas.len() && metas[j].col_offset == end {
+                end += metas[j].col_len as u64;
+                j += 1;
+            }
+            let base = buf.len() as u64;
+            let mut chunk = vec![0u8; (end - start) as usize];
+            let n = read_at_up_to(&self.col, &mut chunk, start)?;
+            chunk.truncate(n);
+            buf.extend_from_slice(&chunk);
+            for m in &metas[i..j] {
+                offsets.push((base + (m.col_offset - start)) as u32);
+            }
+            i = j;
+        }
+        Ok((buf, offsets))
+    }
+
+    /// The image of one slot of a block, out of the buffer of a block read.
+    pub fn image_at<'a>(buf: &'a [u8], offsets: &[u32], slot: usize, len: u32) -> &'a [u8] {
+        let start = offsets[slot] as usize;
+        &buf[start..start + len as usize]
+    }
+
+    /// Read the scalar columns of a block and decode them.
+    ///
+    /// The row images of a block are read with one call and decoded once.
+    /// The result is cached, so that the next query that filters on the
+    /// block does not read and decode it again.
+    ///
+    /// The vector column is not decoded: it is stored in the vector file, and
+    /// a scan that filters on the scalar columns must not copy it.
+    pub fn read_scalar_block(
+        &mut self,
+        block: u32,
+        metas: &[RowMeta],
+    ) -> SqlResult<ScalarBlock> {
+        let key = (self.file_id, block as u64);
+        if let Some(hit) = self.scalar_pool.borrow_mut().get(key) {
+            return Ok((*hit).clone());
+        }
+        let (buf, offsets) = self.read_image_block(metas)?;
+        let mut out = Vec::with_capacity(metas.len());
+        for (slot, meta) in metas.iter().enumerate() {
+            let image = Self::image_at(&buf, &offsets, slot, meta.col_len);
+            out.push(crate::storage::format::decode_row_scalars(image)?);
+        }
+        // A block that is still being filled changes, so it is only cached
+        // once it is complete.
+        if metas.len() == self.block_rows {
+            self.scalar_pool.borrow_mut().put(key, out.clone());
+        }
+        Ok(out)
     }
 
     /// Recompute the row count from the directory (used at startup).
@@ -227,6 +441,9 @@ impl TableStore {
         };
         self.write_meta_at(self.row_count, &meta)?;
         self.row_count += 1;
+        // The number of blocks has to follow the number of rows, because a
+        // scan walks the blocks.
+        self.blocks = self.row_count.div_ceil(self.block_rows as u64);
         Ok(self.row_count - 1)
     }
 
@@ -238,17 +455,7 @@ impl TableStore {
         let mut buf = [0u8; ROW_META_SIZE];
         self.meta.seek(SeekFrom::Start(row_id * ROW_META_SIZE as u64))?;
         self.meta.read_exact(&mut buf)?;
-        let meta = RowMeta {
-            pk: i64::from_le_bytes(buf[0..8].try_into().unwrap()),
-            col_offset: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
-            col_len: u32::from_le_bytes(buf[16..20].try_into().unwrap()),
-            vec_block: u32::from_le_bytes(buf[20..24].try_into().unwrap()),
-            vec_slot: u32::from_le_bytes(buf[24..28].try_into().unwrap()),
-            version: u32::from_le_bytes(buf[28..32].try_into().unwrap()),
-            alive: buf[32],
-            _pad: [0; 11],
-        };
-        Ok(Some(meta))
+        Ok(Some(decode_meta(&buf)))
     }
 
     /// Overwrite the directory entry of a row.
@@ -268,7 +475,14 @@ impl TableStore {
         self.meta
             .seek(SeekFrom::Start(row_id * ROW_META_SIZE as u64))
             .and_then(|_| self.meta.write_all(&buf))
-            .map_err(|e| SqlError::internal(format!("meta write failed: {e}")))
+            .map_err(|e| SqlError::internal(format!("meta write failed: {e}")))?;
+        // The directory block the entry belongs to changed, so the cached
+        // copy of that block is stale.
+        let block = row_id / self.block_rows as u64;
+        self.directory_pool
+            .borrow_mut()
+            .invalidate((self.file_id, block));
+        Ok(())
     }
 
     /// Append a row image to `col.dat` and return its offset.
@@ -277,6 +491,9 @@ impl TableStore {
         self.col
             .write_all(image)
             .map_err(|e| SqlError::internal(format!("col write failed: {e}")))?;
+        // The image belongs to the block of the row that is written, and the
+        // cached scalar columns of that block are now out of date.
+        self.scalar_pool.borrow_mut().clear();
         Ok(offset)
     }
 
@@ -314,6 +531,9 @@ impl TableStore {
     }
 
     /// Write a vector into its slot.
+    ///
+    /// The block the vector belongs to is dropped from the cache, so that the
+    /// next scan does not see the old content.
     pub fn write_vector(&mut self, block: u32, slot: u32, v: &[f32]) -> SqlResult<()> {
         let mut buf = Vec::with_capacity(v.len() * 4);
         for x in v {
@@ -323,7 +543,9 @@ impl TableStore {
         self.vec
             .write_at(&buf, offset)
             .map(|_| ())
-            .map_err(|e| SqlError::internal(format!("vec write failed: {e}")))
+            .map_err(|e| SqlError::internal(format!("vec write failed: {e}")))?;
+        self.vector_pool.borrow_mut().invalidate((self.file_id, block as u64));
+        Ok(())
     }
 
     /// Read one vector back.
@@ -348,7 +570,43 @@ impl TableStore {
     /// is read with a single call. The returned buffer is a
     /// `block_rows x dim` matrix in row major order: the vector of slot `s`
     /// is `out[s * dim .. (s + 1) * dim]`.
+    ///
+    /// The matrix is cached, so that the next scan of the same block does
+    /// not read and decode it again.
     pub fn read_block_matrix(&mut self, block: u32) -> SqlResult<Vec<f32>> {
+        let br = self.block_rows;
+        let d = self.dim;
+        let total = br * d * 4;
+        let offset = self.vector_offset(block, 0);
+        let key = (self.file_id, block as u64);
+        if let Some(hit) = self.vector_pool.borrow_mut().get(key) {
+            return Ok((*hit).clone());
+        }
+        let mut buf = vec![0u8; total];
+        let n = read_at_up_to(&self.vec, &mut buf, offset)
+            .map_err(|e| SqlError::internal(format!("vec read failed: {e}")))?;
+        // A partially filled block is padded with zeros.
+        buf.truncate(n);
+        buf.resize(total, 0);
+        let out: Vec<f32> = buf
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        self.vector_pool.borrow_mut().put(key, out.clone());
+        Ok(out)
+    }
+
+    /// Read a block matrix without copying it.
+    ///
+    /// The cached matrix is handed out as a shared reference, so a scan that
+    /// finds the block in the cache does not copy the whole matrix. This is
+    /// the path a query takes; [`TableStore::read_block_matrix`] stays
+    /// available for the callers that need their own copy.
+    pub fn block_matrix(&mut self, block: u32) -> SqlResult<Rc<Vec<f32>>> {
+        let key = (self.file_id, block as u64);
+        if let Some(hit) = self.vector_pool.borrow_mut().get(key) {
+            return Ok(hit);
+        }
         let br = self.block_rows;
         let d = self.dim;
         let total = br * d * 4;
@@ -356,13 +614,27 @@ impl TableStore {
         let mut buf = vec![0u8; total];
         let n = read_at_up_to(&self.vec, &mut buf, offset)
             .map_err(|e| SqlError::internal(format!("vec read failed: {e}")))?;
-        // A partially filled block is padded with zeros.
         buf.truncate(n);
         buf.resize(total, 0);
-        Ok(buf
+        let out: Vec<f32> = buf
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-            .collect())
+            .collect();
+        Ok(self.vector_pool.borrow_mut().put(key, out))
+    }
+}
+
+/// Decode one directory entry.
+fn decode_meta(buf: &[u8]) -> RowMeta {
+    RowMeta {
+        pk: i64::from_le_bytes(buf[0..8].try_into().unwrap()),
+        col_offset: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
+        col_len: u32::from_le_bytes(buf[16..20].try_into().unwrap()),
+        vec_block: u32::from_le_bytes(buf[20..24].try_into().unwrap()),
+        vec_slot: u32::from_le_bytes(buf[24..28].try_into().unwrap()),
+        version: u32::from_le_bytes(buf[28..32].try_into().unwrap()),
+        alive: buf[32],
+        _pad: [0; 11],
     }
 }
 
@@ -506,6 +778,84 @@ mod tests {
             std::fs::metadata(dir.0.join("vec.dat")).unwrap().len(),
             VEC_HEADER_SIZE as u64
         );
+    }
+
+    #[test]
+    fn the_block_count_follows_the_row_count() {
+        let dir = TempDir::new("blocks-count");
+        let mut store = TableStore::open(&dir.0, "t", 2, 8).unwrap();
+        assert_eq!(store.blocks, 0);
+        for i in 0..8 {
+            let offset = store.append_columns(&[i as u8]).unwrap();
+            store.append_row(i as i64, offset, 1, 0, i as u32).unwrap();
+        }
+        assert_eq!(store.row_count, 8);
+        assert_eq!(store.blocks, 1);
+        let offset = store.append_columns(&[9]).unwrap();
+        store.append_row(9, offset, 1, 1, 0).unwrap();
+        assert_eq!(store.blocks, 2);
+    }
+
+    #[test]
+    fn the_directory_of_a_block_is_read_in_one_call() {
+        let dir = TempDir::new("meta-block");
+        let mut store = TableStore::open(&dir.0, "t", 2, 8).unwrap();
+        for i in 0..10u64 {
+            let offset = store.append_columns(&[i as u8]).unwrap();
+            store.append_row(i as i64, offset, 1, 0, i as u32).unwrap();
+        }
+        let first = store.read_meta_block(0).unwrap();
+        assert_eq!(first.len(), 8);
+        assert_eq!(first[3].pk, 3);
+        let second = store.read_meta_block(1).unwrap();
+        assert_eq!(second.len(), 2);
+        assert_eq!(second[0].pk, 8);
+        assert_eq!(second[1].pk, 9);
+        // A block beyond the last one is empty.
+        assert!(store.read_meta_block(2).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_cached_block_matrix_is_the_same_after_a_second_read() {
+        let dir = TempDir::new("cached-matrix");
+        let mut store = TableStore::open(&dir.0, "t", 3, 8).unwrap();
+        for i in 0..8u64 {
+            store.write_vector(0, i as u32, &[i as f32, 1.0, 2.0]).unwrap();
+        }
+        let first = store.read_block_matrix(0).unwrap();
+        let second = store.read_block_matrix(0).unwrap();
+        assert_eq!(first, second);
+        // The shared form holds the same values.
+        let shared = store.block_matrix(0).unwrap();
+        assert_eq!(&*shared, &first[..]);
+    }
+
+    #[test]
+    fn a_write_drops_the_cached_block() {
+        let dir = TempDir::new("stale-cache");
+        let mut store = TableStore::open(&dir.0, "t", 2, 8).unwrap();
+        store.write_vector(0, 0, &[1.0, 2.0]).unwrap();
+        assert_eq!(store.read_block_matrix(0).unwrap()[0], 1.0);
+        // The write changes the file, so the cached copy has to be dropped.
+        store.write_vector(0, 0, &[9.0, 9.0]).unwrap();
+        assert_eq!(store.read_block_matrix(0).unwrap()[0], 9.0);
+    }
+
+    #[test]
+    fn a_write_drops_the_cached_directory_block() {
+        let dir = TempDir::new("stale-directory");
+        let mut store = TableStore::open(&dir.0, "t", 2, 8).unwrap();
+        for i in 0..8u64 {
+            let offset = store.append_columns(&[i as u8]).unwrap();
+            store.append_row(i as i64, offset, 1, 0, i as u32).unwrap();
+        }
+        assert_eq!(store.read_meta_block(0).unwrap()[2].pk, 2);
+        // An update rewrites the directory entry of a row, so the cached
+        // block of the directory has to be dropped.
+        let mut meta = store.read_meta(2).unwrap().unwrap();
+        meta.pk = 42;
+        store.write_meta(2, &meta).unwrap();
+        assert_eq!(store.read_meta_block(0).unwrap()[2].pk, 42);
     }
 }
 

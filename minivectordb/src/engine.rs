@@ -6,8 +6,7 @@ use crate::catalog::{Catalog, TableDef};
 use crate::config::{Config, SearchMode};
 use crate::error::{SqlError, SqlResult};
 use crate::storage::format::{decode_row, encode_row};
-use crate::storage::table::{ColValue, RowMeta, TableStore};
-use crate::storage::wal::{read_all, Record, Wal};
+use crate::storage::table::{ColValue, RowMeta, TableStore};use crate::storage::wal::{read_all, Record, Wal};
 use crate::sql::ast::*;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -152,6 +151,12 @@ pub struct Engine {
     pub(crate) pk_index: HashMap<u32, HashMap<i64, u64>>,
     /// Current search mode, may be switched at runtime.
     pub mode: SearchMode,
+    /// The cache of the decoded vector blocks, shared by every table.
+    pub(crate) vector_pool: crate::storage::table::VectorPool,
+    /// The cache of the decoded directory blocks, shared by every table.
+    pub(crate) directory_pool: crate::storage::table::DirectoryPool,
+    /// The cache of the decoded scalar columns, shared by every table.
+    pub(crate) scalar_pool: crate::storage::table::ScalarPool,
 }
 
 /// Per table runtime state.
@@ -179,6 +184,7 @@ impl Engine {
         let wal = Wal::open(&wal_path, sync)
             .map_err(|e| SqlError::internal(format!("cannot open wal: {e}")))?;
 
+        let buffer_pool_mb = config.buffer_pool_mb;
         let mut engine = Engine {
             mode: config.mode,
             config,
@@ -190,6 +196,18 @@ impl Engine {
             next_txn_id: 1,
             next_table_id: 1,
             pk_index: HashMap::new(),
+            // Every table shares one pair of block caches, so that the memory
+            // they use is bounded by one budget rather than by the number of
+            // tables.
+            vector_pool: std::rc::Rc::new(std::cell::RefCell::new(
+                crate::storage::bufferpool::BufferPool::new(buffer_pool_mb),
+            )),
+            directory_pool: std::rc::Rc::new(std::cell::RefCell::new(
+                crate::storage::bufferpool::BufferPool::new(buffer_pool_mb),
+            )),
+            scalar_pool: std::rc::Rc::new(std::cell::RefCell::new(
+                crate::storage::bufferpool::BufferPool::new(buffer_pool_mb),
+            )),
         };
         // The tables are restored from the catalog file first, so that the
         // replay of the log finds them: the log may have been folded into
@@ -785,11 +803,14 @@ impl Engine {
             })
             .unwrap_or(0);
         let dir = self.table_dir(&name);
-        let store = TableStore::open(
+        let store = TableStore::open_with_pools(
             &dir,
             &name,
             dim,
             self.config.vector_block_rows,
+            self.vector_pool.clone(),
+            self.directory_pool.clone(),
+            self.scalar_pool.clone(),
         )
         .map_err(|e| SqlError::internal(format!("cannot open table storage: {e}")))?;
         self.catalog.insert(def.clone());
@@ -1026,5 +1047,114 @@ mod tests {
         let out = run(&mut engine, "SELECT id FROM t").unwrap();
         assert_eq!(out.rows.len(), 1);
         assert_eq!(out.rows[0][0], Cell::Int(7));
+    }
+
+    /// The answer of a TopK query, as the list of the primary keys.
+    fn topk(engine: &mut Engine, query: &str, k: usize, filter: Option<&str>) -> Vec<i64> {
+        let clause = match filter {
+            Some(f) => format!(" WHERE {}", f),
+            None => String::new(),
+        };
+        let sql = format!(
+            "SELECT id, L2_DISTANCE(v,'{}') AS distance FROM t{} \
+             ORDER BY distance LIMIT {}",
+            query, clause, k
+        );
+        let out = run(engine, &sql).unwrap();
+        out.rows
+            .iter()
+            .map(|row| match row[0] {
+                Cell::Int(i) => i,
+                _ => panic!("the identifier is not an integer"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_block_scan_agrees_with_the_row_by_row_path() {
+        // The block scan reads the vectors from the vector file, while the
+        // row by row path reads them from the row images. The two copies
+        // have to stay in step, and the answers have to be identical.
+        let dir = TempDir::new("blocks");
+        let mut engine = engine_in(&dir);
+        run(
+            &mut engine,
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, cat VARCHAR(8), v VECTOR(4))",
+        )
+        .unwrap();
+        for i in 1..=40i64 {
+            let v = format!(
+                "[{}.0,{}.0,{}.0,{}.0]",
+                i % 7,
+                (i * 3) % 11,
+                (i * 5) % 13,
+                (i * 7) % 17
+            );
+            let cat = format!("c{}", i % 4);
+            run(
+                &mut engine,
+                &format!("INSERT INTO t VALUES ({},'{}','{}')", i, cat, v),
+            )
+            .unwrap();
+        }
+        // An update replaces a vector, so the two copies have to be brought
+        // back in step there as well.
+        run(
+            &mut engine,
+            "UPDATE t SET v = '[99.0,1.0,2.0,3.0]' WHERE id = 7",
+        )
+        .unwrap();
+
+        let queries = ["[0.0,0.0,0.0,0.0]", "[3.0,1.0,4.0,1.0]", "[9.0,9.0,9.0,9.0]"];
+        for query in queries {
+            let exact = topk(&mut engine, query, 5, None);
+            let filtered = topk(&mut engine, query, 5, Some("cat = 'c1'"));
+            assert_eq!(exact.len(), 5);
+            assert!(filtered.len() <= 5);
+            // The filtered answer may only hold rows of the wanted category.
+            for pk in &filtered {
+                assert_eq!(pk % 4, 1, "the filtered answer holds a row of another category");
+            }
+            // The same query has to give the same answer every time.
+            assert_eq!(exact, topk(&mut engine, query, 5, None));
+        }
+    }
+
+    #[test]
+    fn a_deleted_row_is_not_in_the_answer() {
+        let dir = TempDir::new("deleted");
+        let mut engine = engine_in(&dir);
+        run(&mut engine, "CREATE TABLE t (id BIGINT PRIMARY KEY, v VECTOR(2))").unwrap();
+        for i in 1..=5i64 {
+            run(
+                &mut engine,
+                &format!("INSERT INTO t VALUES ({},'[{}.0,0.0]')", i, i),
+            )
+            .unwrap();
+        }
+        run(&mut engine, "DELETE FROM t WHERE id = 1").unwrap();
+        let answer = topk(&mut engine, "[0.0,0.0]", 3, None);
+        assert_eq!(answer, vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn a_transaction_sees_its_own_changes() {
+        let dir = TempDir::new("txn-topk");
+        let mut engine = engine_in(&dir);
+        run(&mut engine, "CREATE TABLE t (id BIGINT PRIMARY KEY, v VECTOR(2))").unwrap();
+        for i in 1..=5i64 {
+            run(
+                &mut engine,
+                &format!("INSERT INTO t VALUES ({},'[{}.0,0.0]')", i, i),
+            )
+            .unwrap();
+        }
+        run(&mut engine, "BEGIN").unwrap();
+        run(&mut engine, "INSERT INTO t VALUES (0, '[0.0,0.0]')").unwrap();
+        let answer = topk(&mut engine, "[0.0,0.0]", 2, None);
+        assert_eq!(answer, vec![0, 1]);
+        run(&mut engine, "ROLLBACK").unwrap();
+        let answer = topk(&mut engine, "[0.0,0.0]", 2, None);
+        assert_eq!(answer, vec![1, 2]);
     }
 }

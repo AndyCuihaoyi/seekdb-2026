@@ -10,7 +10,7 @@ use crate::error::{SqlError, SqlResult};
 use crate::sql::ast::*;
 use crate::storage::table::ColValue;
 use crate::value::vector::Vector;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// How one output column is produced.
 enum Projection {
@@ -129,6 +129,59 @@ pub fn format_distance(d: f32) -> String {
 pub fn render_vector(v: &Vector) -> String {
     let parts: Vec<String> = v.as_slice().iter().map(|x| format_distance(*x)).collect();
     format!("[{}]", parts.join(","))
+}
+
+/// The values of a row.
+///
+/// The values are either already decoded, or still in the byte form of the
+/// row image. The image form matters for a scan: a row that a filter
+/// rejects must not have all of its columns materialised, and the vector
+/// column is `dim` floats long, so copying it for every row of a scan is
+/// the single largest allocation of a query.
+///
+/// Only the columns that are actually used are decoded, so a scan that
+/// filters on one small column never touches the vector.
+pub enum RowValues<'a> {
+    /// The values are already decoded.
+    Decoded(&'a [ColValue]),
+    /// The values are still in the byte form of the row image.
+    Image(&'a [u8]),
+    /// The scalar values are decoded, the vector column is not.
+    ///
+    /// The vector column is `None` at its position. It is read from the
+    /// vector file when it is needed.
+    Scalars(&'a [Option<ColValue>]),
+}
+
+impl RowValues<'_> {
+    /// The value of one column.
+    pub fn at(&self, idx: usize) -> SqlResult<EvalValue> {
+        match self {
+            RowValues::Decoded(cols) => match cols.get(idx) {
+                Some(ColValue::BigInt(i)) => Ok(EvalValue::BigInt(*i)),
+                Some(ColValue::Text(s)) => Ok(EvalValue::Text(s.clone())),
+                Some(ColValue::Vector(v)) => Ok(EvalValue::Vector(v.clone())),
+                None => Err(SqlError::internal("row is missing a column value")),
+            },
+            RowValues::Image(image) => {
+                let value = crate::storage::format::decode_value_at(image, idx)?;
+                match value {
+                    ColValue::BigInt(i) => Ok(EvalValue::BigInt(i)),
+                    ColValue::Text(s) => Ok(EvalValue::Text(s)),
+                    ColValue::Vector(v) => Ok(EvalValue::Vector(v)),
+                }
+            }
+            RowValues::Scalars(cols) => match cols.get(idx) {
+                Some(Some(ColValue::BigInt(i))) => Ok(EvalValue::BigInt(*i)),
+                Some(Some(ColValue::Text(s))) => Ok(EvalValue::Text(s.clone())),
+                Some(Some(ColValue::Vector(v))) => Ok(EvalValue::Vector(v.clone())),
+                Some(None) => Err(SqlError::internal(
+                    "the vector column is not available in a scan",
+                )),
+                None => Err(SqlError::internal("row is missing a column value")),
+            },
+        }
+    }
 }
 
 /// A mapping from a row identifier to the position of the row in a list.
@@ -374,8 +427,6 @@ impl Engine {
         def: &TableDef,
         topk: DistanceTopK,
     ) -> SqlResult<QueryResult> {
-        let rows = self.collect_rows(&def)?;
-
         // Rows that the current transaction changed are not in the index, so
         // they are handled separately: an updated row replaces the indexed
         // one, a deleted row is removed, an inserted row is added.
@@ -418,12 +469,15 @@ impl Engine {
             // satisfies the filter. Applying the filter after the scan would
             // be wrong: it would return fewer than K rows, and the rows it
             // would return would be the K nearest of the unfiltered set.
-            let index = self.vector_index(table_id).expect("index checked above");
             let filter = sel.filter.clone();
             let mut hits: Vec<(i64, f32, u64)> = Vec::new();
+            // The rows are collected before the index is borrowed, so that
+            // the two borrows of the engine do not overlap.
+            let rows = self.collect_rows(def)?;
             // The row identifiers are dense, so the position of a row in the
             // list is found through an array instead of a linear search.
             let row_index = RowIndex::build(&rows);
+            let index = self.vector_index(table_id).expect("index checked above");
             let mut scan_error: Option<SqlError> = None;
             index.scan_ordered(
                 topk.query.as_slice(),
@@ -440,7 +494,7 @@ impl Engine {
                         None => return false,
                     };
                     match &filter {
-                        Some(f) => match self.eval_predicate(f, row, def) {
+                        Some(f) => match eval_predicate(f, &RowValues::Decoded(&row.cols), def) {
                             Ok(v) => v,
                             Err(e) => {
                                 if scan_error.is_none() {
@@ -461,41 +515,66 @@ impl Engine {
         } else {
             // The exact path: every visible row is measured, and the filter
             // is applied before the K-th row is chosen.
-            for row in &rows {
-                if let Some(filter) = &sel.filter {
-                    if !self.eval_predicate(filter, row, def)? {
-                        continue;
-                    }
+            //
+            // The scan works on the blocks of the table, so the rows are
+            // read in a few large reads instead of two reads and one
+            // decoding per row.
+            let filter_expr = sel.filter.clone();
+            let key = def.name.to_ascii_lowercase();
+            let state = self
+                .tables
+                .get_mut(&key)
+                .ok_or_else(|| SqlError::no_such_table(&def.name))?;
+            let store = &mut state.store;
+            let mut filter = |row_id: u64, _pk: i64, cols: &[Option<ColValue>]| -> SqlResult<bool> {
+                // The rows the transaction changed are measured separately,
+                // so the scan skips them.
+                if updated.contains(&row_id) || deleted.contains(&row_id) {
+                    return Ok(false);
                 }
-                let vec = match row.cols.get(topk.vector_index) {
-                    Some(ColValue::Vector(v)) => v,
-                    _ => continue,
-                };
-                let d = crate::vector::dist::l2_dispatch(vec.as_slice(), topk.query.as_slice());
-                candidates.push((row.pk, d, row.row_id));
+                match &filter_expr {
+                    Some(f) => eval_predicate(f, &RowValues::Scalars(cols), def),
+                    None => Ok(true),
+                }
+            };
+            let hits = crate::vector::exact::scan_exact_topk(
+                store,
+                topk.query.as_slice(),
+                topk.k,
+                Some(&mut filter),
+            )?;
+            for hit in hits {
+                candidates.push((hit.pk, hit.dist, hit.row_id));
             }
         }
 
         // Overlay the rows the index does not describe correctly: the rows
-        // staged by the transaction (inserted or updated) and the rows whose
-        // index entry is stale because their vector changed.
-        //
-        // The stale index copies are dropped first and the fresh values are
-        // added afterwards, so that a row that was updated is not lost
-        // between the two steps.
+        // Overlay the rows the transaction changed: the rows it inserted and
+        // the rows it updated. The scan and the index both skip them,
+        // because neither describes their current values.
         if use_index {
             // The indexed copy of an updated row is stale: the index still
             // holds the vector the row had before the transaction.
             candidates.retain(|(_, _, row_id)| !updated.contains(row_id));
-            for row in &rows {
-                let indexed_and_current = row.row_id < committed_rows
-                    && !updated.contains(&row.row_id)
-                    && !deleted.contains(&row.row_id);
-                if indexed_and_current {
+        }
+        {
+            let mut staged: Vec<(u64, Vec<ColValue>)> =
+                self.txn_buffer.inserted_of(table_id);
+            // An updated row replaces the committed one.
+            for (row_id, cols) in self.txn_buffer.updated_of(table_id) {
+                staged.push((row_id, cols));
+            }
+            for (row_id, cols) in staged {
+                if deleted.contains(&row_id) {
                     continue;
                 }
+                let pk = match cols.get(def.pk_index) {
+                    Some(ColValue::BigInt(i)) => *i,
+                    _ => continue,
+                };
+                let row = LiveRow { row_id, pk, cols };
                 if let Some(filter) = &sel.filter {
-                    if !self.eval_predicate(filter, row, def)? {
+                    if !eval_predicate(filter, &RowValues::Decoded(&row.cols), def)? {
                         continue;
                     }
                 }
@@ -536,8 +615,12 @@ impl Engine {
             }
         }
 
-        let mut out: Vec<Vec<Cell>> = Vec::with_capacity(candidates.len());
+        // Only the rows of the answer are materialised, so the rendering
+        // costs one read per row of the answer, not per row of the table.
+        let wanted: Vec<u64> = candidates.iter().map(|(_, _, row_id)| *row_id).collect();
+        let rows = self.materialize_rows(def, &wanted)?;
         let row_index = RowIndex::build(&rows);
+        let mut out: Vec<Vec<Cell>> = Vec::with_capacity(candidates.len());
         for (pk, _d, row_id) in &candidates {
             let row = match row_index.row(&rows, *row_id) {
                 Some(r) => r,
@@ -556,6 +639,64 @@ impl Engine {
         }
 
         Ok(QueryResult { columns, rows: out, affected: None })
+    }
+
+    /// Materialise the rows with the given identifiers.
+    ///
+    /// The rows that the current transaction changed are taken from the
+    /// transaction, the others from the storage.
+    fn materialize_rows(
+        &mut self,
+        def: &TableDef,
+        row_ids: &[u64],
+    ) -> SqlResult<Vec<LiveRow>> {
+        let key = def.name.to_ascii_lowercase();
+        let table_id = self.tables.get(&key).map(|t| t.id).unwrap_or(0);
+        let mut out = Vec::with_capacity(row_ids.len());
+
+        // The rows the transaction changed come first, so that they win
+        // over the committed values.
+        let mut staged: HashMap<u64, Vec<ColValue>> = HashMap::new();
+        for (row_id, cols) in self.txn_buffer.updated_of(table_id) {
+            staged.insert(row_id, cols);
+        }
+        for (row_id, cols) in self.txn_buffer.inserted_of(table_id) {
+            staged.insert(row_id, cols);
+        }
+        let deleted: HashSet<u64> = self
+            .txn_buffer
+            .deleted_of(table_id)
+            .into_iter()
+            .collect();
+
+        for row_id in row_ids {
+            if deleted.contains(row_id) {
+                continue;
+            }
+            if let Some(cols) = staged.get(row_id) {
+                let pk = match cols.get(def.pk_index) {
+                    Some(ColValue::BigInt(i)) => *i,
+                    _ => 0,
+                };
+                out.push(LiveRow { row_id: *row_id, pk, cols: cols.clone() });
+                continue;
+            }
+            let state = match self.tables.get_mut(&key) {
+                Some(s) => s,
+                None => continue,
+            };
+            let meta = match state.store.read_meta(*row_id)? {
+                Some(m) => m,
+                None => continue,
+            };
+            if meta.alive == 0 {
+                continue;
+            }
+            let image = state.store.read_columns(meta.col_offset, meta.col_len)?;
+            let cols = crate::storage::format::decode_row(&image)?;
+            out.push(LiveRow { row_id: *row_id, pk: meta.pk, cols });
+        }
+        Ok(out)
     }
 
     /// Whether a table has a vector index.
@@ -645,84 +786,7 @@ impl Engine {
         row: &LiveRow,
         def: &TableDef,
     ) -> SqlResult<EvalValue> {
-        match expr {
-            Expr::Int(i) => Ok(EvalValue::BigInt(*i)),
-            Expr::Str(s) => Ok(EvalValue::Text(s.clone())),
-            Expr::Num(n) => {
-                let f = crate::value::vector::parse_f32(n)?;
-                Ok(EvalValue::Distance(f))
-            }
-            Expr::Column(name) => {
-                let idx = def
-                    .column_index(name)
-                    .ok_or_else(|| SqlError::no_such_column(name))?;
-                self.column_at(row, def, idx)
-            }
-            Expr::Compare(l, op, r) => {
-                let lv = self.eval_expr(l, row, def)?;
-                let rv = self.eval_expr(r, row, def)?;
-                let ord = compare_values(&lv, &rv);
-                let res = match op {
-                    CmpOp::Eq => ord == std::cmp::Ordering::Equal,
-                    CmpOp::Ne => ord != std::cmp::Ordering::Equal,
-                    CmpOp::Lt => ord == std::cmp::Ordering::Less,
-                    CmpOp::LtEq => ord != std::cmp::Ordering::Greater,
-                    CmpOp::Gt => ord == std::cmp::Ordering::Greater,
-                    CmpOp::GtEq => ord != std::cmp::Ordering::Less,
-                };
-                Ok(EvalValue::Boolean(res))
-            }
-            Expr::BoolOp(l, op, r) => {
-                let lv = self.eval_expr(l, row, def)?;
-                let rv = self.eval_expr(r, row, def)?;
-                let lb = truthy(&lv);
-                let rb = truthy(&rv);
-                let res = match op {
-                    BoolOp::And => lb && rb,
-                    BoolOp::Or => lb || rb,
-                };
-                Ok(EvalValue::Boolean(res))
-            }
-            Expr::L2Distance(a, b) => {
-                // The first argument must be the vector column, the second a
-                // vector literal.
-                let (col_name, lit) = match (a.as_ref(), b.as_ref()) {
-                    (Expr::Column(c), other) => (c, other),
-                    (other, Expr::Column(c)) => (c, other),
-                    _ => {
-                        return Err(SqlError::not_supported(
-                            "L2_DISTANCE requires a vector column and a vector literal",
-                        ))
-                    }
-                };
-                let idx = def
-                    .column_index(col_name)
-                    .ok_or_else(|| SqlError::no_such_column(col_name))?;
-                if def.vector_column != Some(idx) {
-                    return Err(SqlError::not_supported(format!(
-                        "column '{col_name}' is not a vector column"
-                    )));
-                }
-                let stored = match row.cols.get(idx) {
-                    Some(ColValue::Vector(v)) => v.clone(),
-                    _ => {
-                        return Err(SqlError::internal(
-                            "vector column holds a non vector value",
-                        ))
-                    }
-                };                let query = match lit {
-                    Expr::Str(s) => Vector::parse_literal(s)?,
-                    _ => {
-                        return Err(SqlError::not_supported(
-                            "L2_DISTANCE requires a vector literal",
-                        ))
-                    }
-                };
-                query.check_dim(stored.dim)?;
-                let d = crate::vector::dist::l2_dispatch(stored.as_slice(), query.as_slice());
-                Ok(EvalValue::Distance(d))
-            }
-        }
+        eval_expr(expr, &RowValues::Decoded(&row.cols), def)
     }
 
     /// Read one column value of a row.
@@ -732,12 +796,7 @@ impl Engine {
         _def: &TableDef,
         idx: usize,
     ) -> SqlResult<EvalValue> {
-        match row.cols.get(idx) {
-            Some(ColValue::BigInt(i)) => Ok(EvalValue::BigInt(*i)),
-            Some(ColValue::Text(s)) => Ok(EvalValue::Text(s.clone())),
-            Some(ColValue::Vector(v)) => Ok(EvalValue::Vector(v.clone())),
-            None => Err(SqlError::internal("row is missing a column value")),
-        }
+        RowValues::Decoded(&row.cols).at(idx)
     }
 
     /// Evaluate a boolean predicate.
@@ -747,9 +806,102 @@ impl Engine {
         row: &LiveRow,
         def: &TableDef,
     ) -> SqlResult<bool> {
-        let v = self.eval_expr(expr, row, def)?;
-        Ok(truthy(&v))
+        eval_predicate(expr, &RowValues::Decoded(&row.cols), def)
     }
+}
+
+/// Evaluate an expression against a row.
+///
+/// The evaluation does not need the engine, so it is a free function: a
+/// scan can call it while it holds a mutable borrow of the storage.
+pub fn eval_expr(expr: &Expr, row: &RowValues<'_>, def: &TableDef) -> SqlResult<EvalValue> {
+    match expr {
+        Expr::Int(i) => Ok(EvalValue::BigInt(*i)),
+        Expr::Str(s) => Ok(EvalValue::Text(s.clone())),
+        Expr::Num(n) => {
+            let f = crate::value::vector::parse_f32(n)?;
+            Ok(EvalValue::Distance(f))
+        }
+        Expr::Column(name) => {
+            let idx = def
+                .column_index(name)
+                .ok_or_else(|| SqlError::no_such_column(name))?;
+            row.at(idx)
+        }
+        Expr::Compare(l, op, r) => {
+            let lv = eval_expr(l, row, def)?;
+            let rv = eval_expr(r, row, def)?;
+            let ord = compare_values(&lv, &rv);
+            let res = match op {
+                CmpOp::Eq => ord == std::cmp::Ordering::Equal,
+                CmpOp::Ne => ord != std::cmp::Ordering::Equal,
+                CmpOp::Lt => ord == std::cmp::Ordering::Less,
+                CmpOp::LtEq => ord != std::cmp::Ordering::Greater,
+                CmpOp::Gt => ord == std::cmp::Ordering::Greater,
+                CmpOp::GtEq => ord != std::cmp::Ordering::Less,
+            };
+            Ok(EvalValue::Boolean(res))
+        }
+        Expr::BoolOp(l, op, r) => {
+            let lv = eval_expr(l, row, def)?;
+            let rv = eval_expr(r, row, def)?;
+            let lb = truthy(&lv);
+            let rb = truthy(&rv);
+            let res = match op {
+                BoolOp::And => lb && rb,
+                BoolOp::Or => lb || rb,
+            };
+            Ok(EvalValue::Boolean(res))
+        }
+        Expr::L2Distance(a, b) => {
+            // The first argument must be the vector column, the second a
+            // vector literal.
+            let (col_name, lit) = match (a.as_ref(), b.as_ref()) {
+                (Expr::Column(c), other) => (c, other),
+                (other, Expr::Column(c)) => (c, other),
+                _ => {
+                    return Err(SqlError::not_supported(
+                        "L2_DISTANCE requires a vector column and a vector literal",
+                    ))
+                }
+            };
+            let idx = def
+                .column_index(col_name)
+                .ok_or_else(|| SqlError::no_such_column(col_name))?;
+            if def.vector_column != Some(idx) {
+                return Err(SqlError::not_supported(format!(
+                    "column '{col_name}' is not a vector column"
+                )));
+            }
+            let stored = match row.at(idx)? {
+                EvalValue::Vector(v) => v,
+                _ => {
+                    return Err(SqlError::internal("vector column holds a non vector value"))
+                }
+            };
+            let query = match lit {
+                Expr::Str(s) => Vector::parse_literal(s)?,
+                _ => {
+                    return Err(SqlError::not_supported(
+                        "L2_DISTANCE requires a vector literal",
+                    ))
+                }
+            };
+            query.check_dim(stored.dim)?;
+            let d = crate::vector::dist::l2_dispatch(stored.as_slice(), query.as_slice());
+            Ok(EvalValue::Distance(d))
+        }
+    }
+}
+
+/// Evaluate a boolean predicate against a row.
+pub fn eval_predicate(
+    expr: &Expr,
+    row: &RowValues<'_>,
+    def: &TableDef,
+) -> SqlResult<bool> {
+    let v = eval_expr(expr, row, def)?;
+    Ok(truthy(&v))
 }
 
 /// Interpret a value as a boolean.
