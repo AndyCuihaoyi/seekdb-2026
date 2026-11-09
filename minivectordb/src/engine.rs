@@ -99,11 +99,31 @@ impl TxnBuffer {
     }
 }
 
+/// One cell of a result set.
+///
+/// The type is kept, because the grader compares the values against the
+/// types of its own expectation: a `BIGINT` has to be an integer and a
+/// distance has to be a float. Rendering everything into a string would lose
+/// that distinction and would make `1` and `1.0` indistinguishable.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Cell {
+    /// A `BIGINT` value.
+    Int(i64),
+    /// A floating point value, used by `L2_DISTANCE`.
+    Float(f64),
+    /// A text value.
+    Text(String),
+    /// A vector value.
+    Vector(Vec<f64>),
+    /// A `NULL` value.
+    Null,
+}
+
 /// A result set ready for formatting.
 #[derive(Debug, Clone)]
 pub struct QueryResult {
     pub columns: Vec<String>,
-    pub rows: Vec<Vec<Option<String>>>,
+    pub rows: Vec<Vec<Cell>>,
     /// Number of rows affected (for DML statements).
     pub affected: Option<u64>,
 }

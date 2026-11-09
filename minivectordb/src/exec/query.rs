@@ -5,7 +5,7 @@
 
 use crate::catalog::TableDef;
 use crate::config::SearchMode;
-use crate::engine::{Engine, LiveRow, QueryResult};
+use crate::engine::{Cell, Engine, LiveRow, QueryResult};
 use crate::error::{SqlError, SqlResult};
 use crate::sql::ast::*;
 use crate::storage::table::ColValue;
@@ -66,6 +66,18 @@ impl EvalValue {
         match self {
             EvalValue::Vector(v) => Some(v),
             _ => None,
+        }
+    }
+
+    /// Convert the value into a result cell.
+    pub fn to_cell(&self) -> Cell {
+        match self {
+            EvalValue::BigInt(i) => Cell::Int(*i),
+            EvalValue::Text(s) => Cell::Text(s.clone()),
+            EvalValue::Vector(v) => Cell::Vector(v.as_slice().iter().map(|x| *x as f64).collect()),
+            EvalValue::Distance(d) => Cell::Float(*d as f64),
+            EvalValue::Boolean(b) => Cell::Int(if *b { 1 } else { 0 }),
+            EvalValue::Null => Cell::Null,
         }
     }
 
@@ -186,7 +198,7 @@ impl Engine {
         }
 
         // Materialise the projected values.
-        let mut out: Vec<Vec<Option<String>>> = Vec::with_capacity(selected.len());
+        let mut out: Vec<Vec<Cell>> = Vec::with_capacity(selected.len());
         let mut sort_keys: Vec<Vec<EvalValue>> = Vec::with_capacity(selected.len());
         for row in &selected {
             let mut values = Vec::with_capacity(projections.len());
@@ -195,7 +207,7 @@ impl Engine {
                     Projection::Column(idx) => self.column_at(row, &def, *idx)?,
                     Projection::Expr(e) => self.eval_expr(e, row, &def)?,
                 };
-                values.push(Some(v.render()));
+                values.push(v.to_cell());
             }
             out.push(values);
 
@@ -473,7 +485,7 @@ impl Engine {
             }
         }
 
-        let mut out: Vec<Vec<Option<String>>> = Vec::with_capacity(candidates.len());
+        let mut out: Vec<Vec<Cell>> = Vec::with_capacity(candidates.len());
         for (pk, _d, row_id) in &candidates {
             let row = match rows.iter().find(|r| r.row_id == *row_id) {
                 Some(r) => r,
@@ -485,7 +497,7 @@ impl Engine {
                     Projection::Column(idx) => self.column_at(row, def, *idx)?,
                     Projection::Expr(e) => self.eval_expr(e, row, def)?,
                 };
-                values.push(Some(v.render()));
+                values.push(v.to_cell());
             }
             let _ = pk;
             out.push(values);

@@ -14,6 +14,9 @@ pub enum OutputFormat {
     Tsv,
     /// One JSON object per row, then a JSON array terminator.
     Json,
+    /// One JSON object per statement, with the fields of the published
+    /// `.result` files.
+    Jsonl,
 }
 
 /// Where the readiness marker is emitted.
@@ -96,6 +99,7 @@ impl Config {
         if let Some(v) = env_string("MINIVECDB_OUTPUT_FORMAT") {
             self.output_format = match v.to_ascii_lowercase().as_str() {
                 "json" => OutputFormat::Json,
+                "jsonl" => OutputFormat::Jsonl,
                 _ => OutputFormat::Tsv,
             };
         }

@@ -62,6 +62,7 @@ fn main() {
             if let Some(v) = take_value(&mut i) {
                 cfg.output_format = match v.to_ascii_lowercase().as_str() {
                     "json" => config::OutputFormat::Json,
+                    "jsonl" => config::OutputFormat::Jsonl,
                     _ => config::OutputFormat::Tsv,
                 };
             }
