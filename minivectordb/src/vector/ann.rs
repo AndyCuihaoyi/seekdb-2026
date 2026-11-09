@@ -418,3 +418,75 @@ mod tests {
         assert!(hits.len() < 100);
     }
 }
+
+#[cfg(test)]
+mod pruning_tests {
+    use super::*;
+
+    /// A grid of points, so that the cells have a well defined radius.
+    fn grid(n: usize, step: f32) -> Vec<(u64, i64, Vec<f32>)> {
+        (0..n)
+            .map(|i| {
+                let f = i as f32;
+                (
+                    i as u64,
+                    i as i64,
+                    vec![f * step, (f * step).sin() * 2.0, (f * step).cos() * 2.0],
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_pruning_never_drops_a_better_answer() {
+        // Many cells, so that the pruning really fires, and a query that is
+        // far from most of the points.
+        let rows = grid(400, 1.0);
+        let index = IvfIndex::build(3, 32, &rows);
+        let queries = [
+            vec![0.0, 0.0, 0.0],
+            vec![100.0, 50.0, -50.0],
+            vec![-200.0, 3.0, 7.0],
+            vec![17.0, -3.0, 11.0],
+        ];
+        for query in queries {
+            let hits = index.search(&query, 10, None);
+            let mut brute: Vec<(i64, f32)> = rows
+                .iter()
+                .map(|(_, pk, v)| {
+                    let d: f32 = v
+                        .iter()
+                        .zip(query.iter())
+                        .map(|(a, b)| (a - b) * (a - b))
+                        .sum::<f32>()
+                        .sqrt();
+                    (*pk, d)
+                })
+                .collect();
+            brute.sort_by(|a, b| {
+                a.1.partial_cmp(&b.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.0.cmp(&b.0))
+            });
+            brute.truncate(10);
+            assert_eq!(hits.len(), 10);
+            for (i, (pk, _)) in brute.iter().enumerate() {
+                assert_eq!(hits[i].0, *pk, "query {:?}, rank {}", query, i);
+            }
+        }
+    }
+
+    #[test]
+    fn a_finite_nprobe_gives_an_approximate_answer() {
+        let rows = grid(400, 1.0);
+        let index = IvfIndex::build(3, 32, &rows);
+        let query = vec![0.0, 0.0, 0.0];
+        let exact = index.search(&query, 10, None);
+        let approximate = index.search(&query, 10, Some(2));
+        // The approximate answer is a subset of the exact one, because the
+        // cells are visited in the same order and only fewer of them are.
+        for (pk, _, _) in &approximate {
+            assert!(exact.iter().any(|(p, _, _)| p == pk));
+        }
+    }
+}
