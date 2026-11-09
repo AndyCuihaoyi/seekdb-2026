@@ -197,6 +197,9 @@ impl Engine {
         // the rows but not the tables.
         engine.restore_catalog()?;
         engine.recover()?;
+        // The vector files are a derived copy of the row images; a file left
+        // over from an older layout is rebuilt before anything reads it.
+        engine.rebuild_stale_vector_files()?;
         // Rebuild the vector indexes before the server is ready: the
         // statement requires that the database does not report readiness
         // while an index is still being rebuilt.
@@ -598,6 +601,63 @@ impl Engine {
                 index.remove(row_id);
             }
         }
+    }
+
+    /// Rebuild the vector files of every table whose vector file is stale.
+    ///
+    /// The vector file is a derived copy of the data: the authoritative copy
+    /// of a vector is the row image in `col.dat`. A vector file whose header
+    /// does not describe the current layout holds data that was written under
+    /// a different layout, so it is thrown away and written again from the
+    /// row images. This keeps an existing data directory usable across a
+    /// change of the on-disk layout.
+    pub(crate) fn rebuild_stale_vector_files(&mut self) -> SqlResult<()> {
+        let table_ids: Vec<u32> = self.tables.values().map(|t| t.id).collect();
+        for table_id in table_ids {
+            let (vector_index, dim) = {
+                let state = match self.tables.values().find(|t| t.id == table_id) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                match state.def.vector_column {
+                    Some(i) => (i, state.def.vector_dim().unwrap_or(0)),
+                    None => continue,
+                }
+            };
+            let stale = {
+                let state = match self.tables.values_mut().find(|t| t.id == table_id) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                state.store.vector_file_is_stale()?
+            };
+            if !stale {
+                continue;
+            }
+            let state = match self.tables.values_mut().find(|t| t.id == table_id) {
+                Some(s) => s,
+                None => continue,
+            };
+            state.store.reset_vector_file()?;
+            let count = state.store.row_count;
+            for row_id in 0..count {
+                let meta = match state.store.read_meta(row_id)? {
+                    Some(m) => m,
+                    None => continue,
+                };
+                if meta.alive == 0 {
+                    continue;
+                }
+                let image = state.store.read_columns(meta.col_offset, meta.col_len)?;
+                let cols = decode_row(&image)?;
+                let vec = match cols.get(vector_index) {
+                    Some(ColValue::Vector(v)) if v.dim == dim => v.clone(),
+                    _ => continue,
+                };
+                state.store.write_vector_at(&meta, vec.as_slice())?;
+            }
+        }
+        Ok(())
     }
 
     /// Rebuild the vector index of every table that is marked as indexed.
