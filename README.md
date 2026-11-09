@@ -135,6 +135,12 @@ key and `1366` for a value that cannot be converted.
 <data-dir>/<table>/index.dat      the marker that records a vector index
 ```
 
+The vector column is stored once, in `vec.dat`. The row image of a row in
+`col.dat` leaves the vector out and marks its place, so a column keeps its
+index. The write-ahead log holds the complete image, so a log record stays
+self contained and the recovery does not depend on the order in which the
+data files were flushed.
+
 The design of the storage, the index and the recovery is described in
 [docs/design.md](docs/design.md).
 
