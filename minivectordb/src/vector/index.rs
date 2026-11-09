@@ -11,10 +11,14 @@
 //!
 //! * the rebuild cost is paid at every start, which is charged to the
 //!   recovery time and the resource limits;
-//! * the index holds a copy of every vector, so it consumes memory
+//! * the index holds the identity of every row, so it consumes memory
 //!   proportional to the data set. The exact search path does not use it,
 //!   so a deployment that never switches to approximate mode never pays for
 //!   it either - and an index that was never created costs nothing.
+//!
+//! The index does *not* hold a copy of the vectors: it asks the storage for
+//! them when it needs a distance, and the storage reads them through its
+//! block cache.
 
 use crate::error::{SqlError, SqlResult};
 use crate::storage::table::{ColValue, TableStore};

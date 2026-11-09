@@ -307,15 +307,15 @@ impl TableStore {
     /// The returned vector holds one entry per slot of the block; the slots
     /// beyond the last row are absent, so its length is the number of rows
     /// the block really holds.
-    pub fn read_meta_block(&mut self, block: u32) -> io::Result<Vec<RowMeta>> {
+    pub fn read_meta_block(&mut self, block: u32) -> io::Result<Rc<Vec<RowMeta>>> {
         let first = block as u64 * self.block_rows as u64;
         if first >= self.row_count {
-            return Ok(Vec::new());
+            return Ok(Rc::new(Vec::new()));
         }
         let count = (self.row_count - first).min(self.block_rows as u64) as usize;
         let key = (self.file_id, block as u64);
         if let Some(hit) = self.directory_pool.borrow_mut().get(key) {
-            return Ok((*hit).clone());
+            return Ok(hit);
         }
         let mut buf = vec![0u8; count * ROW_META_SIZE];
         let n = read_at_up_to(&self.meta, &mut buf, first * ROW_META_SIZE as u64)?;
@@ -327,12 +327,9 @@ impl TableStore {
             out.push(decode_meta(chunk));
         }
         // The block is cached, so that the next scan does not decode it
-        // again. A block that is still being filled changes, so it is only
-        // cached once it is complete.
-        if out.len() == self.block_rows {
-            self.directory_pool.borrow_mut().put(key, out.clone());
-        }
-        Ok(out)
+        // again. A write to the block drops it from the cache, so a block
+        // that is still being filled is never served from a stale copy.
+        Ok(self.directory_pool.borrow_mut().put(key, out))
     }
 
     /// Read the row images of a whole block with one call.
@@ -390,10 +387,10 @@ impl TableStore {
         &mut self,
         block: u32,
         metas: &[RowMeta],
-    ) -> SqlResult<ScalarBlock> {
+    ) -> SqlResult<Rc<ScalarBlock>> {
         let key = (self.file_id, block as u64);
         if let Some(hit) = self.scalar_pool.borrow_mut().get(key) {
-            return Ok((*hit).clone());
+            return Ok(hit);
         }
         let (buf, offsets) = self.read_image_block(metas)?;
         let mut out = Vec::with_capacity(metas.len());
@@ -401,12 +398,48 @@ impl TableStore {
             let image = Self::image_at(&buf, &offsets, slot, meta.col_len);
             out.push(crate::storage::format::decode_row_scalars(image)?);
         }
-        // A block that is still being filled changes, so it is only cached
-        // once it is complete.
-        if metas.len() == self.block_rows {
-            self.scalar_pool.borrow_mut().put(key, out.clone());
+        // The block is cached, so that the next scan does not read and
+        // decode it again. A write to the block drops it from the cache, so
+        // a block that is still being filled is never served from a stale
+        // copy.
+        Ok(self.scalar_pool.borrow_mut().put(key, out))
+    }
+
+    /// The directory entry and the scalar columns of one row.
+    ///
+    /// Both come from the block caches, so a row of a block that is already
+    /// cached costs no system call at all.
+    ///
+    /// The columns are handed out as a shared reference to the whole block
+    /// together with the slot of the row, so that a caller that reads them
+    /// allocates nothing at all.
+    pub fn read_row_scalars(
+        &mut self,
+        row_id: u64,
+    ) -> SqlResult<Option<(RowMeta, Rc<ScalarBlock>, usize)>> {
+        let block = (row_id / self.block_rows as u64) as u32;
+        let slot = (row_id % self.block_rows as u64) as usize;
+        let metas = self.read_meta_block(block)?;
+        let meta = match metas.get(slot) {
+            Some(m) => *m,
+            None => return Ok(None),
+        };
+        let scalars = self.read_scalar_block(block, &metas)?;
+        if slot >= scalars.len() {
+            return Ok(None);
         }
-        Ok(out)
+        Ok(Some((meta, scalars, slot)))
+    }
+
+    /// The vector of one row, taken from the cached block matrix.
+    ///
+    /// The matrix of a block is read once and kept, so a row of a block that
+    /// is already cached costs a copy of `dim` floats and no system call.
+    pub fn read_vector_cached(&mut self, meta: &RowMeta) -> SqlResult<Vec<f32>> {
+        let matrix = self.block_matrix(meta.vec_block)?;
+        let start = meta.vec_slot as usize * self.dim;
+        let end = start + self.dim;
+        Ok(matrix[start..end].to_vec())
     }
 
     /// Recompute the row count from the directory (used at startup).

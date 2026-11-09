@@ -469,45 +469,65 @@ impl Engine {
             // satisfies the filter. Applying the filter after the scan would
             // be wrong: it would return fewer than K rows, and the rows it
             // would return would be the K nearest of the unfiltered set.
+            //
+            // The index does not hold the vectors, so the scan asks the
+            // storage for the distance of every row it visits. The vectors
+            // come from the block cache, so a row of a block that is already
+            // cached costs nothing.
             let filter = sel.filter.clone();
             let mut hits: Vec<(i64, f32, u64)> = Vec::new();
-            // The rows are collected before the index is borrowed, so that
-            // the two borrows of the engine do not overlap.
-            let rows = self.collect_rows(def)?;
-            // The row identifiers are dense, so the position of a row in the
-            // list is found through an array instead of a linear search.
-            let row_index = RowIndex::build(&rows);
-            let index = self.vector_index(table_id).expect("index checked above");
             let mut scan_error: Option<SqlError> = None;
-            index.scan_ordered(
-                topk.query.as_slice(),
-                self.config.ann_nprobe,
-                topk.k,
-                |row_id, _pk, _d| {
-                    // Rows changed by the transaction are excluded here; they
-                    // are measured below.
-                    if updated.contains(&row_id) || deleted.contains(&row_id) {
-                        return false;
-                    }
-                    let row = match row_index.row(&rows, row_id) {
-                        Some(r) => r,
-                        None => return false,
-                    };
-                    match &filter {
-                        Some(f) => match eval_predicate(f, &RowValues::Decoded(&row.cols), def) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                if scan_error.is_none() {
-                                    scan_error = Some(e);
-                                }
-                                false
+            // The index and the storage of the table live in the same place,
+            // so the index is taken out of it for the duration of the scan.
+            // It is put back at the end, whether the scan succeeded or not.
+            let key = def.name.to_ascii_lowercase();
+            let state = self
+                .tables
+                .get_mut(&key)
+                .ok_or_else(|| SqlError::no_such_table(&def.name))?;
+            let index = state.index.take().expect("index checked above");
+            let nprobe = self.config.ann_nprobe;
+            let query = topk.query.as_slice();
+            let mut fetch = |row_id: u64| -> SqlResult<Option<f32>> {
+                // Rows changed by the transaction are excluded here; they
+                // are measured below.
+                if updated.contains(&row_id) || deleted.contains(&row_id) {
+                    return Ok(None);
+                }
+                // The row is read through the block caches, so a row of a
+                // block that is already cached costs no system call.
+                let (meta, cols, slot) = match state.store.read_row_scalars(row_id)? {
+                    Some(r) => r,
+                    None => return Ok(None),
+                };
+                if meta.alive == 0 {
+                    return Ok(None);
+                }
+                // The filter is applied before the row enters the answer.
+                match &filter {
+                    Some(f) => match eval_predicate(f, &RowValues::Scalars(&cols[slot]), def) {
+                        Ok(true) => {}
+                        Ok(false) => return Ok(None),
+                        Err(e) => {
+                            if scan_error.is_none() {
+                                scan_error = Some(e);
                             }
-                        },
-                        None => true,
-                    }
-                },
-                &mut hits,
-            );
+                            return Ok(None);
+                        }
+                    },
+                    None => {}
+                }
+                // The vector of the row comes from the vector file, through
+                // the block cache.
+                let vec = state.store.read_vector_cached(&meta)?;
+                Ok(Some(crate::vector::dist::l2_dispatch(&vec, query)))
+            };
+            let scan = index.scan_ordered(query, nprobe, topk.k, &mut fetch, &mut hits);
+            // The index goes back into the table.
+            if let Some(state) = self.tables.get_mut(&key) {
+                state.index = Some(index);
+            }
+            scan?;
             if let Some(e) = scan_error {
                 return Err(e);
             }

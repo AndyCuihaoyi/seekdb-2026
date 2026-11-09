@@ -35,19 +35,34 @@
 //! add an iterative training phase whose cost is hard to bound; farthest point
 //! sampling still spreads the centroids over the data, which is what makes
 //! the radius bound useful.
+//!
+//! # The index does not hold the vectors
+//!
+//! An index that holds a copy of every vector costs `dim * 4` bytes per row
+//! on top of the storage: 552 bytes per row at a dimension of 128, which is
+//! 550 megabytes for a million rows. The vectors are already stored, in the
+//! vector file of the table, and they are read through the block cache
+//! anyway. So the index holds only the identity of a row - its identifier and
+//! its primary key, 16 bytes - and the scan asks the caller for the distance
+//! of a row when it needs one.
+//!
+//! The cell of a row is kept in a dense array, indexed by the row
+//! identifier. The identifiers of a table are handed out in order and are
+//! never reused, so the array needs no hashing and no search.
 
+use crate::error::SqlResult;
 use crate::vector::dist::l2_sq_dispatch;
-use std::collections::HashMap;
+
+/// The marker of a row that the index does not hold.
+const NO_CELL: u32 = u32::MAX;
 
 /// One indexed row.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct Entry {
     /// Identifier of the row in the table storage.
     pub row_id: u64,
     /// Primary key of the row.
     pub pk: i64,
-    /// The vector of the row.
-    pub vec: Vec<f32>,
 }
 
 /// An IVF-Flat index over one table.
@@ -66,23 +81,43 @@ pub struct IvfIndex {
     pub radii: Vec<f32>,
     /// The cell each row belongs to, so that a row can be removed without
     /// searching the cells.
-    cells: HashMap<u64, usize>,
+    ///
+    /// The array is indexed by the row identifier and holds [`NO_CELL`] for a
+    /// row that the index does not hold.
+    cell_of: Vec<u32>,
+    /// The position of a row inside its cell.
+    ///
+    /// It makes the removal of a row a constant time operation: the last
+    /// entry of the cell takes the place of the removed one.
+    pos_of: Vec<u32>,
 }
+
+/// A callback that measures the distance of a row to the query.
+///
+/// The callback returns the distance of the row, or `None` when the row does
+/// not belong to the answer - because it was changed by the transaction, or
+/// because it does not satisfy the filter of the query.
+pub type DistanceFetcher<'a> = &'a mut dyn FnMut(u64) -> SqlResult<Option<f32>>;
 
 impl IvfIndex {
     /// Build an index over the given rows.
     ///
-    /// `rows` are `(row_id, pk, vector)` triples. The index is empty when no
-    /// row is given.
+    /// `rows` are `(row_id, pk, vector)` triples. The vectors are used to
+    /// choose the centroids and to measure the radii, but they are not kept:
+    /// the index holds only the identity of the rows.
+    ///
+    /// The index is empty when no row is given.
     pub fn build(dim: usize, nlist: usize, rows: &[(u64, i64, Vec<f32>)]) -> IvfIndex {
         let nlist = nlist.max(1);
+        let max_id = rows.iter().map(|r| r.0).max().unwrap_or(0) as usize;
         let mut index = IvfIndex {
             dim,
             nlist,
             centroids: Vec::new(),
             lists: Vec::new(),
             radii: Vec::new(),
-            cells: HashMap::new(),
+            cell_of: vec![NO_CELL; max_id + 1],
+            pos_of: vec![NO_CELL; max_id + 1],
         };
         if rows.is_empty() {
             index.centroids = vec![vec![0.0f32; dim]; nlist];
@@ -123,10 +158,14 @@ impl IvfIndex {
     }
 
     /// Add a row to the index.
+    ///
+    /// The vector is used to find the cell of the row and to measure the
+    /// radius of that cell, but it is not kept.
     pub fn insert(&mut self, row_id: u64, pk: i64, vec: &[f32]) {
         let cell = self.assign(vec);
-        self.lists[cell].push(Entry { row_id, pk, vec: vec.to_vec() });
-        self.cells.insert(row_id, cell);
+        let pos = self.lists[cell].len() as u32;
+        self.lists[cell].push(Entry { row_id, pk });
+        self.remember(row_id, cell, pos);
         let radius = l2_sq_dispatch(&self.centroids[cell], vec).sqrt();
         if radius > self.radii[cell] {
             self.radii[cell] = radius;
@@ -138,21 +177,38 @@ impl IvfIndex {
     /// The radius of the cell is not shrunk, which only makes the bound
     /// weaker, never wrong.
     pub fn remove(&mut self, row_id: u64) -> bool {
-        let cell = match self.cells.remove(&row_id) {
-            Some(c) => c,
-            None => return false,
+        let cell = match self.cell_of.get(row_id as usize) {
+            Some(c) if *c != NO_CELL => *c as usize,
+            _ => return false,
         };
-        if let Some(list) = self.lists.get_mut(cell) {
-            if let Some(pos) = list.iter().position(|e| e.row_id == row_id) {
-                list.remove(pos);
-            }
+        let pos = self.pos_of[row_id as usize] as usize;
+        // The last entry of the cell takes the place of the removed one, so
+        // that the positions of the other entries stay valid.
+        let last = self.lists[cell].len() - 1;
+        self.lists[cell].swap(pos, last);
+        self.lists[cell].pop();
+        let moved = self.lists[cell].get(pos).map(|e| e.row_id);
+        if let Some(moved) = moved {
+            self.pos_of[moved as usize] = pos as u32;
         }
+        self.forget(row_id);
         true
     }
 
     /// Whether the index contains a row.
     pub fn contains(&self, row_id: u64) -> bool {
-        self.lists.iter().any(|l| l.iter().any(|e| e.row_id == row_id))
+        self.cell_of
+            .get(row_id as usize)
+            .map(|c| *c != NO_CELL)
+            .unwrap_or(false)
+    }
+
+    /// The cell a row belongs to, if the index holds it.
+    pub fn cell_of(&self, row_id: u64) -> Option<usize> {
+        match self.cell_of.get(row_id as usize) {
+            Some(c) if *c != NO_CELL => Some(*c as usize),
+            _ => None,
+        }
     }
 
     /// Search the `k` closest entries to `query`.
@@ -169,25 +225,25 @@ impl IvfIndex {
         query: &[f32],
         k: usize,
         nprobe: Option<usize>,
-    ) -> Vec<(i64, f32, u64)> {
+        fetch: DistanceFetcher<'_>,
+    ) -> SqlResult<Vec<(i64, f32, u64)>> {
         let mut out = Vec::new();
-        self.scan_ordered(query, nprobe, k, |_, _, _| true, &mut out);
+        self.scan_ordered(query, nprobe, k, fetch, &mut out)?;
         out.sort_by(|a, b| {
             a.1.partial_cmp(&b.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then(a.0.cmp(&b.0))
         });
         out.truncate(k);
-        out
+        Ok(out)
     }
 
     /// Scan the candidates in ascending distance order, keeping the ones the
     /// caller accepts.
     ///
-    /// The callback receives the row identifier, the primary key and the
-    /// distance of every candidate, in ascending distance order, and returns
-    /// whether the candidate belongs to the answer. The accepted candidates
-    /// are appended to `out`.
+    /// The callback receives the identifier of a row and returns its distance
+    /// to the query, or `None` when the row does not belong to the answer.
+    /// The rows that the callback accepts are appended to `out`.
     ///
     /// This is the primitive the filtered search needs: a cell is skipped
     /// only when its distance bound proves that **no** point of the cell can
@@ -199,11 +255,11 @@ impl IvfIndex {
         query: &[f32],
         nprobe: Option<usize>,
         k: usize,
-        mut accept: impl FnMut(u64, i64, f32) -> bool,
+        mut fetch: DistanceFetcher<'_>,
         out: &mut Vec<(i64, f32, u64)>,
-    ) {
+    ) -> SqlResult<()> {
         if k == 0 || self.is_empty() {
-            return;
+            return Ok(());
         }
 
         // Visit the cells in order of their centroid distance.
@@ -245,10 +301,11 @@ impl IvfIndex {
             }
 
             for entry in self.lists[*cell].iter() {
-                let d = l2_sq_dispatch(&entry.vec, query).sqrt();
-                if accept(entry.row_id, entry.pk, d) {
-                    best.push((entry.pk, d, entry.row_id));
-                }
+                let d = match fetch(entry.row_id)? {
+                    Some(d) => d,
+                    None => continue,
+                };
+                best.push((entry.pk, d, entry.row_id));
             }
             if best.len() > k {
                 best.sort_by(|a, b| {
@@ -261,6 +318,27 @@ impl IvfIndex {
         }
 
         out.append(&mut best);
+        Ok(())
+    }
+
+    /// Record the cell and the position of a row.
+    fn remember(&mut self, row_id: u64, cell: usize, pos: u32) {
+        let idx = row_id as usize;
+        if idx >= self.cell_of.len() {
+            self.cell_of.resize(idx + 1, NO_CELL);
+            self.pos_of.resize(idx + 1, NO_CELL);
+        }
+        self.cell_of[idx] = cell as u32;
+        self.pos_of[idx] = pos;
+    }
+
+    /// Forget a row.
+    fn forget(&mut self, row_id: u64) {
+        let idx = row_id as usize;
+        if idx < self.cell_of.len() {
+            self.cell_of[idx] = NO_CELL;
+            self.pos_of[idx] = NO_CELL;
+        }
     }
 }
 
@@ -315,11 +393,30 @@ mod tests {
         (id, pk, v.to_vec())
     }
 
+    /// A fetcher that answers with the distance of a row, taken from the
+    /// rows the index was built from.
+    fn fetcher<'a>(
+        rows: &'a [(u64, i64, Vec<f32>)],
+        query: &'a [f32],
+    ) -> impl FnMut(u64) -> SqlResult<Option<f32>> + 'a {
+        move |row_id| {
+            let (_, _, v) = rows
+                .iter()
+                .find(|(id, _, _)| *id == row_id)
+                .expect("the row is indexed");
+            Ok(Some(l2_sq_dispatch(v, query).sqrt()))
+        }
+    }
+
     #[test]
     fn empty_index_searches_nothing() {
         let index = IvfIndex::build(3, 4, &[]);
         assert!(index.is_empty());
-        assert!(index.search(&[0.0, 0.0, 0.0], 10, None).is_empty());
+        let mut f = |_row_id: u64| Ok(None);
+        assert!(index
+            .search(&[0.0, 0.0, 0.0], 10, None, &mut f)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -330,7 +427,10 @@ mod tests {
             row(2, 30, &[0.0, 10.0]),
         ];
         let index = IvfIndex::build(2, 3, &rows);
-        let hits = index.search(&[0.1, 0.0], 1, None);
+        let query = [0.1, 0.0];
+        let hits = index
+            .search(&query, 1, None, &mut fetcher(&rows, &query))
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, 10);
     }
@@ -345,7 +445,9 @@ mod tests {
             .collect();
         let index = IvfIndex::build(3, 8, &rows);
         let query = [1.0, 2.0, 3.0];
-        let hits = index.search(&query, 10, None);
+        let hits = index
+            .search(&query, 10, None, &mut fetcher(&rows, &query))
+            .unwrap();
 
         let mut brute: Vec<(i64, f32)> = rows
             .iter()
@@ -381,7 +483,10 @@ mod tests {
             row(1, 3, &[-1.0, 0.0]),
         ];
         let index = IvfIndex::build(2, 2, &rows);
-        let hits = index.search(&[0.0, 0.0], 2, None);
+        let query = [0.0, 0.0];
+        let hits = index
+            .search(&query, 2, None, &mut fetcher(&rows, &query))
+            .unwrap();
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].0, 3);
         assert_eq!(hits[1].0, 7);
@@ -407,13 +512,49 @@ mod tests {
     }
 
     #[test]
+    fn removing_a_row_keeps_the_other_rows_reachable() {
+        // Every row of a cell is removed one after the other, so that the
+        // positions of the remaining rows are checked as well.
+        let rows: Vec<(u64, i64, Vec<f32>)> = (0..20)
+            .map(|i| row(i, i as i64, &[i as f32 * 0.01, 0.0]))
+            .collect();
+        let mut index = IvfIndex::build(2, 1, &rows);
+        assert_eq!(index.len(), 20);
+        for id in 0..20u64 {
+            assert!(index.remove(id), "row {id} was not removed");
+            assert!(!index.contains(id));
+        }
+        assert_eq!(index.len(), 0);
+    }
+
+    #[test]
+    fn the_index_holds_no_copy_of_the_vectors() {
+        let rows: Vec<(u64, i64, Vec<f32>)> = (0..100)
+            .map(|i| row(i, i as i64, &[i as f32, 0.0, 0.0]))
+            .collect();
+        let index = IvfIndex::build(3, 4, &rows);
+        // The index holds the identity of the rows and the centroids, and
+        // nothing else.
+        let identities = index.lists.iter().map(|l| l.len()).sum::<usize>();
+        assert_eq!(identities, 100);
+        let centroid_bytes: usize = index.centroids.iter().map(|c| c.len() * 4).sum();
+        assert!(
+            centroid_bytes < 100 * 3 * 4,
+            "the centroids are larger than the data"
+        );
+    }
+
+    #[test]
     fn nprobe_limits_the_number_of_visited_cells() {
         let rows: Vec<(u64, i64, Vec<f32>)> = (0..100)
             .map(|i| row(i, i as i64, &[i as f32, 0.0]))
             .collect();
         let index = IvfIndex::build(2, 10, &rows);
         // A single cell cannot contain all the rows.
-        let hits = index.search(&[0.0, 0.0], 10, Some(1));
+        let query = [0.0, 0.0];
+        let hits = index
+            .search(&query, 10, Some(1), &mut fetcher(&rows, &query))
+            .unwrap();
         assert!(hits.len() <= 10);
         assert!(hits.len() < 100);
     }
@@ -437,6 +578,20 @@ mod pruning_tests {
             .collect()
     }
 
+    /// A fetcher that answers with the distance of a row.
+    fn fetcher<'a>(
+        rows: &'a [(u64, i64, Vec<f32>)],
+        query: &'a [f32],
+    ) -> impl FnMut(u64) -> SqlResult<Option<f32>> + 'a {
+        move |row_id| {
+            let (_, _, v) = rows
+                .iter()
+                .find(|(id, _, _)| *id == row_id)
+                .expect("the row is indexed");
+            Ok(Some(l2_sq_dispatch(v, query).sqrt()))
+        }
+    }
+
     #[test]
     fn the_pruning_never_drops_a_better_answer() {
         // Many cells, so that the pruning really fires, and a query that is
@@ -450,7 +605,9 @@ mod pruning_tests {
             vec![17.0, -3.0, 11.0],
         ];
         for query in queries {
-            let hits = index.search(&query, 10, None);
+            let hits = index
+                .search(&query, 10, None, &mut fetcher(&rows, &query))
+                .unwrap();
             let mut brute: Vec<(i64, f32)> = rows
                 .iter()
                 .map(|(_, pk, v)| {
@@ -481,8 +638,12 @@ mod pruning_tests {
         let rows = grid(400, 1.0);
         let index = IvfIndex::build(3, 32, &rows);
         let query = vec![0.0, 0.0, 0.0];
-        let exact = index.search(&query, 10, None);
-        let approximate = index.search(&query, 10, Some(2));
+        let exact = index
+            .search(&query, 10, None, &mut fetcher(&rows, &query))
+            .unwrap();
+        let approximate = index
+            .search(&query, 10, Some(2), &mut fetcher(&rows, &query))
+            .unwrap();
         // The approximate answer is a subset of the exact one, because the
         // cells are visited in the same order and only fewer of them are.
         for (pk, _, _) in &approximate {
