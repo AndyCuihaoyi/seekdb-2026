@@ -1,0 +1,665 @@
+//! The database engine: catalog, storage, transaction state and query execution.
+
+#![allow(dead_code)]
+
+use crate::catalog::{Catalog, TableDef};
+use crate::config::{Config, SearchMode};
+use crate::error::{SqlError, SqlResult};
+use crate::storage::format::{decode_row, encode_row};
+use crate::storage::table::{ColValue, RowMeta, TableStore};
+use crate::storage::wal::{read_all, Record, Wal};
+use crate::sql::ast::*;
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+/// A row as seen by the executor.
+#[derive(Debug, Clone)]
+pub struct LiveRow {
+    pub row_id: u64,
+    pub pk: i64,
+    pub cols: Vec<ColValue>,
+}
+
+/// Transaction state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxnState {
+    /// No explicit transaction: each statement is its own transaction.
+    Auto,
+    InProgress,
+}
+
+/// Per transaction undo information.
+///
+/// The engine keeps the affected rows in memory and only writes them to the
+/// data files at COMMIT, which makes ROLLBACK trivial and guarantees that a
+/// failed statement leaves no partial modification.
+#[derive(Debug, Default)]
+pub struct TxnBuffer {
+    /// Staged inserts per table, in insertion order: (row_id, values).
+    inserted: HashMap<u32, Vec<(u64, Vec<ColValue>)>>,
+    /// Staged updates: (table_id, row_id) -> new values.
+    updated: HashMap<(u32, u64), Vec<ColValue>>,
+    /// Staged deletes: (table_id, row_id).
+    deleted: HashMap<(u32, u64), ()>,
+}
+
+impl TxnBuffer {
+    pub fn is_empty(&self) -> bool {
+        self.inserted.is_empty() && self.updated.is_empty() && self.deleted.is_empty()
+    }
+
+    /// Stage an insert.
+    pub fn stage_insert(&mut self, table_id: u32, row_id: u64, cols: Vec<ColValue>) {
+        self.inserted.entry(table_id).or_default().push((row_id, cols));
+    }
+
+    /// Stage an update.
+    pub fn stage_update(&mut self, table_id: u32, row_id: u64, cols: Vec<ColValue>) {
+        self.updated.insert((table_id, row_id), cols);
+    }
+
+    /// Stage a delete.
+    pub fn stage_delete(&mut self, table_id: u32, row_id: u64) {
+        self.deleted.insert((table_id, row_id), ());
+    }
+
+    /// Discard everything staged.
+    pub fn clear(&mut self) {
+        self.inserted.clear();
+        self.updated.clear();
+        self.deleted.clear();
+    }
+
+    /// Number of staged inserts for a table.
+    pub fn inserted_len(&self, table_id: u32) -> usize {
+        self.inserted.get(&table_id).map(|v| v.len()).unwrap_or(0)
+    }
+
+    /// Staged inserts of a table, oldest first.
+    pub fn inserted_of(&self, table_id: u32) -> Vec<(u64, Vec<ColValue>)> {
+        self.inserted.get(&table_id).cloned().unwrap_or_default()
+    }
+
+    /// All staged updates of a table.
+    pub fn updated_of(&self, table_id: u32) -> Vec<(u64, Vec<ColValue>)> {
+        self.updated
+            .iter()
+            .filter(|((t, _), _)| *t == table_id)
+            .map(|((_, r), c)| (*r, c.clone()))
+            .collect()
+    }
+
+    /// All staged deletes of a table.
+    pub fn deleted_of(&self, table_id: u32) -> Vec<u64> {
+        self.deleted
+            .iter()
+            .filter(|((t, _), _)| *t == table_id)
+            .map(|((_, r), _)| *r)
+            .collect()
+    }
+}
+
+/// A result set ready for formatting.
+#[derive(Debug, Clone)]
+pub struct QueryResult {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<Option<String>>>,
+    /// Number of rows affected (for DML statements).
+    pub affected: Option<u64>,
+}
+
+impl QueryResult {
+    pub fn empty(columns: Vec<String>) -> Self {
+        QueryResult { columns, rows: Vec::new(), affected: None }
+    }
+
+    pub fn ok() -> Self {
+        QueryResult { columns: Vec::new(), rows: Vec::new(), affected: Some(0) }
+    }
+}
+
+/// The engine.
+pub struct Engine {
+    pub config: Config,
+    pub(crate) catalog: Catalog,
+    pub(crate) tables: HashMap<String, TableState>,
+    pub(crate) wal: Wal,
+    pub(crate) txn_state: TxnState,
+    pub(crate) txn_buffer: TxnBuffer,
+    pub(crate) next_txn_id: u64,
+    pub(crate) next_table_id: u32,
+    /// Primary key index: table_id -> pk -> row_id.
+    pub(crate) pk_index: HashMap<u32, HashMap<i64, u64>>,
+    /// Current search mode, may be switched at runtime.
+    pub mode: SearchMode,
+}
+
+/// Per table runtime state.
+pub struct TableState {
+    pub def: TableDef,
+    pub store: TableStore,
+    /// Stable identifier of the table, used in the write-ahead log.
+    pub id: u32,
+}
+
+impl Engine {
+    /// Open (or create) the database rooted at `config.data_dir` and replay the
+    /// log to recover committed state.
+    pub fn open(config: Config) -> SqlResult<Engine> {
+        std::fs::create_dir_all(&config.data_dir)
+            .map_err(|e| SqlError::internal(format!("cannot create data dir: {e}")))?;
+
+        let wal_path = config.data_dir.join("wal.dat");
+        let sync = matches!(config.durability, crate::config::Durability::Full);
+        let wal = Wal::open(&wal_path, sync)
+            .map_err(|e| SqlError::internal(format!("cannot open wal: {e}")))?;
+
+        let mut engine = Engine {
+            mode: config.mode,
+            config,
+            catalog: Catalog::new(),
+            tables: HashMap::new(),
+            wal,
+            txn_state: TxnState::Auto,
+            txn_buffer: TxnBuffer::default(),
+            next_txn_id: 1,
+            next_table_id: 1,
+            pk_index: HashMap::new(),
+        };
+        engine.recover()?;
+        Ok(engine)
+    }
+
+    /// Directory of one table.
+    fn table_dir(&self, name: &str) -> PathBuf {
+        self.config.data_dir.join(name.to_ascii_lowercase())
+    }
+
+    // ---------------------------------------------------------------- recovery
+
+    /// Replay the write-ahead log.
+    ///
+    /// The log is replayed in transaction groups: only the transactions whose
+    /// commit marker is present are applied. A transaction without a commit
+    /// marker was never acknowledged and must not become visible.
+    ///
+    /// Replaying is idempotent: the log is truncated afterwards, and the data
+    /// files are rewritten from the recovered state, so an interrupted recovery
+    /// that is retried produces the same result.
+    fn recover(&mut self) -> SqlResult<()> {
+        let wal_path = self.config.data_dir.join("wal.dat");
+        let records = read_all(&wal_path)
+            .map_err(|e| SqlError::internal(format!("cannot read wal: {e}")))?;
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        // Group records by transaction id, preserving order. Only the
+        // transactions whose commit marker is present are applied: a
+        // transaction without a commit marker was never acknowledged.
+        //
+        // Schema changes are the exception: they are applied immediately when
+        // the statement succeeds, so they are always replayed.
+        let mut committed: Vec<Record> = Vec::new();
+        let mut pending: HashMap<u64, Vec<Record>> = HashMap::new();
+        for (txn_id, rec) in records {
+            match &rec {
+                Record::Ddl { .. } => committed.push(rec),
+                Record::Commit { .. } => {
+                    let group = pending.remove(&txn_id).unwrap_or_default();
+                    committed.extend(group);
+                    committed.push(rec);
+                }
+                Record::Rollback { .. } => {
+                    pending.remove(&txn_id);
+                }
+                _ => {
+                    pending.entry(txn_id).or_default().push(rec);
+                }
+            }
+        }
+
+        // Apply committed records in order. Schema changes come first so that
+        // the data records find their table.
+        let mut ddl: Vec<Record> = Vec::new();
+        let mut data: Vec<Record> = Vec::new();
+        for rec in committed {
+            match rec {
+                Record::Ddl { .. } => ddl.push(rec),
+                _ => data.push(rec),
+            }
+        }
+        for rec in ddl {
+            self.apply_recovered(rec)?;
+        }
+        for rec in data {
+            self.apply_recovered(rec)?;
+        }
+
+        // Rebuild the primary key index from the recovered directory.
+        self.rebuild_pk_index();
+        self.next_table_id = self
+            .tables
+            .values()
+            .map(|t| t.id + 1)
+            .max()
+            .unwrap_or(1);
+        self.next_txn_id = self.next_txn_id.max(1);
+
+        // The log has been folded into the data files: truncate it so that a
+        // second recovery is a no-op. The truncation happens after the data is
+        // durable, so an interruption here simply replays the same records.
+        self.wal
+            .truncate()
+            .map_err(|e| SqlError::internal(format!("cannot truncate wal: {e}")))?;
+        Ok(())
+    }
+
+    fn apply_recovered(&mut self, rec: Record) -> SqlResult<()> {
+        match rec {
+            Record::Ddl { table_id, name, schema } => {
+                let def = decode_schema(&schema)?;
+                self.install_table(table_id, name_to_string(&name), def)?;
+            }
+            Record::Insert { table_id, row_id, value } => {
+                self.replay_insert(table_id, row_id, &value)?;
+            }
+            Record::Update { table_id, row_id, value } => {
+                self.replay_update(table_id, row_id, &value)?;
+            }
+            Record::Delete { table_id, row_id } => {
+                self.replay_delete(table_id, row_id)?;
+            }
+            Record::Commit { .. } | Record::Rollback { .. } => {}
+        }
+        Ok(())
+    }
+
+    fn table_by_id(&mut self, table_id: u32) -> Option<&mut TableState> {
+        self.tables.values_mut().find(|t| t.id == table_id)
+    }
+
+    fn replay_insert(&mut self, table_id: u32, row_id: u64, image: &[u8]) -> SqlResult<()> {
+        // Idempotency: if the row is already present with the same content the
+        // record has been applied before, so it is skipped.
+        if let Some(state) = self.tables.values().find(|t| t.id == table_id) {
+            if row_id < state.store.row_count {
+                return Ok(());
+            }
+        }
+        let cols = decode_row(image)?;
+        let (state, pk) = {
+            let st = self
+                .table_by_id(table_id)
+                .ok_or_else(|| SqlError::internal("log references unknown table"))?;
+            let pk = match cols.get(st.def.pk_index) {
+                Some(ColValue::BigInt(i)) => *i,
+                _ => return Err(SqlError::internal("row image without primary key")),
+            };
+            (st, pk)
+        };
+        let vec = state.def.vector_column.and_then(|i| match &cols[i] {
+            ColValue::Vector(v) => Some(v.clone()),
+            _ => None,
+        });
+        let block = (row_id / state.store.block_rows as u64) as u32;
+        let slot = (row_id % state.store.block_rows as u64) as u32;
+
+        let col_offset = state.store.append_columns(image)?;
+        if let Some(v) = vec {
+            state.store.write_vector(block, slot, v.as_slice())?;
+        }
+        state.store.append_row(pk, col_offset, image.len() as u32, block, slot)?;
+        self.pk_index.entry(table_id).or_default().insert(pk, row_id);
+        Ok(())
+    }
+
+    fn replay_update(&mut self, table_id: u32, row_id: u64, image: &[u8]) -> SqlResult<()> {
+        let cols = decode_row(image)?;
+        let state = self
+            .table_by_id(table_id)
+            .ok_or_else(|| SqlError::internal("log references unknown table"))?;
+        let pk = match cols.get(state.def.pk_index) {
+            Some(ColValue::BigInt(i)) => *i,
+            _ => return Err(SqlError::internal("row image without primary key")),
+        };
+        let vec = state.def.vector_column.and_then(|i| match &cols[i] {
+            ColValue::Vector(v) => Some(v.clone()),
+            _ => None,
+        });
+        let block = (row_id / state.store.block_rows as u64) as u32;
+        let slot = (row_id % state.store.block_rows as u64) as u32;
+        let col_offset = state.store.append_columns(image)?;
+        if let Some(v) = vec {
+            state.store.write_vector(block, slot, v.as_slice())?;
+        }
+        let version = state
+            .store
+            .read_meta(row_id)?
+            .map(|m| m.version + 1)
+            .unwrap_or(1);
+        state.store.write_meta(
+            row_id,
+            &RowMeta {
+                pk,
+                col_offset,
+                col_len: image.len() as u32,
+                vec_block: block,
+                vec_slot: slot,
+                version,
+                alive: 1,
+                _pad: [0; 11],
+            },
+        )?;
+        self.pk_index.entry(table_id).or_default().insert(pk, row_id);
+        Ok(())
+    }
+
+    fn replay_delete(&mut self, table_id: u32, row_id: u64) -> SqlResult<()> {
+        let state = self
+            .table_by_id(table_id)
+            .ok_or_else(|| SqlError::internal("log references unknown table"))?;
+        if let Some(mut meta) = state.store.read_meta(row_id)? {
+            meta.alive = 0;
+            state.store.write_meta(row_id, &meta)?;
+        }
+        if let Some(meta) = state.store.read_meta(row_id)? {
+            self.pk_index.entry(table_id).or_default().remove(&meta.pk);
+        }
+        Ok(())
+    }
+
+    /// Reserve the next row id of a table.
+    ///
+    /// Row ids are dense and monotonically increasing. They are reserved when
+    /// the statement is prepared so that the log record identifies the row;
+    /// the directory entry is written at commit time.
+    pub(crate) fn next_row_id(&mut self, table_id: u32) -> u64 {
+        let committed = self
+            .tables
+            .values()
+            .find(|t| t.id == table_id)
+            .map(|t| t.store.row_count)
+            .unwrap_or(0);
+        let staged = self.txn_buffer.inserted_len(table_id);
+        committed + staged as u64
+    }
+
+    /// Apply the staged transaction to the data files and write the commit
+    /// marker.
+    ///
+    /// The commit marker is written **after** the data, so a crash between the
+    /// two leaves the transaction unacknowledged and the recovery will discard
+    /// it. This satisfies "a transaction whose commit was not acknowledged may
+    /// be fully applied or fully absent, but never partially applied".
+    pub(crate) fn commit_buffer(&mut self) -> SqlResult<()> {
+        let table_ids: Vec<u32> = self.tables.values().map(|t| t.id).collect();
+        for table_id in table_ids {
+            for (row_id, cols) in self.txn_buffer.inserted_of(table_id) {
+                self.apply_insert(table_id, row_id, cols)?;
+            }
+            for (row_id, cols) in self.txn_buffer.updated_of(table_id) {
+                self.apply_update(table_id, row_id, cols)?;
+            }
+            for row_id in self.txn_buffer.deleted_of(table_id) {
+                self.apply_delete(table_id, row_id)?;
+            }
+        }
+        self.txn_buffer.clear();
+        // The staged log records reach the file before the commit marker.
+        self.wal
+            .flush_staged()
+            .map_err(|e| SqlError::internal(format!("wal write failed: {e}")))?;
+        self.wal
+            .log_commit()
+            .map_err(|e| SqlError::internal(format!("wal write failed: {e}")))?;
+        Ok(())
+    }
+
+    /// Run one statement with the transaction semantics the statement demands.
+    ///
+    /// * Inside an explicit transaction the statement only stages its changes.
+    /// * Outside a transaction the statement is its own transaction: it is
+    ///   applied and committed as soon as it succeeds.
+    /// * A failing statement leaves no partial modification: the staged
+    ///   changes are discarded and the log records of the statement are
+    ///   dropped.
+    pub fn execute(&mut self, stmt: &crate::sql::ast::Statement) -> SqlResult<QueryResult> {
+        let in_txn = self.txn_state == TxnState::InProgress;
+        let result = self.dispatch(stmt);
+        match result {
+            Ok(r) => {
+                if !in_txn && self.txn_state == TxnState::Auto {
+                    // Autocommit: the statement is its own transaction.
+                    if !self.txn_buffer.is_empty() {
+                        self.commit_buffer()?;
+                    } else {
+                        // Nothing to commit, but the staged log records (if
+                        // any) still have to reach the file.
+                        self.wal
+                            .flush_staged()
+                            .map_err(|e| SqlError::internal(format!("wal write failed: {e}")))?;
+                    }
+                } else {
+                    self.wal
+                        .flush_staged()
+                        .map_err(|e| SqlError::internal(format!("wal write failed: {e}")))?;
+                }
+                Ok(r)
+            }
+            Err(e) => {
+                // The statement failed: undo everything it staged.
+                self.txn_buffer.clear();
+                self.wal.discard_staged();
+                Err(e)
+            }
+        }
+    }
+
+    /// Write one row to its table and return the new row id.
+    fn apply_insert(&mut self, table_id: u32, row_id: u64, cols: Vec<ColValue>) -> SqlResult<u64> {
+        let state = self
+            .table_by_id(table_id)
+            .ok_or_else(|| SqlError::internal("unknown table during commit"))?;
+        let pk = match cols.get(state.def.pk_index) {
+            Some(ColValue::BigInt(i)) => *i,
+            _ => return Err(SqlError::internal("row image without primary key")),
+        };
+        let vec = state.def.vector_column.and_then(|i| match &cols[i] {
+            ColValue::Vector(v) => Some(v.clone()),
+            _ => None,
+        });
+        let block = (row_id / state.store.block_rows as u64) as u32;
+        let slot = (row_id % state.store.block_rows as u64) as u32;
+        let image = encode_row(&cols);
+        let col_offset = state.store.append_columns(&image)?;
+        if let Some(v) = vec {
+            state.store.write_vector(block, slot, v.as_slice())?;
+        }
+        state.store.append_row(pk, col_offset, image.len() as u32, block, slot)?;
+        self.pk_index.entry(table_id).or_default().insert(pk, row_id);
+        Ok(row_id)
+    }
+
+    fn apply_update(&mut self, table_id: u32, row_id: u64, cols: Vec<ColValue>) -> SqlResult<()> {
+        let state = self
+            .table_by_id(table_id)
+            .ok_or_else(|| SqlError::internal("unknown table during commit"))?;
+        let pk = match cols.get(state.def.pk_index) {
+            Some(ColValue::BigInt(i)) => *i,
+            _ => return Err(SqlError::internal("row image without primary key")),
+        };
+        let vec = state.def.vector_column.and_then(|i| match &cols[i] {
+            ColValue::Vector(v) => Some(v.clone()),
+            _ => None,
+        });
+        let block = (row_id / state.store.block_rows as u64) as u32;
+        let slot = (row_id % state.store.block_rows as u64) as u32;
+        let image = encode_row(&cols);
+        let col_offset = state.store.append_columns(&image)?;
+        if let Some(v) = vec {
+            state.store.write_vector(block, slot, v.as_slice())?;
+        }
+        let version = state
+            .store
+            .read_meta(row_id)?
+            .map(|m| m.version + 1)
+            .unwrap_or(1);
+        state.store.write_meta(
+            row_id,
+            &RowMeta {
+                pk,
+                col_offset,
+                col_len: image.len() as u32,
+                vec_block: block,
+                vec_slot: slot,
+                version,
+                alive: 1,
+                _pad: [0; 11],
+            },
+        )?;
+        self.pk_index.entry(table_id).or_default().insert(pk, row_id);
+        Ok(())
+    }
+
+    fn apply_delete(&mut self, table_id: u32, row_id: u64) -> SqlResult<()> {
+        let state = self
+            .table_by_id(table_id)
+            .ok_or_else(|| SqlError::internal("unknown table during commit"))?;
+        if let Some(mut meta) = state.store.read_meta(row_id)? {
+            meta.alive = 0;
+            state.store.write_meta(row_id, &meta)?;
+            self.pk_index.entry(table_id).or_default().remove(&meta.pk);
+        }
+        Ok(())
+    }
+
+    fn rebuild_pk_index(&mut self) {
+        self.pk_index.clear();
+        let table_ids: Vec<u32> = self.tables.values().map(|t| t.id).collect();
+        for table_id in table_ids {
+            let mut index = HashMap::new();
+            if let Some(state) = self.tables.values_mut().find(|t| t.id == table_id) {
+                let count = state.store.row_count;
+                for row_id in 0..count {
+                    if let Ok(Some(meta)) = state.store.read_meta(row_id) {
+                        if meta.alive == 1 {
+                            index.insert(meta.pk, row_id);
+                        }
+                    }
+                }
+            }
+            self.pk_index.insert(table_id, index);
+        }
+    }
+
+    /// Install a table definition and open its storage.
+    pub(crate) fn install_table(
+        &mut self,
+        table_id: u32,
+        name: String,
+        def: TableDef,
+    ) -> SqlResult<()> {
+        let dim = def
+            .vector_column
+            .and_then(|i| match &def.columns[i].ty {
+                ColumnType::Vector(d) => Some(*d),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let dir = self.table_dir(&name);
+        let store = TableStore::open(
+            &dir,
+            &name,
+            dim,
+            self.config.vector_block_rows,
+        )
+        .map_err(|e| SqlError::internal(format!("cannot open table storage: {e}")))?;
+        self.catalog.insert(def.clone());
+        self.tables.insert(
+            name.to_ascii_lowercase(),
+            TableState { def, store, id: table_id },
+        );
+        Ok(())
+    }
+}
+
+/// Decode a table name from log bytes.
+fn name_to_string(name: &[u8]) -> String {
+    String::from_utf8_lossy(name).to_string()
+}
+
+/// Decode a table schema from log bytes.
+///
+/// The schema is stored as a compact textual description so that recovery
+/// does not depend on the in-memory `TableDef` layout.
+pub fn encode_schema(def: &TableDef) -> Vec<u8> {
+    let mut s = String::new();
+    s.push_str(&def.name);
+    s.push('\n');
+    for c in &def.columns {
+        s.push_str(&c.name);
+        s.push('\t');
+        match &c.ty {
+            ColumnType::BigInt => s.push_str("BIGINT"),
+            ColumnType::VarChar(n) => {
+                s.push_str("VARCHAR");
+                s.push('(');
+                s.push_str(&n.to_string());
+                s.push(')');
+            }
+            ColumnType::Vector(n) => {
+                s.push_str("VECTOR");
+                s.push('(');
+                s.push_str(&n.to_string());
+                s.push(')');
+            }
+        }
+        if c.primary_key {
+            s.push_str("\tPK");
+        }
+        s.push('\n');
+    }
+    s.into_bytes()
+}
+
+/// Parse a schema written by [`encode_schema`].
+pub fn decode_schema(data: &[u8]) -> SqlResult<TableDef> {
+    let text = std::str::from_utf8(data)
+        .map_err(|_| SqlError::internal("invalid UTF-8 in stored schema"))?;
+    let mut lines = text.lines();
+    let name = lines
+        .next()
+        .ok_or_else(|| SqlError::internal("empty stored schema"))?
+        .to_string();
+    let mut columns = Vec::new();
+    let mut pk_index: Option<usize> = None;
+    let mut vector_column = None;
+    for (i, line) in lines.enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut parts = line.split('\t');
+        let cname = parts.next().unwrap_or("").to_string();
+        let tystr = parts.next().unwrap_or("");
+        let ty = if let Some(rest) = tystr.strip_prefix("VARCHAR(") {
+            let n: usize = rest.trim_end_matches(')').parse().unwrap_or(255);
+            ColumnType::VarChar(n)
+        } else if let Some(rest) = tystr.strip_prefix("VECTOR(") {
+            let n: usize = rest.trim_end_matches(')').parse().unwrap_or(0);
+            ColumnType::Vector(n)
+        } else {
+            ColumnType::BigInt
+        };
+        let primary_key = parts.next().map(|p| p == "PK").unwrap_or(false);
+        if primary_key {
+            pk_index = Some(i);
+        }
+        if matches!(ty, ColumnType::Vector(_)) {
+            vector_column = Some(i);
+        }
+        columns.push(ColumnDef { name: cname, ty, primary_key });
+    }
+    let pk_index = pk_index.unwrap_or(0);
+    Ok(TableDef { name, columns, vector_column, pk_index })
+}

@@ -1,0 +1,23 @@
+[package]
+name = "minivectordb"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "MiniVectorDB - a lightweight single-process vector database with SQL, persistence, transactions and crash recovery"
+
+# NOTE: zero external dependencies on purpose.
+# The competition runtime is offline, so every dependency must be vendored or
+# avoided. Keeping the dependency graph empty lets `cargo build --offline`
+# succeed unconditionally in the evaluation container.
+[dependencies]
+
+[[bin]]
+name = "minivectordb"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "unwind"
+strip = true
