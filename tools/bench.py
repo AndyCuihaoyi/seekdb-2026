@@ -473,6 +473,7 @@ def main():
     else:
         shutil.rmtree(args.data_dir, ignore_errors=True)
         os.makedirs(args.data_dir, exist_ok=True)
+        data_dir = args.data_dir
     data_dir = os.path.abspath(data_dir)
 
     try:
