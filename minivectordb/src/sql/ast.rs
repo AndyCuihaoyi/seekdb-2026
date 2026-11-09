@@ -117,6 +117,11 @@ pub struct Delete {
 pub struct CreateTable {
     pub table: String,
     pub columns: Vec<ColumnDef>,
+    /// Whether the statement carried `IF NOT EXISTS`.
+    ///
+    /// The flag makes the statement idempotent: creating a table that
+    /// already exists is a success instead of an error.
+    pub if_not_exists: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

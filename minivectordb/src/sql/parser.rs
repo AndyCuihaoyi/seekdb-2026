@@ -210,10 +210,14 @@ impl Parser {
             ));
         }
         self.eat_keyword("TABLE");
+        // `CREATE TABLE IF NOT EXISTS` is idempotent: the flag makes the
+        // statement a success when the table is already there.
+        let mut if_not_exists = false;
         if self.peek().is_keyword("IF") {
-            return Err(SqlError::not_supported(
-                "CREATE TABLE IF NOT EXISTS is not supported by MiniVectorDB",
-            ));
+            self.pos += 1;
+            self.expect_keyword("NOT")?;
+            self.expect_keyword("EXISTS")?;
+            if_not_exists = true;
         }
         let table = self.parse_ident()?;
         self.expect_punct("(")?;
@@ -245,7 +249,7 @@ impl Parser {
             break;
         }
         self.expect_punct(")")?;
-        Ok(Statement::CreateTable(CreateTable { table, columns }))
+        Ok(Statement::CreateTable(CreateTable { table, columns, if_not_exists }))
     }
 
     fn parse_column_type(&mut self) -> SqlResult<ColumnType> {
@@ -567,6 +571,27 @@ mod tests {
                 assert!(ct.columns[0].primary_key);
                 assert_eq!(ct.columns[2].ty, ColumnType::Vector(4));
             }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_create_table_if_not_exists() {
+        let s = parse("CREATE TABLE IF NOT EXISTS docs (id BIGINT PRIMARY KEY)").unwrap();
+        match s {
+            Statement::CreateTable(ct) => {
+                assert_eq!(ct.table, "docs");
+                assert!(ct.if_not_exists);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_create_table_without_the_flag_is_not_idempotent() {
+        let s = parse("CREATE TABLE docs (id BIGINT PRIMARY KEY)").unwrap();
+        match s {
+            Statement::CreateTable(ct) => assert!(!ct.if_not_exists),
             other => panic!("unexpected {other:?}"),
         }
     }

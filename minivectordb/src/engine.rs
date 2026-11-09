@@ -493,6 +493,43 @@ impl Engine {
         }
     }
 
+    /// Shut the engine down cleanly.
+    ///
+    /// An explicit transaction that is still open at this point has never
+    /// been committed, so it is rolled back: the staged changes are dropped
+    /// and a rollback marker is written, which makes the recovery skip the
+    /// records of the transaction even if the log is read again.
+    ///
+    /// After that the log and the data files are flushed, so that every
+    /// committed row is on the disk when the process exits.
+    pub fn shutdown(&mut self) -> SqlResult<()> {
+        if self.txn_state == TxnState::InProgress {
+            self.wal
+                .log_rollback()
+                .map_err(|e| SqlError::internal(format!("wal write failed: {e}")))?;
+            self.txn_buffer.clear();
+            self.txn_state = TxnState::Auto;
+            self.next_txn_id += 1;
+            self.wal.set_txn_id(0);
+        } else {
+            // Nothing is staged, but a failed statement may have left records
+            // behind; they must not reach the file.
+            self.wal.discard_staged();
+        }
+        self.wal
+            .flush()
+            .map_err(|e| SqlError::internal(format!("wal flush failed: {e}")))?;
+        let table_ids: Vec<u32> = self.tables.values().map(|t| t.id).collect();
+        for table_id in table_ids {
+            let state = match self.tables.values_mut().find(|t| t.id == table_id) {
+                Some(s) => s,
+                None => continue,
+            };
+            state.store.sync()?;
+        }
+        Ok(())
+    }
+
     /// Write one row to its table and return the new row id.
     fn apply_insert(&mut self, table_id: u32, row_id: u64, cols: Vec<ColValue>) -> SqlResult<u64> {
         let state = self
@@ -881,4 +918,113 @@ pub fn decode_schema(data: &[u8]) -> SqlResult<TableDef> {
     }
     let pk_index = pk_index.unwrap_or(0);
     Ok(TableDef { name, columns, vector_column, pk_index })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::sql::parser::parse;
+    use std::path::PathBuf;
+
+    /// A temporary directory that removes itself when the test ends.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> TempDir {
+            let mut path = std::env::temp_dir();
+            path.push(format!("mvdb-engine-test-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            TempDir(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn engine_in(dir: &TempDir) -> Engine {
+        let mut cfg = Config::default();
+        cfg.data_dir = dir.0.clone();
+        cfg.ready_sink = crate::config::ReadySink::None;
+        Engine::open(cfg).unwrap()
+    }
+
+    fn run(engine: &mut Engine, sql: &str) -> SqlResult<QueryResult> {
+        let stmt = parse(sql).unwrap();
+        engine.execute(&stmt)
+    }
+
+    #[test]
+    fn create_table_if_not_exists_is_idempotent() {
+        let dir = TempDir::new("idempotent");
+        let mut engine = engine_in(&dir);
+        run(
+            &mut engine,
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, v VECTOR(2))",
+        )
+        .unwrap();
+        // The second run succeeds and changes nothing.
+        run(
+            &mut engine,
+            "CREATE TABLE IF NOT EXISTS t (id BIGINT PRIMARY KEY, v VECTOR(2))",
+        )
+        .unwrap();
+        run(&mut engine, "INSERT INTO t VALUES (1, '[1,2]')").unwrap();
+        let out = run(&mut engine, "SELECT id FROM t").unwrap();
+        assert_eq!(out.rows.len(), 1);
+        // A table that does not exist yet is created.
+        run(
+            &mut engine,
+            "CREATE TABLE IF NOT EXISTS other (id BIGINT PRIMARY KEY)",
+        )
+        .unwrap();
+        assert!(engine.catalog.get("other").is_some());
+    }
+
+    #[test]
+    fn create_table_without_the_flag_still_reports_the_conflict() {
+        let dir = TempDir::new("conflict");
+        let mut engine = engine_in(&dir);
+        run(&mut engine, "CREATE TABLE t (id BIGINT PRIMARY KEY)").unwrap();
+        let err = run(&mut engine, "CREATE TABLE t (id BIGINT PRIMARY KEY)").unwrap_err();
+        assert_eq!(err.code, 1050);
+    }
+
+    #[test]
+    fn shutdown_rolls_back_an_open_transaction() {
+        let dir = TempDir::new("shutdown");
+        {
+            let mut engine = engine_in(&dir);
+            run(&mut engine, "CREATE TABLE t (id BIGINT PRIMARY KEY)").unwrap();
+            run(&mut engine, "INSERT INTO t VALUES (1)").unwrap();
+            run(&mut engine, "BEGIN").unwrap();
+            run(&mut engine, "INSERT INTO t VALUES (2)").unwrap();
+            // The process ends here, with the transaction still open.
+            engine.shutdown().unwrap();
+        }
+        // The committed row survived, the staged one did not.
+        let mut engine = engine_in(&dir);
+        let out = run(&mut engine, "SELECT id FROM t").unwrap();
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(out.rows[0][0], Cell::Int(1));
+    }
+
+    #[test]
+    fn a_committed_row_survives_a_restart() {
+        let dir = TempDir::new("restart");
+        {
+            let mut engine = engine_in(&dir);
+            run(&mut engine, "CREATE TABLE t (id BIGINT PRIMARY KEY)").unwrap();
+            run(&mut engine, "INSERT INTO t VALUES (7)").unwrap();
+            engine.shutdown().unwrap();
+        }
+        let mut engine = engine_in(&dir);
+        let out = run(&mut engine, "SELECT id FROM t").unwrap();
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(out.rows[0][0], Cell::Int(7));
+    }
 }

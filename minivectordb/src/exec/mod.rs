@@ -39,6 +39,12 @@ impl Engine {
     // -------------------------------------------------------------------- DDL
 
     fn exec_create_table(&mut self, ct: &CreateTable) -> SqlResult<QueryResult> {
+        // `CREATE TABLE IF NOT EXISTS` is idempotent: when the table is
+        // already there the statement succeeds and the existing table is
+        // left exactly as it is.
+        if ct.if_not_exists && self.catalog.get(&ct.table).is_some() {
+            return Ok(QueryResult::ok());
+        }
         let def = self.catalog.build_table_def(&ct.table, ct.columns.clone())?;
         let table_id = self.next_table_id;
         self.next_table_id += 1;

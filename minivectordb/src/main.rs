@@ -174,6 +174,11 @@ fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     if !trailing.is_empty() {
         run_statement(&mut engine, &mut out, &trailing)?;
     }
+
+    // The input ended. An explicit transaction that is still open has never
+    // been committed, so it is rolled back, and everything that was
+    // committed is flushed to the disk.
+    engine.shutdown()?;
     Ok(())
 }
 

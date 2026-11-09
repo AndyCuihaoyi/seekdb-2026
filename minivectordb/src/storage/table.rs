@@ -182,6 +182,19 @@ impl TableStore {
         self.read_vector(meta.vec_block, meta.vec_slot)
     }
 
+    /// Push the data of the table files into the kernel.
+    ///
+    /// The row directory and the row images are the durable copy of a
+    /// committed row, so they are flushed before the process reports that it
+    /// has shut down cleanly.
+    pub fn sync(&mut self) -> SqlResult<()> {
+        self.meta
+            .sync_data()
+            .and_then(|_| self.col.sync_data())
+            .and_then(|_| self.vec.sync_data())
+            .map_err(|e| SqlError::internal(format!("sync failed: {e}")))
+    }
+
     /// Recompute the row count from the directory (used at startup).
     pub fn reload_counts(&mut self) -> io::Result<()> {
         let len = self.meta.metadata()?.len();
