@@ -167,6 +167,12 @@ pub struct TableStore {
     directory_pool: DirectoryPool,
     /// The cache of the decoded scalar columns, shared with the other tables.
     scalar_pool: ScalarPool,
+    /// The index of the vector column in the row image, when the table has
+    /// one.
+    ///
+    /// The vector is stored in the vector file rather than in the row image,
+    /// so a reader has to know where to find it.
+    vector_index: Option<usize>,
 }
 
 impl TableStore {
@@ -219,6 +225,7 @@ impl TableStore {
             vector_pool,
             directory_pool,
             scalar_pool,
+            vector_index: None,
         };
         store.reload_counts()?;
         // A fresh vector file gets its header right away, so that the file
@@ -229,6 +236,11 @@ impl TableStore {
             })?;
         }
         Ok(store)
+    }
+
+    /// The index of the vector column in the row image.
+    pub fn set_vector_index(&mut self, index: Option<usize>) {
+        self.vector_index = index;
     }
 
     /// Whether the vector file has to be rebuilt from the row images.
@@ -440,6 +452,38 @@ impl TableStore {
         let start = meta.vec_slot as usize * self.dim;
         let end = start + self.dim;
         Ok(matrix[start..end].to_vec())
+    }
+
+    /// Read a whole row: the scalar columns of the image and the vector of
+    /// the vector file.
+    ///
+    /// The vector is not part of the row image, so it is read from the vector
+    /// file. A row whose image still holds the vector - an image written
+    /// before the two were separated - keeps the vector of its image.
+    pub fn read_row(&mut self, row_id: u64) -> SqlResult<Option<(RowMeta, Vec<ColValue>)>> {
+        let meta = match self.read_meta(row_id)? {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+        if meta.alive == 0 {
+            return Ok(None);
+        }
+        let image = self.read_columns(meta.col_offset, meta.col_len)?;
+        let mut cols = crate::storage::format::decode_row(&image)?;
+        // The vector of the row comes from the vector file, unless the image
+        // already holds it.
+        if let Some(idx) = self.vector_index {
+            if let Some(ColValue::Vector(v)) = cols.get(idx) {
+                if v.dim == 0 && self.dim > 0 {
+                    let vec = self.read_vector(meta.vec_block, meta.vec_slot)?;
+                    cols[idx] = ColValue::Vector(crate::value::vector::Vector::new(
+                        self.dim,
+                        vec,
+                    ));
+                }
+            }
+        }
+        Ok(Some((meta, cols)))
     }
 
     /// Recompute the row count from the directory (used at startup).

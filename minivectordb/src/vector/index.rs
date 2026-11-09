@@ -32,6 +32,9 @@ const INDEX_MARKER: &str = "index.dat";
 ///
 /// The rows are read in storage order, so the index built from them is
 /// deterministic.
+///
+/// The vectors come from the vector file, not from the row image: the image
+/// does not hold them, because they are stored a second time there.
 pub fn collect_indexable_rows(
     store: &mut TableStore,
     pk_index: usize,
@@ -46,16 +49,15 @@ pub fn collect_indexable_rows(
         if meta.alive == 0 {
             continue;
         }
-        let image = store.read_columns(meta.col_offset, meta.col_len)?;
-        let cols = crate::storage::format::decode_row(&image)?;
-        let pk = match cols.get(pk_index) {
-            Some(ColValue::BigInt(i)) => *i,
-            _ => meta.pk,
+        let pk = {
+            let image = store.read_columns(meta.col_offset, meta.col_len)?;
+            let cols = crate::storage::format::decode_row(&image)?;
+            match cols.get(pk_index) {
+                Some(ColValue::BigInt(i)) => *i,
+                _ => meta.pk,
+            }
         };
-        let vec = match cols.get(vector_index) {
-            Some(ColValue::Vector(v)) => v.as_slice().to_vec(),
-            _ => continue,
-        };
+        let vec = store.read_vector(meta.vec_block, meta.vec_slot)?;
         out.push((row_id, pk, vec));
     }
     Ok(out)

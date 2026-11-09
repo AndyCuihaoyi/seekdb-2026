@@ -21,6 +21,10 @@ const TAG_BIGINT: u8 = 0x01;
 const TAG_TEXT: u8 = 0x02;
 const TAG_VECTOR: u8 = 0x03;
 
+/// The marker of a vector that is stored in the vector file rather than in
+/// the row image.
+const TAG_VECTOR_ELSEWHERE: u8 = 0x04;
+
 /// Encode one value.
 pub fn encode_value(out: &mut Vec<u8>, v: &ColValue) {
     match v {
@@ -84,6 +88,14 @@ pub fn decode_value(buf: &[u8]) -> SqlResult<(ColValue, usize)> {
                 .collect();
             Ok((ColValue::Vector(Vector::new(dim, data)), need))
         }
+        TAG_VECTOR_ELSEWHERE => {
+            // The vector of this column is stored in the vector file. The
+            // image only marks its place.
+            Ok((
+                ColValue::Vector(Vector::new(0, Vec::new())),
+                1,
+            ))
+        }
         tag => Err(SqlError::internal(format!("unknown value tag {tag}"))),
     }
 }
@@ -114,6 +126,7 @@ fn value_span(buf: &[u8]) -> SqlResult<usize> {
             let dim = u32::from_le_bytes(buf[1..5].try_into().unwrap()) as usize;
             Ok(5 + dim * 4)
         }
+        TAG_VECTOR_ELSEWHERE => Ok(1),
         tag => Err(SqlError::internal(format!("unknown value tag {tag}"))),
     }
 }
@@ -165,6 +178,35 @@ pub fn encode_row(cols: &[ColValue]) -> Vec<u8> {
     out
 }
 
+/// Encode a row image without the vector column.
+///
+/// The vector is stored a second time in the vector file, so keeping it in
+/// the row image would triple the write amplification of a vector table:
+/// the image would hold the vector, the vector file would hold it, and the
+/// write-ahead log would hold the whole image. The image on disk therefore
+/// leaves the vector out.
+///
+/// The vector column keeps its place, so a column is still addressed by its
+/// index: the value is replaced by an empty marker, which the decoder
+/// recognises. The log keeps the complete image, so a log record stays self
+/// contained and the recovery does not depend on the order in which the
+/// files were flushed.
+pub fn encode_row_without_vector(
+    cols: &[ColValue],
+    vector_index: Option<usize>,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (i, c) in cols.iter().enumerate() {
+        if Some(i) == vector_index {
+            // The marker of a vector that is stored elsewhere.
+            out.push(TAG_VECTOR_ELSEWHERE);
+            continue;
+        }
+        encode_value(&mut out, c);
+    }
+    out
+}
+
 /// Decode a whole row image.
 pub fn decode_row(buf: &[u8]) -> SqlResult<Vec<ColValue>> {
     let mut out = Vec::new();
@@ -192,7 +234,7 @@ pub fn decode_row_scalars(buf: &[u8]) -> SqlResult<Vec<Option<ColValue>>> {
     let mut out = Vec::new();
     let mut pos = 0usize;
     while pos < buf.len() {
-        if buf[pos] == TAG_VECTOR {
+        if buf[pos] == TAG_VECTOR || buf[pos] == TAG_VECTOR_ELSEWHERE {
             // The vector is not decoded, but its length is still needed to
             // step over it.
             let span = value_span(&buf[pos..])?;
@@ -232,5 +274,61 @@ mod tests {
     fn detects_truncation() {
         let bytes = encode_row(&[ColValue::Text("abc".into())]);
         assert!(decode_row(&bytes[..3]).is_err());
+    }
+
+    #[test]
+    fn a_row_without_the_vector_keeps_the_column_in_place() {
+        let cols = vec![
+            ColValue::BigInt(42),
+            ColValue::Text("旅行攻略".to_string()),
+            ColValue::Vector(Vector::parse_literal("[1,2,3]").unwrap()),
+        ];
+        let bytes = encode_row_without_vector(&cols, Some(2));
+        let back = decode_row(&bytes).unwrap();
+        assert_eq!(back.len(), 3);
+        assert_eq!(back[0], ColValue::BigInt(42));
+        assert_eq!(back[1], ColValue::Text("旅行攻略".to_string()));
+        // The vector column is marked, not dropped, so that the column
+        // indices of the other columns do not move.
+        match &back[2] {
+            ColValue::Vector(v) => assert_eq!(v.dim, 0),
+            other => panic!("expected a vector marker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_image_without_the_vector_is_much_smaller() {
+        let cols = vec![
+            ColValue::BigInt(1),
+            ColValue::Vector(Vector::parse_literal("[1,2,3]").unwrap()),
+        ];
+        let full = encode_row(&cols);
+        let slim = encode_row_without_vector(&cols, Some(1));
+        assert!(slim.len() < full.len());
+        // The full image still holds the vector, so it can be recovered.
+        assert_eq!(decode_row(&full).unwrap()[1], cols[1]);
+    }
+
+    #[test]
+    fn a_row_without_a_vector_column_is_left_alone() {
+        let cols = vec![ColValue::BigInt(7), ColValue::Text("x".into())];
+        let bytes = encode_row_without_vector(&cols, None);
+        assert_eq!(decode_row(&bytes).unwrap(), cols);
+    }
+
+    #[test]
+    fn the_scalar_decoder_skips_the_vector_marker() {
+        let cols = vec![
+            ColValue::BigInt(42),
+            ColValue::Text("a".into()),
+            ColValue::Vector(Vector::parse_literal("[1,2,3]").unwrap()),
+        ];
+        let bytes = encode_row_without_vector(&cols, Some(2));
+        let scalars = decode_row_scalars(&bytes).unwrap();
+        assert_eq!(scalars.len(), 3);
+        assert_eq!(scalars[0], Some(ColValue::BigInt(42)));
+        assert_eq!(scalars[1], Some(ColValue::Text("a".into())));
+        // The vector is not decoded: it lives in the vector file.
+        assert_eq!(scalars[2], None);
     }
 }

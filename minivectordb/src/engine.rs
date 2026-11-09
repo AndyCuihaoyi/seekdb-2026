@@ -343,7 +343,7 @@ impl Engine {
             }
         }
         let cols = decode_row(image)?;
-        let (state, pk) = {
+        let (state, pk, vector_index) = {
             let st = self
                 .table_by_id(table_id)
                 .ok_or_else(|| SqlError::internal("log references unknown table"))?;
@@ -351,20 +351,25 @@ impl Engine {
                 Some(ColValue::BigInt(i)) => *i,
                 _ => return Err(SqlError::internal("row image without primary key")),
             };
-            (st, pk)
+            let vector_index = st.def.vector_column;
+            (st, pk, vector_index)
         };
-        let vec = state.def.vector_column.and_then(|i| match &cols[i] {
+        let vec = vector_index.and_then(|i| match &cols[i] {
             ColValue::Vector(v) => Some(v.clone()),
             _ => None,
         });
         let block = (row_id / state.store.block_rows as u64) as u32;
         let slot = (row_id % state.store.block_rows as u64) as u32;
 
-        let col_offset = state.store.append_columns(image)?;
+        // The log holds the complete image, but the image on disk leaves the
+        // vector out, because the vector file holds it.
+        let stored =
+            crate::storage::format::encode_row_without_vector(&cols, vector_index);
+        let col_offset = state.store.append_columns(&stored)?;
         if let Some(v) = vec {
             state.store.write_vector(block, slot, v.as_slice())?;
         }
-        state.store.append_row(pk, col_offset, image.len() as u32, block, slot)?;
+        state.store.append_row(pk, col_offset, stored.len() as u32, block, slot)?;
         self.pk_index.entry(table_id).or_default().insert(pk, row_id);
         Ok(())
     }
@@ -378,13 +383,18 @@ impl Engine {
             Some(ColValue::BigInt(i)) => *i,
             _ => return Err(SqlError::internal("row image without primary key")),
         };
-        let vec = state.def.vector_column.and_then(|i| match &cols[i] {
+        let vector_index = state.def.vector_column;
+        let vec = vector_index.and_then(|i| match &cols[i] {
             ColValue::Vector(v) => Some(v.clone()),
             _ => None,
         });
         let block = (row_id / state.store.block_rows as u64) as u32;
         let slot = (row_id % state.store.block_rows as u64) as u32;
-        let col_offset = state.store.append_columns(image)?;
+        // The log holds the complete image, but the image on disk leaves the
+        // vector out, because the vector file holds it.
+        let stored =
+            crate::storage::format::encode_row_without_vector(&cols, vector_index);
+        let col_offset = state.store.append_columns(&stored)?;
         if let Some(v) = vec {
             state.store.write_vector(block, slot, v.as_slice())?;
         }
@@ -398,7 +408,7 @@ impl Engine {
             &RowMeta {
                 pk,
                 col_offset,
-                col_len: image.len() as u32,
+                col_len: stored.len() as u32,
                 vec_block: block,
                 vec_slot: slot,
                 version,
@@ -557,13 +567,17 @@ impl Engine {
             Some(ColValue::BigInt(i)) => *i,
             _ => return Err(SqlError::internal("row image without primary key")),
         };
-        let vec = state.def.vector_column.and_then(|i| match &cols[i] {
+        let vector_index = state.def.vector_column;
+        let vec = vector_index.and_then(|i| match &cols[i] {
             ColValue::Vector(v) => Some(v.clone()),
             _ => None,
         });
         let block = (row_id / state.store.block_rows as u64) as u32;
         let slot = (row_id % state.store.block_rows as u64) as u32;
-        let image = encode_row(&cols);
+        // The image on disk leaves the vector out: it is stored in the
+        // vector file, so keeping it here would triple the write
+        // amplification of the table.
+        let image = crate::storage::format::encode_row_without_vector(&cols, vector_index);
         let col_offset = state.store.append_columns(&image)?;
         if let Some(v) = vec.as_ref() {
             state.store.write_vector(block, slot, v.as_slice())?;
@@ -583,13 +597,16 @@ impl Engine {
             Some(ColValue::BigInt(i)) => *i,
             _ => return Err(SqlError::internal("row image without primary key")),
         };
-        let vec = state.def.vector_column.and_then(|i| match &cols[i] {
+        let vector_index = state.def.vector_column;
+        let vec = vector_index.and_then(|i| match &cols[i] {
             ColValue::Vector(v) => Some(v.clone()),
             _ => None,
         });
         let block = (row_id / state.store.block_rows as u64) as u32;
         let slot = (row_id % state.store.block_rows as u64) as u32;
-        let image = encode_row(&cols);
+        // The image on disk leaves the vector out; it is stored in the
+        // vector file.
+        let image = crate::storage::format::encode_row_without_vector(&cols, vector_index);
         let col_offset = state.store.append_columns(&image)?;
         if let Some(v) = vec.as_ref() {
             state.store.write_vector(block, slot, v.as_slice())?;
@@ -707,6 +724,10 @@ impl Engine {
                 let cols = decode_row(&image)?;
                 let vec = match cols.get(vector_index) {
                     Some(ColValue::Vector(v)) if v.dim == dim => v.clone(),
+                    // The image does not hold the vector, so there is
+                    // nothing to rebuild it from. This happens when the
+                    // vector file was written under the current layout,
+                    // which means it is not stale in the first place.
                     _ => continue,
                 };
                 state.store.write_vector_at(&meta, vec.as_slice())?;
@@ -803,6 +824,7 @@ impl Engine {
             })
             .unwrap_or(0);
         let dir = self.table_dir(&name);
+        let vector_index = def.vector_column;
         let store = TableStore::open_with_pools(
             &dir,
             &name,
@@ -813,6 +835,8 @@ impl Engine {
             self.scalar_pool.clone(),
         )
         .map_err(|e| SqlError::internal(format!("cannot open table storage: {e}")))?;
+        let mut store = store;
+        store.set_vector_index(vector_index);
         self.catalog.insert(def.clone());
         self.tables.insert(
             name.to_ascii_lowercase(),

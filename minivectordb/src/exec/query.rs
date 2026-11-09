@@ -705,15 +705,12 @@ impl Engine {
                 Some(s) => s,
                 None => continue,
             };
-            let meta = match state.store.read_meta(*row_id)? {
-                Some(m) => m,
+            // The row is read whole: the scalar columns of the image and
+            // the vector of the vector file.
+            let (meta, cols) = match state.store.read_row(*row_id)? {
+                Some(r) => r,
                 None => continue,
             };
-            if meta.alive == 0 {
-                continue;
-            }
-            let image = state.store.read_columns(meta.col_offset, meta.col_len)?;
-            let cols = crate::storage::format::decode_row(&image)?;
             out.push(LiveRow { row_id: *row_id, pk: meta.pk, cols });
         }
         Ok(out)
@@ -751,15 +748,12 @@ impl Engine {
                 Some(s) => s,
                 None => break,
             };
-            let meta = match state.store.read_meta(row_id)? {
-                Some(m) => m,
+            // The row is read whole: the scalar columns of the image and
+            // the vector of the vector file.
+            let (meta, cols) = match state.store.read_row(row_id)? {
+                Some(r) => r,
                 None => continue,
             };
-            if meta.alive == 0 {
-                continue;
-            }
-            let image = state.store.read_columns(meta.col_offset, meta.col_len)?;
-            let cols = crate::storage::format::decode_row(&image)?;
             out.push(LiveRow { row_id, pk: meta.pk, cols });
         }
 

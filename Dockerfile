@@ -42,4 +42,10 @@ ENV MINIVECDB_DURABILITY=os
 ENV MINIVECDB_BUFFER_POOL_MB=64
 
 # The server reads SQL from stdin and writes results to stdout.
+#
+# The command line matches the example of the statement, so that the image
+# runs the same way when it is started with a plain `docker run`. The
+# environment variables above are still there, and a flag on the command line
+# takes precedence over them.
 ENTRYPOINT ["/usr/local/bin/minivectordb"]
+CMD ["--data-dir", "/data"]
