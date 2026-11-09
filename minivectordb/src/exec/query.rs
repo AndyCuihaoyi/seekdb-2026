@@ -131,6 +131,55 @@ pub fn render_vector(v: &Vector) -> String {
     format!("[{}]", parts.join(","))
 }
 
+/// A mapping from a row identifier to the position of the row in a list.
+///
+/// The row identifiers of a table are dense: they are handed out in order
+/// and a deleted row only loses its content, its identifier is never reused.
+/// A list of the visible rows therefore can be addressed by identifier
+/// through a plain array, instead of searching the list.
+///
+/// The array holds `u32::MAX` for an identifier that is not in the list,
+/// which is the case for a deleted row.
+pub struct RowIndex {
+    positions: Vec<u32>,
+}
+
+impl RowIndex {
+    /// Build the index of a list of rows.
+    ///
+    /// The list does not have to be sorted, and it may hold several rows
+    /// with the same identifier; the last one wins, which matches the
+    /// behaviour of a search that finds the first match.
+    pub fn build(rows: &[LiveRow]) -> RowIndex {
+        let mut max_id = 0u64;
+        for row in rows {
+            if row.row_id > max_id {
+                max_id = row.row_id;
+            }
+        }
+        let mut positions = vec![u32::MAX; (max_id + 1) as usize];
+        for (i, row) in rows.iter().enumerate() {
+            positions[row.row_id as usize] = i as u32;
+        }
+        RowIndex { positions }
+    }
+
+    /// The position of a row, if the list holds it.
+    pub fn get(&self, row_id: u64) -> Option<usize> {
+        let pos = *self.positions.get(row_id as usize)?;
+        if pos == u32::MAX {
+            None
+        } else {
+            Some(pos as usize)
+        }
+    }
+
+    /// The row with the given identifier, if the list holds it.
+    pub fn row<'a>(&self, rows: &'a [LiveRow], row_id: u64) -> Option<&'a LiveRow> {
+        self.get(row_id).and_then(|i| rows.get(i))
+    }
+}
+
 impl Engine {
     /// Execute a SELECT statement.
     pub(crate) fn exec_select(&mut self, sel: &Select) -> SqlResult<QueryResult> {
@@ -372,7 +421,9 @@ impl Engine {
             let index = self.vector_index(table_id).expect("index checked above");
             let filter = sel.filter.clone();
             let mut hits: Vec<(i64, f32, u64)> = Vec::new();
-            let rows_ref = &rows;
+            // The row identifiers are dense, so the position of a row in the
+            // list is found through an array instead of a linear search.
+            let row_index = RowIndex::build(&rows);
             let mut scan_error: Option<SqlError> = None;
             index.scan_ordered(
                 topk.query.as_slice(),
@@ -384,7 +435,7 @@ impl Engine {
                     if updated.contains(&row_id) || deleted.contains(&row_id) {
                         return false;
                     }
-                    let row = match rows_ref.iter().find(|r| r.row_id == row_id) {
+                    let row = match row_index.row(&rows, row_id) {
                         Some(r) => r,
                         None => return false,
                     };
@@ -486,8 +537,9 @@ impl Engine {
         }
 
         let mut out: Vec<Vec<Cell>> = Vec::with_capacity(candidates.len());
+        let row_index = RowIndex::build(&rows);
         for (pk, _d, row_id) in &candidates {
-            let row = match rows.iter().find(|r| r.row_id == *row_id) {
+            let row = match row_index.row(&rows, *row_id) {
                 Some(r) => r,
                 None => continue,
             };
@@ -561,12 +613,19 @@ impl Engine {
         }
 
         // Staged updates replace the committed values.
+        //
+        // The row identifiers are dense, so the position of a row is found
+        // through an array instead of a linear search. A linear search would
+        // make the whole operation quadratic in the number of rows.
         let updates = self.txn_buffer.updated_of(table_id);
-        for (row_id, cols) in updates {
-            if let Some(row) = out.iter_mut().find(|r| r.row_id == row_id) {
-                let pk = row.pk;
-                row.cols = cols;
-                let _ = pk;
+        if !updates.is_empty() {
+            let index = RowIndex::build(&out);
+            for (row_id, cols) in updates {
+                if let Some(pos) = index.get(row_id) {
+                    if let Some(row) = out.get_mut(pos) {
+                        row.cols = cols;
+                    }
+                }
             }
         }
 
@@ -766,5 +825,49 @@ pub fn describe_expr(expr: &Expr) -> String {
             };
             format!("{} {} {}", describe_expr(l), word, describe_expr(r))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(row_id: u64, pk: i64) -> LiveRow {
+        LiveRow { row_id, pk, cols: Vec::new() }
+    }
+
+    #[test]
+    fn the_index_finds_a_row_by_its_identifier() {
+        let rows = vec![row(0, 10), row(1, 20), row(2, 30)];
+        let index = RowIndex::build(&rows);
+        assert_eq!(index.get(0), Some(0));
+        assert_eq!(index.get(1), Some(1));
+        assert_eq!(index.get(2), Some(2));
+        assert_eq!(index.row(&rows, 2).map(|r| r.pk), Some(30));
+    }
+
+    #[test]
+    fn the_index_reports_a_row_that_is_not_in_the_list() {
+        let rows = vec![row(0, 10), row(2, 30)];
+        let index = RowIndex::build(&rows);
+        // Row 1 is missing, because it was deleted.
+        assert_eq!(index.get(1), None);
+        assert_eq!(index.row(&rows, 1).is_none(), true);
+        // An identifier beyond the list is missing as well.
+        assert_eq!(index.get(9), None);
+    }
+
+    #[test]
+    fn the_index_handles_a_list_that_starts_at_a_high_identifier() {
+        let rows = vec![row(100, 1)];
+        let index = RowIndex::build(&rows);
+        assert_eq!(index.get(100), Some(0));
+        assert_eq!(index.get(0), None);
+    }
+
+    #[test]
+    fn the_index_of_an_empty_list_has_no_row() {
+        let index = RowIndex::build(&[]);
+        assert_eq!(index.get(0), None);
     }
 }
