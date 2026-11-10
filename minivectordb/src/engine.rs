@@ -8,8 +8,10 @@ use crate::error::{SqlError, SqlResult};
 use crate::storage::format::{decode_row, encode_row};
 use crate::storage::table::{ColValue, RowMeta, TableStore};use crate::storage::wal::{read_all, Record, Wal};
 use crate::sql::ast::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+
+
 
 /// A row as seen by the executor.
 #[derive(Debug, Clone)]
@@ -41,15 +43,25 @@ pub enum TxnState {
 pub struct TxnBuffer {
     /// The staged operations, in the order they were prepared.
     ops: Vec<TxnOp>,
+    /// The number of staged inserts of every table.
+    inserted: HashMap<u32, usize>,
+    /// The primary keys that the staged operations hold.
+    ///
+    /// The buffer is checked for a duplicate key while the rows of a
+    /// statement are prepared. Scanning the log for that would make a
+    /// multi-row insert quadratic in the number of rows, so the keys are
+    /// kept in a set. The set is rebuilt from the log whenever the log is
+    /// truncated, because the two have to stay in step.
+    keys: HashSet<(u32, i64)>,
 }
 
 /// One staged operation.
 #[derive(Debug, Clone)]
 pub enum TxnOp {
     /// An inserted row.
-    Insert { table_id: u32, row_id: u64, cols: Vec<ColValue> },
+    Insert { table_id: u32, row_id: u64, pk: i64, cols: Vec<ColValue> },
     /// An updated row. The columns are the new values of the whole row.
-    Update { table_id: u32, row_id: u64, cols: Vec<ColValue> },
+    Update { table_id: u32, row_id: u64, pk: i64, cols: Vec<ColValue> },
     /// A deleted row.
     Delete { table_id: u32, row_id: u64 },
 }
@@ -74,16 +86,21 @@ impl TxnBuffer {
     /// leaves the changes of the earlier statements of the transaction alone.
     pub fn undo_to(&mut self, mark: TxnMark) {
         self.ops.truncate(mark.0);
+        self.rebuild_keys();
+        self.rebuild_counts();
     }
 
     /// Stage an insert.
-    pub fn stage_insert(&mut self, table_id: u32, row_id: u64, cols: Vec<ColValue>) {
-        self.ops.push(TxnOp::Insert { table_id, row_id, cols });
+    pub fn stage_insert(&mut self, table_id: u32, row_id: u64, pk: i64, cols: Vec<ColValue>) {
+        self.keys.insert((table_id, pk));
+        *self.inserted.entry(table_id).or_insert(0) += 1;
+        self.ops.push(TxnOp::Insert { table_id, row_id, pk, cols });
     }
 
     /// Stage an update.
-    pub fn stage_update(&mut self, table_id: u32, row_id: u64, cols: Vec<ColValue>) {
-        self.ops.push(TxnOp::Update { table_id, row_id, cols });
+    pub fn stage_update(&mut self, table_id: u32, row_id: u64, pk: i64, cols: Vec<ColValue>) {
+        self.keys.insert((table_id, pk));
+        self.ops.push(TxnOp::Update { table_id, row_id, pk, cols });
     }
 
     /// Stage a delete.
@@ -91,17 +108,64 @@ impl TxnBuffer {
         self.ops.push(TxnOp::Delete { table_id, row_id });
     }
 
+    /// Whether the staged operations hold a primary key.
+    ///
+    /// The answer comes from the key set, so it costs the same whatever the
+    /// number of staged rows is.
+    pub fn holds_key(&self, table_id: u32, pk: i64) -> bool {
+        self.keys.contains(&(table_id, pk))
+    }
+
+    /// Rebuild the insert counters from the log.
+    ///
+    /// The counters mirror the log, so they are rebuilt whenever the log is
+    /// truncated.
+    fn rebuild_counts(&mut self) {
+        self.inserted.clear();
+        for op in &self.ops {
+            if let TxnOp::Insert { table_id, .. } = op {
+                *self.inserted.entry(*table_id).or_insert(0) += 1;
+            }
+        }
+    }
+
+    /// Rebuild the key set from the log.
+    ///
+    /// The log is the truth; the set only mirrors it. This is called after
+    /// the log has been truncated.
+    fn rebuild_keys(&mut self) {
+        self.keys.clear();
+        for op in &self.ops {
+            match op {
+                TxnOp::Insert { table_id, pk, .. } | TxnOp::Update { table_id, pk, .. } => {
+                    self.keys.insert((*table_id, *pk));
+                }
+                TxnOp::Delete { .. } => {}
+            }
+        }
+    }
+
     /// Discard everything staged.
     pub fn clear(&mut self) {
         self.ops.clear();
+        self.keys.clear();
+        self.inserted.clear();
     }
 
     /// Number of staged inserts of a table.
     pub fn inserted_len(&self, table_id: u32) -> usize {
-        self.ops
-            .iter()
-            .filter(|op| matches!(op, TxnOp::Insert { table_id: t, .. } if *t == table_id))
-            .count()
+        // The count is kept in the buffer, so that the cost does not depend
+        // on the number of staged rows. Scanning the log here would make a
+        // multi-row insert quadratic in the number of rows.
+        self.inserted.get(&table_id).copied().unwrap_or(0)
+    }
+
+    /// The number of staged inserts of every table.
+    pub fn inserted_counts(&self) -> Vec<(u32, usize)> {
+        let mut counts: Vec<(u32, usize)> =
+            self.inserted.iter().map(|(id, count)| (*id, *count)).collect();
+        counts.sort_unstable();
+        counts
     }
 
     /// Staged inserts of a table, oldest first.
@@ -109,7 +173,7 @@ impl TxnBuffer {
         self.ops
             .iter()
             .filter_map(|op| match op {
-                TxnOp::Insert { table_id: t, row_id, cols } if *t == table_id => {
+                TxnOp::Insert { table_id: t, row_id, cols, .. } if *t == table_id => {
                     Some((*row_id, cols.clone()))
                 }
                 _ => None,
@@ -122,7 +186,7 @@ impl TxnBuffer {
         self.ops
             .iter()
             .filter_map(|op| match op {
-                TxnOp::Update { table_id: t, row_id, cols } if *t == table_id => {
+                TxnOp::Update { table_id: t, row_id, cols, .. } if *t == table_id => {
                     Some((*row_id, cols.clone()))
                 }
                 _ => None,
@@ -1231,5 +1295,64 @@ mod tests {
         run(&mut engine, "ROLLBACK").unwrap();
         let answer = topk(&mut engine, "[0.0,0.0]", 2, None);
         assert_eq!(answer, vec![1, 2]);
+    }
+
+    #[test]
+    fn a_multi_row_insert_does_not_scan_the_staged_rows_twice() {
+        // The buffer used to be checked for a duplicate key by walking the
+        // staged log, and the row id was derived from a count of the staged
+        // inserts. Both made a multi-row insert quadratic in the number of
+        // rows, which made a large insert unusable. The test pins the
+        // property down by measuring the time of two inserts whose sizes
+        // differ by a factor of four: a quadratic behaviour would make the
+        // second one roughly sixteen times slower, a linear one roughly
+        // four times.
+        fn elapsed(rows: usize) -> f64 {
+            let dir = TempDir::new("bulk-insert");
+            let mut engine = engine_in(&dir);
+            run(&mut engine, "CREATE TABLE t (id BIGINT PRIMARY KEY, v VECTOR(2))").unwrap();
+            let mut values = Vec::new();
+            for i in 0..rows {
+                values.push(format!("({},'[0.0,0.0]')", i));
+            }
+            let sql = format!("INSERT INTO t VALUES {}", values.join(","));
+            let started = std::time::Instant::now();
+            run(&mut engine, &sql).unwrap();
+            started.elapsed().as_secs_f64()
+        }
+
+        // The sizes are small enough to keep the test quick, but large
+        // enough for the quadratic term to show.
+        let small = elapsed(2_000);
+        let large = elapsed(8_000);
+        let ratio = large / small.max(1e-6);
+        assert!(
+            ratio < 8.0,
+            "the insert is not linear: 2000 rows took {:.3}s and 8000 rows took {:.3}s (a factor of {:.1})",
+            small,
+            large,
+            ratio
+        );
+    }
+
+    #[test]
+    fn a_duplicate_key_is_still_refused_inside_a_statement() {
+        // The key set replaced the scan of the staged log, so the check has
+        // to keep its meaning: a duplicate inside one statement and a
+        // duplicate against an earlier statement of the same transaction are
+        // both refused.
+        let dir = TempDir::new("dup-key");
+        let mut engine = engine_in(&dir);
+        run(&mut engine, "CREATE TABLE t (id BIGINT PRIMARY KEY, v VECTOR(2))").unwrap();
+        let inside = run(
+            &mut engine,
+            "INSERT INTO t VALUES (1,'[0.0,0.0]'),(1,'[0.0,0.0]')",
+        );
+        assert!(inside.is_err(), "the duplicate inside the statement is accepted");
+        run(&mut engine, "BEGIN").unwrap();
+        run(&mut engine, "INSERT INTO t VALUES (7,'[0.0,0.0]')").unwrap();
+        let against = run(&mut engine, "INSERT INTO t VALUES (7,'[0.0,0.0]')");
+        assert!(against.is_err(), "the duplicate against the transaction is accepted");
+        run(&mut engine, "ROLLBACK").unwrap();
     }
 }

@@ -156,17 +156,11 @@ impl Engine {
             {
                 return Err(SqlError::duplicate_key(pk));
             }
-            let staged_dup = self
-                .txn_buffer
-                .inserted_of(table_id)
-                .iter()
-                .any(|(_, cols)| {
-                    matches!(cols.get(def.pk_index), Some(ColValue::BigInt(i)) if *i == pk)
-                })
-                || self.txn_buffer.updated_of(table_id).iter().any(|(_, cols)| {
-                    matches!(cols.get(def.pk_index), Some(ColValue::BigInt(i)) if *i == pk)
-                });
-            if staged_dup {
+            // The staged rows are checked through the key set of the buffer,
+            // so the cost does not depend on how many rows the transaction
+            // has staged so far. Scanning the log would make a multi-row
+            // insert quadratic in the number of rows.
+            if self.txn_buffer.holds_key(table_id, pk) {
                 return Err(SqlError::duplicate_key(pk));
             }
 
@@ -177,7 +171,7 @@ impl Engine {
             self.wal
                 .log_insert(table_id, row_id, &image)
                 .map_err(|e| SqlError::internal(format!("wal write failed: {e}")))?;
-            self.txn_buffer.stage_insert(table_id, row_id, cols);
+            self.txn_buffer.stage_insert(table_id, row_id, pk, cols);
             count += 1;
         }
         Ok(QueryResult { columns: Vec::new(), rows: Vec::new(), affected: Some(count) })
@@ -232,7 +226,11 @@ impl Engine {
             self.wal
                 .log_update(table_id, row_id, &image)
                 .map_err(|e| SqlError::internal(format!("wal write failed: {e}")))?;
-            self.txn_buffer.stage_update(table_id, row_id, cols);
+            let pk = match cols.get(def.pk_index) {
+                Some(ColValue::BigInt(value)) => *value,
+                _ => return Err(SqlError::internal("row image without primary key")),
+            };
+            self.txn_buffer.stage_update(table_id, row_id, pk, cols);
         }
         Ok(QueryResult { columns: Vec::new(), rows: Vec::new(), affected: Some(affected) })
     }
