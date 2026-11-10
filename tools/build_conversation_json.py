@@ -217,6 +217,30 @@ USER_PROMPTS = [
             "公开用例里最大的一条 INSERT 只有 3 行，永远触发不了。"
         ),
     },
+    {
+        "id": "up-17",
+        "time": "2026-11-10T14:23:00+08:00",
+        "content": (
+            "这次修复的测试可以覆盖上一次测试，你可以继续去上游题包翻一遍，"
+            "确认是否有更完整的 SQL 语法清单"
+        ),
+        "source": "student",
+        "excerpt": (
+            "这次修复的测试可以覆盖上一次测试，你可以继续去上游题包翻一遍，"
+            "确认是否有更完整的 SQL 语法清单"
+        ),
+        "note": (
+            "这一问同时包含两件事：**用修复后的构建把上一轮的测试整套重跑一遍**，"
+            "以及**回到上游确认边界**。\n"
+            "第二件事的价值在于：上一轮把「不补 COUNT / JOIN」"
+            "写成了自己的判断并诚实标为风险面，"
+            "这一问把它推进成「有明文依据的边界」 —— "
+            "题面 §2.1 第 35 行早就写着"
+            "「本题不要求 NULL、JOIN、聚合、子查询、ALTER TABLE、外键、"
+            "嵌套事务或主键更新」。\n"
+            "也正因为要求重跑，才发现了上一轮 A/B 对比被后台压测污染的事实。"
+        ),
+    },
 ]
 
 
@@ -763,6 +787,70 @@ CONVERSATIONS = [
                 "数据目录从 2.2 GB 降到 1.10 GB，重启恢复正常。",
                 "峰值内存撞顶",
                 "/conversations/12/turns/4/excerpt",
+            ),
+        ],
+    },
+    {
+        "id": "c-14",
+        "topic": "上游再查与语法边界的确认",
+        "turns": [
+            turn(
+                "student",
+                "这次修复的测试可以覆盖上一次测试，你可以继续去上游题包翻一遍，"
+                "确认是否有更完整的 SQL 语法清单",
+                "这次修复的测试可以覆盖上一次测试，你可以继续去上游题包翻一遍，"
+                "确认是否有更完整的 SQL 语法清单",
+                "/user_prompts/16/excerpt",
+            ),
+            turn(
+                "agent",
+                "**上游没有新增任何语法规范文件。**\n"
+                "`2026-competition-round2` 的 HEAD 仍是 `f4d4e2665`，"
+                "相对基线新增 50 个文件、1726 行，全部是通信协议、"
+                "20 组公开用例和官方检查器 —— 没有语法文档。\n"
+                "但翻出了一个更重要的东西：`manifest.json` 里 "
+                "`version` 是 `minivectordb-public-v4`，20 组用例分 "
+                "**sql 8 / storage 3 / vector 4 / transaction 5**，共 95 条 SQL。"
+                "正式 29 组减公开 20 组等于保留 9 组，"
+                "而隐藏的是数据而非功能 —— "
+                "这印证了上一轮把力气花在规模上是对的。",
+                "隐藏的是数据而非功能",
+                "/conversations/13/turns/1/excerpt",
+            ),
+            turn(
+                "agent",
+                "**`config.json` 里的判题资源与本轮自测用的完全一致**\n"
+                "（`cpus 2`、`memory 2g`、`pids_limit 128`、"
+                "`case_timeout 600`）—— 说明规模压测是对着判题条件做的，"
+                "不是自己拍的一个数字。\n"
+                "**但 `error_codes` 是空对象**，README 写着「正式映射以题包为准」。"
+                "公开用例只用到 `duplicate_key` / `dimension_mismatch` / "
+                "`unsupported_sql` 三个名字，正式映射若换了名字就有失配风险。"
+                "错误码语义抽查 9 项全部符合预期，但映射这件事**本地无法验证**，"
+                "只能如实写进 limitations。",
+                "错误码语义抽查 9 项全部符合预期",
+                "/conversations/13/turns/2/excerpt",
+            ),
+            turn(
+                "agent",
+                "**然后找到了把上一轮的「判断」变成「事实」的那句话。**\n"
+                "题面 §2.1 第 35 行明文写着：\n"
+                "「本题不要求 NULL、JOIN、聚合、子查询、ALTER TABLE、外键、"
+                "嵌套事务或主键更新。不支持的语句须返回约定错误，"
+                "不能静默执行为其他含义。」\n"
+                "上一轮我把「不补 COUNT / JOIN」写成了 **我的判断**，"
+                "并诚实标为「风险面」。现在它有明文依据了，"
+                "而且逐条实测也对得上：\n"
+                "| 题面「必须支持」17 项 | 结果 |\n"
+                "- 题面「不要求」的 **8 项全部返回约定错误**"
+                "（NULL→unsupported_sql、JOIN→syntax_error、"
+                "聚合→syntax_error、子查询→syntax_error、"
+                "ALTER TABLE→unsupported_sql、外键→syntax_error、"
+                "嵌套事务→transaction_state、主键更新→unsupported_sql）。\n"
+                "关键在于：`sql_unsupported` 这组公开用例**本身就在测「不支持」** —— "
+                "所以补这些语法不只是无用功，还可能破坏一个被测语义。",
+                "| 题面「必须支持」17 项 | 结果 |",
+                "/conversations/13/turns/3/excerpt",
             ),
         ],
     },
@@ -1377,6 +1465,107 @@ EXPERIMENTS = [
             "Recall 仍是 1.0 —— 检查点没有带来回归。"
         ),
     },
+    {
+        "id": "e-20",
+        "name": "上游复查与题面子集的逐条核对",
+        "hypothesis": (
+            "上游可能已经发布更完整的 SQL 语法清单，"
+            "而当前实现按题面 §2.2 的子集实现，"
+            "若清单更宽，则存在语法缺口。"
+        ),
+        "command": (
+            "git fetch upstream 2026-competition-round2；"
+            "git diff --stat c842a368c upstream/2026-competition-round2；"
+            "git show upstream/2026-competition-round2:mysqltest/manifest.json；"
+            "git show upstream/2026-competition-round2:protocol_check/config.json"
+        ),
+        "result": (
+            " STDIO_PROTOCOL.md                                  |   311 +++++++++++++++\n"
+            " mysqltest/README.md                                |    93 ++++++\n"
+            " protocol_check/_assertions.py                       |    42 ++++\n"
+            " protocol_check/_transport.py                        |   181 +++++++\n"
+            " protocol_check/config.json                          |    12 +\n"
+            " protocol_check/run.py                               |   128 ++++++\n"
+            " 50 files changed, 1726 insertions(+)\n"
+            "version: minivectordb-public-v4 scope: public-samples\n"
+            "groups: {'sql': 8, 'storage': 3, 'vector': 4, 'transaction': 5}\n"
+            "cases: 20 statements: 95\n"
+            "\"cpus\": \"2\", \"memory\": \"2g\", \"pids_limit\": 128,\n"
+            "\"error_codes\": {}"
+        ),
+        "result_excerpt": (
+            "groups: {'sql': 8, 'storage': 3, 'vector': 4, 'transaction': 5}\n"
+            "cases: 20 statements: 95"
+        ),
+        "interpretation": (
+            "**上游没有发布任何新的语法规范文件**，"
+            "所以「是否存在更完整的语法清单」这个问题的答案是：不存在。\n"
+            "更有价值的收获是三个可核对的数字：\n"
+            "1. 公开用例分 4 组（sql 8 / storage 3 / vector 4 / transaction 5）、95 条 SQL，"
+            "正式 29 组意味着保留的 9 组落在这 4 组里 —— "
+            "隐藏的是数据与规模，不是新的功能类别；\n"
+            "2. `config.json` 的 `cpus 2` / `memory 2g` / `pids_limit 128` "
+            "与本轮自测用的限制完全一致，说明规模压测是对着判题条件做的；\n"
+            "3. `error_codes` 是空对象 —— 错误码的冻结映射尚未公布，"
+            "这是一处本地无法消除的不确定性，已如实写进 `limitations`。"
+        ),
+    },
+    {
+        "id": "e-21",
+        "name": "题面「不要求」清单的逐条实测",
+        "hypothesis": (
+            "题面 §2.1 明文写着「本题不要求 NULL、JOIN、聚合、子查询、"
+            "ALTER TABLE、外键、嵌套事务或主键更新」，"
+            "且「不支持的语句须返回约定错误，不能静默执行为其他含义」。"
+            "当前实现应当做到：这 8 类语句全部返回约定错误，"
+            "而题面「必须支持」的 17 项全部成功。"
+        ),
+        "command": (
+            "python3 - <<'PY'   # 逐条发请求并检查响应\n"
+            "PY"
+        ),
+        "result": (
+            "=== 题面 §2.1「不要求」清单：应当返回约定错误 ===\n"
+            "NULL 值                                 OK     unsupported_sql\n"
+            "JOIN                                   OK     syntax_error\n"
+            "聚合 COUNT                             OK     syntax_error\n"
+            "子查询                                 OK     syntax_error\n"
+            "ALTER TABLE                            OK     unsupported_sql\n"
+            "外键                                   OK     syntax_error\n"
+            "嵌套事务 BEGIN(内)                    OK     transaction_state\n"
+            "主键更新                               OK     unsupported_sql\n"
+            "=== 题面 §2.1「必须支持」清单：应当成功 ===\n"
+            "= 比较                                   OK     ok:true\n"
+            "普通列投影                              OK     ok:true\n"
+            "SELECT *                              OK     ok:true\n"
+            "< 比较                                   OK     ok:true\n"
+            "<= 比较                                  OK     ok:true\n"
+            "> 比较                                   OK     ok:true\n"
+            ">= 比较                                  OK     ok:true\n"
+            "AND                                    OK     ok:true\n"
+            "ORDER BY                               OK     ok:true\n"
+            "LIMIT                                  OK     ok:true\n"
+            "L2_DISTANCE                            OK     ok:true\n"
+            "精确 TopK                              OK     ok:true\n"
+            "带过滤 TopK                           OK     ok:true\n"
+            "多行 INSERT                            OK     ok:true\n"
+            "按条件更新                              OK     ok:true\n"
+            "按条件删除                              OK     ok:true\n"
+            "CREATE VECTOR INDEX                   OK     ok:true"
+        ),
+        "result_excerpt": (
+            "主键更新                               OK     unsupported_sql"
+        ),
+        "interpretation": (
+            "**「必须支持」17 项全部成功，「不要求」8 项全部返回约定错误。**\n"
+            "这一轮把上一轮留作「风险面」的判断变成了有依据的边界："
+            "题面 §2.1 第 35 行把「哪些语法不做」写成了明文，"
+            "而 `sql_unsupported` 这组公开用例恰好在测「不支持」这件事本身 —— "
+            "所以补 COUNT / JOIN / GROUP BY 不仅是无用功，"
+            "还可能把一个被测语义破坏掉。\n"
+            "错误码语义另抽查 9 项全部符合预期。"
+        ),
+    },
 ]
 
 
@@ -1496,6 +1685,25 @@ RETROSPECTIVE = {
                 "这个例子说明：**「内存不够」和「谁在占内存」是两个问题**，"
                 "只看总量会往错误的方向优化 —— "
                 "去调缓冲池大小、调索引结构，都碰不到真正的病根。"
+            ),
+        },
+        {
+            "title": "把自己的判断推进成有依据的边界",
+            "detail": (
+                "上一轮结束时，「不补 COUNT / JOIN / GROUP BY」"
+                "写进了材料，但标注为**判断**与**风险面** —— "
+                "因为官方 README 只说「基础样例已简化」，没有逐条列语法。\n"
+                "这一轮回到上游再查，发现上游根本没发布过语法清单，"
+                "但题面 §2.1 第 35 行本来就写着"
+                "「本题不要求 NULL、JOIN、聚合、子查询、ALTER TABLE、外键、"
+                "嵌套事务或主键更新」。\n"
+                "于是把 8 类「不要求」的语句逐条实测，"
+                "确认它们全部返回约定错误、"
+                "17 项「必须支持」的能力全部成功 —— "
+                "**判断变成了事实**。\n"
+                "而且实测还纠正了判断的方向："
+                "`sql_unsupported` 这组公开用例本身就在测「不支持」，"
+                "所以补语法不只是无用功，还可能破坏一个被测语义。"
             ),
         },
     ],
@@ -1627,13 +1835,25 @@ RETROSPECTIVE = {
         "检查点阈值默认 64 MiB，可用 `MINIVECDB_CHECKPOINT_MB` 调整。"
         "已验证的边界是 200 万行 128 维（数据目录 1104 MiB、峰值内存 1557 MiB，"
         "均在 2 GiB 限额内）；再大一档未实测。",
-        "SQL 语法支持严格限于题面 §2.2 列出的子集"
+        "SQL 语法支持严格限于题面 §2.1 与 §2.2 列出的子集"
         "（CREATE TABLE / INSERT / SELECT / UPDATE / DELETE / "
         "L2_DISTANCE / BEGIN / COMMIT / ROLLBACK / CREATE VECTOR INDEX）。"
         "COUNT、DISTINCT、GROUP BY、JOIN、IN、BETWEEN、LIKE、IS NULL、"
-        "OFFSET 等未实现，按约定返回错误 —— "
-        "官方 README 明确「基础样例已简化」，但未逐条列出完整语法，"
-        "因此这是一个已知的风险面而非已验证的能力。",
+        "OFFSET 等未实现，按约定返回错误。\n"
+        "这一边界有明文依据而非推断：题面 §2.1 写着"
+        "「本题不要求 NULL、JOIN、聚合、子查询、ALTER TABLE、外键、"
+        "嵌套事务或主键更新。不支持的语句须返回约定错误」，"
+        "且已逐条实测这 8 类语句确实返回了约定错误、"
+        "题面「必须支持」的 17 项全部成功。",
+        "错误码的冻结映射尚未公布。官方 `protocol_check/config.json` 的 "
+        "`error_codes` 是空对象，题包 README 写着「正式映射以题包为准」；"
+        "公开用例只用到 `duplicate_key` / `dimension_mismatch` / `unsupported_sql` "
+        "三个名字。本实现覆盖 9 个语义名"
+        "（`duplicate_key` / `dimension_mismatch` / `unsupported_sql` / "
+        "`syntax_error` / `no_such_table` / `no_such_column` / `data_error` / "
+        "`value_out_of_range` / `transaction_state`），"
+        "但若正式映射使用了不同的名字，仍有失配的可能 —— "
+        "这是当前无法通过本地验证消除的不确定性。",
     ],
 }
 
