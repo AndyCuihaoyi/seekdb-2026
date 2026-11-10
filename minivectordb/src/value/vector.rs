@@ -69,7 +69,7 @@ impl Vector {
     /// Check the dimension against the column declaration.
     pub fn check_dim(&self, expected: usize) -> SqlResult<()> {
         if self.dim != expected {
-            return Err(SqlError::data_error(format!(
+            return Err(SqlError::dimension_mismatch(format!(
                 "vector dimension mismatch: expected {expected}, got {}",
                 self.dim
             )));

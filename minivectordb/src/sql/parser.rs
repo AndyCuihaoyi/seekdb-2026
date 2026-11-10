@@ -17,7 +17,6 @@ pub fn parse(stmt: &str) -> SqlResult<Statement> {
     p.expect_eof()?;
     Ok(s)
 }
-
 struct Parser {
     toks: Vec<Token>,
     pos: usize,
@@ -34,9 +33,16 @@ impl Parser {
         t
     }
 
-    fn expect_eof(&self) -> SqlResult<()> {
+    fn expect_eof(&mut self) -> SqlResult<()> {
+        // A statement may be terminated by a semicolon. The judge sends the
+        // statements with their terminator, so it is accepted and ignored
+        // here. A semicolon in the middle of a statement is a syntax error,
+        // because only one statement is allowed per request.
+        let had_semicolon = self.eat_punct(";");
         if matches!(self.peek(), Token::Eof) {
             Ok(())
+        } else if had_semicolon {
+            Err(SqlError::syntax("unexpected trailing input"))
         } else {
             Err(SqlError::syntax("unexpected trailing input"))
         }

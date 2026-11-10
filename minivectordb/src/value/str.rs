@@ -16,7 +16,7 @@ pub fn char_len(s: &str) -> usize {
 pub fn check_varchar(s: &str, max_chars: usize) -> SqlResult<()> {
     let n = char_len(s);
     if n > max_chars {
-        return Err(SqlError::data_error(format!(
+        return Err(SqlError::value_out_of_range(format!(
             "string too long: {n} characters exceeds VARCHAR({max_chars})"
         )));
     }

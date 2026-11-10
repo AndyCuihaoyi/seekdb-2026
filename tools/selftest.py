@@ -32,6 +32,7 @@ The script exits with a non-zero status when a check fails.
 """
 
 import argparse
+import json
 import math
 import os
 import random
@@ -57,54 +58,45 @@ class Failure(Exception):
 
 
 class Db:
-    """A running instance of the database under test."""
+    """A running instance of the database under test.
+
+    The database speaks the JSON Lines protocol of the competition: it
+    announces itself with `{"type":"ready"}` and then answers one JSON
+    object per request. The synchronisation helper of the older text
+    protocol is not needed any more, because the protocol itself delimits
+    the answers.
+    """
 
     def __init__(self, binary, data_dir, mode="exact", nlist=32, nprobe=None):
         env = dict(os.environ)
         env["MINIVECDB_DATA_DIR"] = data_dir
         env["MINIVECDB_MODE"] = mode
-        env["MINIVECDB_OUTPUT_FORMAT"] = "tsv"
-        env["MINIVECDB_READY_SINK"] = "stderr"
         env["MINIVECDB_ANN_NLIST"] = str(nlist)
         if nprobe is not None:
             env["MINIVECDB_ANN_NPROBE"] = str(nprobe)
         else:
             env.pop("MINIVECDB_ANN_NPROBE", None)
         self.proc = subprocess.Popen(
-            [binary],
+            [binary, "--data-dir", data_dir],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             env=env,
             text=True,
             bufsize=1,
         )
-        # Wait for the readiness token.
-        line = self.proc.stderr.readline()
-        if "ready" not in line:
-            raise Failure("the database did not report readiness: %r" % line)
-
-        # The synchronisation token. It is unique, so that it cannot be
-        # confused with a line of a result set.
-        self.token = "SYNC-%d-%s" % (
-            os.getpid(),
-            "".join(random.Random().choices("0123456789", k=8)),
-        )
-        # The synchronisation table has a name of its own, so that several
-        # instances can use the same data directory.
-        self.sync_table = "__mvdb_sync_%d_%s" % (
-            os.getpid(),
-            "".join(random.Random().choices("0123456789", k=8)),
-        )
-        self.sync_sql = "SELECT tok FROM %s;" % self.sync_table
-
-        # The synchronisation table is created without the synchronisation
-        # helper, because the helper needs the table to exist.
-        self.send(
-            "CREATE TABLE %s (id BIGINT PRIMARY KEY, tok VARCHAR(64));"
-            % self.sync_table
-        )
-        self.send("INSERT INTO %s VALUES (1,'%s');" % (self.sync_table, self.token))
+        self.sequence = 0
+        self.mode = mode
+        # The handshake has to arrive before the first request is sent.
+        raw = self.proc.stdout.readline()
+        if not raw:
+            raise Failure("the database closed its output before the handshake")
+        try:
+            message = json.loads(raw)
+        except ValueError as exc:
+            raise Failure("the handshake is not JSON: %r (%s)" % (raw, exc))
+        if message != {"type": "ready"}:
+            raise Failure("expected a ready message, got %r" % (message,))
 
     # ---------------------------------------------------------------- talking
 
@@ -114,46 +106,52 @@ class Db:
         self.proc.stdin.flush()
 
     def run(self, sql):
-        """Run one statement and return the lines it produced.
+        """Run one statement and return its answer object.
 
-        The returned lines are the result set without its header, or the
-        error line. An empty list means the statement produced no output.
+        The answer is the JSON object of the protocol. A failing statement
+        is reported through the `ok` field rather than through an
+        exception, so that the checks can look at it.
         """
-        self.send(sql)
-        self.send(self.sync_sql)
-
-        lines = []
-        while True:
-            raw = self.proc.stdout.readline()
-            if not raw:
-                raise Failure(
-                    "the database closed its output while running %r" % sql
-                )
-            line = raw.rstrip("\n")
-            if line == self.token:
-                break
-            lines.append(line)
-        # The last line before the token is the header of the synchronisation
-        # result set, which belongs to the protocol and not to the statement.
-        if lines and lines[-1] == "tok":
-            lines.pop()
-        return lines
+        self.sequence += 1
+        request = {
+            "id": self.sequence,
+            "op": "execute",
+            "sql": sql.rstrip().rstrip(";"),
+            "search_mode": self.mode,
+        }
+        self.proc.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
+        self.proc.stdin.flush()
+        raw = self.proc.stdout.readline()
+        if not raw:
+            raise Failure(
+                "the database closed its output while running %r" % sql
+            )
+        try:
+            answer = json.loads(raw)
+        except ValueError as exc:
+            raise Failure("the answer of %r is not JSON: %r (%s)" % (sql, raw, exc))
+        if answer.get("id") != request["id"]:
+            raise Failure(
+                "the answer of %r carries the id %r, expected %r"
+                % (sql, answer.get("id"), request["id"])
+            )
+        return answer
 
     def query(self, sql, expected_rows):
         """Run a query and return its rows.
 
-        The number of rows is stated by the caller, because the protocol
-        carries no row count.
+        The rows are returned as a list of lists, which keeps the type of
+        every value.
         """
-        lines = self.run(sql)
-        if len(lines) == 1 and lines[0].startswith("ERROR "):
-            raise Failure("the query failed: %s" % lines[0])
-        if len(lines) != expected_rows + 1:
+        answer = self.run(sql)
+        if answer.get("ok") is not True:
+            raise Failure("the query failed: %s" % (answer.get("error"),))
+        rows = answer.get("rows") or []
+        if len(rows) != expected_rows:
             raise Failure(
-                "the query returned %d lines, expected %d rows plus a header"
-                % (len(lines), expected_rows)
+                "the query returned %d rows, expected %d" % (len(rows), expected_rows)
             )
-        return lines[1:]
+        return rows
 
     def exec(self, sql):
         """Run a statement that produces no result set.
@@ -161,10 +159,9 @@ class Db:
         An error is reported as a failure, so that a broken statement cannot
         pass unnoticed.
         """
-        lines = self.run(sql)
-        for line in lines:
-            if line.startswith("ERROR "):
-                raise Failure("the statement failed: %s" % line)
+        answer = self.run(sql)
+        if answer.get("ok") is not True:
+            raise Failure("the statement failed: %s" % (answer.get("error"),))
 
     def close(self):
         try:
@@ -241,14 +238,13 @@ def compare_topk(name, got, truth, tolerance=DIST_TOLERANCE):
         )
 
 
-def parse_topk(lines):
+def parse_topk(rows):
     """Parse the answer of a TopK query into `(distance, pk)` pairs."""
     out = []
-    for line in lines:
-        parts = line.split("\t")
-        if len(parts) < 2:
-            raise Failure("cannot parse the answer line %r" % line)
-        out.append((float(parts[1]), int(parts[0])))
+    for row in rows:
+        if len(row) < 2:
+            raise Failure("cannot parse the answer row %r" % (row,))
+        out.append((float(row[1]), int(row[0])))
     return out
 
 

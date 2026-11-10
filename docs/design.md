@@ -218,7 +218,59 @@ the database starts, every marked table gets its index rebuilt before the
 server reports readiness - the statement requires that the database does not
 report readiness while an index is still being rebuilt.
 
-## 4. Transactions and durability
+## 4. The wire protocol
+
+The judge drives the database over the standard streams with one JSON object
+per line. The protocol has three parts.
+
+### The handshake
+
+The server opens the data files, replays the log and rebuilds the indexes
+*before* it writes the readiness message, because the statement requires that
+the database does not report readiness while an index is still being rebuilt.
+The message is one line, `{"type":"ready"}`, and it is flushed on its own, so
+the judge sees it even when it sends nothing at all.
+
+### The requests
+
+A request is an object with an `id`, an `op` and, for `execute`, a `sql` and
+a `search_mode`. The `id` is echoed back with the very same JSON type, so a
+number stays a number and a string stays a string.
+
+The reader is a dependency free JSON parser (`proto/json.rs`). It is strict
+where the protocol demands it: trailing content is refused, a duplicate
+object key is an error rather than a silent overwrite, and a non finite
+number is refused. A request that fails to parse is reported like any other
+failure and the session continues, because a single bad line must not take
+the whole run down.
+
+### The answers
+
+A query carries its `columns` and its `rows`. The `rows` field is present
+even when the result set is empty, because the judge compares it against an
+empty list and a missing field is not an empty list. A modification carries
+`affected_rows`. A failure carries `ok:false` and an `error` with a non empty
+`code`.
+
+The code names the kind of the failure, not its wording: `duplicate_key`,
+`unsupported_sql`, `dimension_mismatch` and so on. The numeric MySQL code is
+kept next to it and appears in the diagnostics on standard error.
+
+Every message is flushed as soon as it is written, because the judge reads
+one line at a time and would otherwise wait for a buffer that never fills.
+Nothing but a protocol message is ever written to standard output.
+
+### The end of the session
+
+The `shutdown` request rolls back an open transaction, flushes the committed
+data to disk and answers `{"id":N,"ok":true}`. The judge then closes the
+standard input and waits for the process, which ends with the code 0 and
+without writing anything more.
+
+Closing the standard input has the same effect, so a driver that simply
+hangs up still gets a clean shutdown.
+
+## 5. Transactions and durability
 
 A statement that runs outside an explicit transaction is its own transaction
 and takes effect at once.
@@ -229,6 +281,14 @@ buffer; the data files are only written at the commit. This makes a rollback
 exact, and it makes a statement that fails leave nothing behind: the log
 records of a statement are staged as well and are only appended to the log
 once the statement has succeeded.
+
+The buffer is an ordered log rather than a set of maps, and that shape is
+what allows a statement to be undone precisely. A statement that fails
+removes only the operations it staged; the operations of the statements that
+ran before it in the same transaction stay, and the transaction can
+continue. The alternative - dropping the whole buffer on a failure - would
+silently roll back the earlier statements as well, which is wrong: the
+transaction has not failed, only one of its statements has.
 
 ### The write-ahead log
 
@@ -253,14 +313,14 @@ whether a record has already been applied. After the replay the log is
 truncated and the data files hold the recovered state, so an interrupted
 recovery that is retried produces the same result.
 
-### The end of the input
+### The end of the session
 
-When the input ends, the server rolls back an open transaction, writes a
+When the session ends, the server rolls back an open transaction, writes a
 rollback marker, discards the staged changes and flushes the committed data
 to disk. The statement requires this explicitly: a transaction that was never
 committed must not become visible after a restart.
 
-## 5. What is not implemented
+## 6. What is not implemented
 
 The following is deliberately out of scope, and the database reports an error
 rather than behaving like something else:
@@ -282,7 +342,7 @@ A finite `--ann-nprobe` gives up early and is therefore genuinely
 approximate; the recall then depends on the data set, and the benchmark
 reports it.
 
-## 6. The measurements
+## 7. The measurements
 
 The performance is measured with `tools/bench.py`, which builds the data set
 of the statement - ten thousand rows of a dimension of 128, a hundred rows

@@ -68,39 +68,53 @@ class Failure(Exception):
 class Db:
     """A running instance of the database under test.
 
-    The `jsonl` output format is used: every statement produces exactly one
-    line, holding a JSON object. That removes the ambiguity of the plain
-    result stream, which has no end-of-result marker.
+    The database speaks the JSON Lines protocol of the competition: it
+    announces itself with `{"type":"ready"}` and then answers one JSON
+    object per request. The client checks the id of every answer, so a
+    protocol bug shows up here rather than in the measurement.
     """
 
     def __init__(self, binary, data_dir, mode="ann", nlist=64, nprobe=None):
         env = dict(os.environ)
         env["MINIVECDB_DATA_DIR"] = data_dir
         env["MINIVECDB_MODE"] = mode
-        env["MINIVECDB_OUTPUT_FORMAT"] = "jsonl"
-        env["MINIVECDB_READY_SINK"] = "stderr"
         env["MINIVECDB_ANN_NLIST"] = str(nlist)
         if nprobe is not None:
             env["MINIVECDB_ANN_NPROBE"] = str(nprobe)
         else:
             env.pop("MINIVECDB_ANN_NPROBE", None)
         self.proc = subprocess.Popen(
-            [binary],
+            [binary, "--data-dir", data_dir],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             env=env,
             text=True,
             bufsize=1,
         )
-        # Wait for the readiness token.
-        line = self.proc.stderr.readline()
-        if "ready" not in line:
-            raise Failure("the database did not report readiness: %r" % line)
+        self.sequence = 0
+        self.mode = mode
+        # The handshake has to arrive before the first request is sent.
+        raw = self.proc.stdout.readline()
+        if not raw:
+            raise Failure("the database closed its output before the handshake")
+        try:
+            message = json.loads(raw)
+        except ValueError as exc:
+            raise Failure("the handshake is not JSON: %r (%s)" % (raw, exc))
+        if message != {"type": "ready"}:
+            raise Failure("expected a ready message, got %r" % (message,))
 
-    def run(self, sql):
+    def run(self, sql, mode=None):
         """Run one statement and return its answer."""
-        self.proc.stdin.write(sql.rstrip() + "\n")
+        self.sequence += 1
+        request = {
+            "id": self.sequence,
+            "op": "execute",
+            "sql": sql.rstrip().rstrip(";"),
+            "search_mode": mode or self.mode,
+        }
+        self.proc.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
         self.proc.stdin.flush()
         raw = self.proc.stdout.readline()
         if not raw:
@@ -108,9 +122,14 @@ class Db:
                 "the database closed its output while running %r" % sql[:120]
             )
         answer = json.loads(raw)
-        if "error" in answer:
+        if answer.get("id") != request["id"]:
             raise Failure(
-                "the statement %r failed: %s" % (sql[:120], answer["error"])
+                "the answer carries the id %r, expected %r"
+                % (answer.get("id"), request["id"])
+            )
+        if answer.get("ok") is not True:
+            raise Failure(
+                "the statement %r failed: %s" % (sql[:120], answer.get("error"))
             )
         return answer
 

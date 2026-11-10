@@ -13,6 +13,10 @@
 # The script kills the database while it recovers, so the recovery itself is
 # interrupted as well - that is the case the statement asks about ("terminate
 # again during recovery, check for repeated recovery").
+#
+# The database is driven through the JSON Lines protocol of the competition.
+# A crash is simulated by sending the statements and killing the process
+# before it can answer, which is what the judge does as well.
 
 set -u
 
@@ -53,15 +57,33 @@ mkdir -p "$DATA"
 
 # ---------------------------------------------------------------- the helpers
 
-# Run one SQL statement against a database whose stdin is the file given as
-# the first argument. The answer is written to the file of the second
-# argument.
-run_sql() {
-    local sql_file="$1" out_file="$2"
+# Feed the statements given on stdin to a database and write its answers to
+# the file of the first argument. The process is killed as soon as it has
+# read the input, which is what a crash looks like.
+feed_and_kill() {
+    local out_file="$1"
+    local sql_file="$2"
+    local jsonl="$WORK/feed.jsonl"
+    python3 "$ROOT/tools/sql2jsonl.py" "$sql_file" "$jsonl" || return 1
     MINIVECDB_DATA_DIR="$DATA" \
-    MINIVECDB_OUTPUT_FORMAT=tsv \
-    MINIVECDB_READY_SINK=stderr \
-    "$BINARY" <"$sql_file" >"$out_file" 2>"$WORK/stderr.txt"
+    MINIVECDB_MODE=exact \
+    "$BINARY" --data-dir "$DATA" <"$jsonl" >"$out_file" 2>/dev/null &
+    local pid=$!
+    sleep 0.05
+    kill -9 "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+}
+
+# Run the statements of the second argument to completion and write the
+# answers to the file of the first argument.
+feed_all() {
+    local out_file="$1"
+    local sql_file="$2"
+    local jsonl="$WORK/feed.jsonl"
+    python3 "$ROOT/tools/sql2jsonl.py" "$sql_file" "$jsonl" || return 1
+    MINIVECDB_DATA_DIR="$DATA" \
+    MINIVECDB_MODE=exact \
+    "$BINARY" --data-dir "$DATA" <"$jsonl" >"$out_file" 2>/dev/null
 }
 
 # Count the rows of a table with a query.
@@ -70,9 +92,23 @@ count_rows() {
     local sql_file="$WORK/count.sql"
     local out_file="$WORK/count.out"
     printf 'SELECT id FROM %s;\n' "$table" >"$sql_file"
-    run_sql "$sql_file" "$out_file" || { echo "-1"; return; }
-    # The first line is the header.
-    tail -n +2 "$out_file" | wc -l | tr -d ' '
+    feed_all "$out_file" "$sql_file" || { echo "-1"; return; }
+    # The answer is one JSON object; the rows are in its `rows` field.
+    python3 - "$out_file" <<'PY'
+import json, sys
+text = open(sys.argv[1], encoding="utf-8").read()
+count = 0
+for line in text.splitlines():
+    line = line.strip()
+    if not line:
+        continue
+    message = json.loads(line)
+    if message.get("type") == "ready":
+        continue
+    if message.get("ok") is True:
+        count += len(message.get("rows") or [])
+print(count)
+PY
 }
 
 # The identifiers of the rows of a table, sorted.
@@ -81,8 +117,23 @@ list_rows() {
     local sql_file="$WORK/list.sql"
     local out_file="$WORK/list.out"
     printf 'SELECT id FROM %s;\n' "$table" >"$sql_file"
-    run_sql "$sql_file" "$out_file" || return
-    tail -n +2 "$out_file" | sort -n
+    feed_all "$out_file" "$sql_file" || return
+    python3 - "$out_file" <<'PY'
+import json, sys
+text = open(sys.argv[1], encoding="utf-8").read()
+ids = []
+for line in text.splitlines():
+    line = line.strip()
+    if not line:
+        continue
+    message = json.loads(line)
+    if message.get("type") == "ready":
+        continue
+    for row in message.get("rows") or []:
+        ids.append(str(row[0]))
+for value in sorted(ids, key=int):
+    print(value)
+PY
 }
 
 say "MiniVectorDB crash recovery test"
@@ -101,7 +152,7 @@ say "preparing the initial state"
             "$i" "$i" "$((i + 1))" "$((i + 2))" "$((i + 3))"
     done
 } >"$WORK/init.sql"
-run_sql "$WORK/init.sql" "$WORK/init.out" || {
+feed_all "$WORK/init.out" "$WORK/init.sql" || {
     fail "the initial load failed"
     exit 1
 }
@@ -138,16 +189,7 @@ for round in $(seq 1 "$ROUNDS"); do
     # The process is killed while it is still working. Whether the
     # transaction was committed depends on how far it got; the test only
     # requires that the state is consistent afterwards.
-    MINIVECDB_DATA_DIR="$DATA" \
-    MINIVECDB_OUTPUT_FORMAT=tsv \
-    MINIVECDB_READY_SINK=stderr \
-    "$BINARY" <"$WORK/round.sql" >"$WORK/round.out" 2>/dev/null &
-    pid=$!
-
-    # Let the process work for a moment, then kill it.
-    sleep 0.05
-    kill -9 "$pid" 2>/dev/null
-    wait "$pid" 2>/dev/null
+    feed_and_kill "$WORK/round.out" "$WORK/round.sql"
 
     # An uncommitted transaction: the rows must not be visible.
     {
@@ -159,34 +201,30 @@ for round in $(seq 1 "$ROUNDS"); do
         done
         # No COMMIT: the transaction is never acknowledged.
     } >"$WORK/pending.sql"
-    MINIVECDB_DATA_DIR="$DATA" \
-    MINIVECDB_OUTPUT_FORMAT=tsv \
-    MINIVECDB_READY_SINK=stderr \
-    "$BINARY" <"$WORK/pending.sql" >"$WORK/pending.out" 2>/dev/null &
-    pid=$!
-    sleep 0.05
-    kill -9 "$pid" 2>/dev/null
-    wait "$pid" 2>/dev/null
+    feed_and_kill "$WORK/pending.out" "$WORK/pending.sql"
 
     # Restart the database and check the state. The restart itself may be
     # interrupted in the next round, so the recovery has to be idempotent.
     {
         printf "SELECT id FROM t;\n"
     } >"$WORK/check.sql"
-    if ! run_sql "$WORK/check.sql" "$WORK/check.out"; then
+    if ! feed_all "$WORK/check.out" "$WORK/check.sql"; then
         fail "round $round: the database did not start again"
         continue
     fi
 
+    # Collect the identifiers of the rows that are visible.
+    list_rows t >"$WORK/ids.txt"
+
     # No row may appear twice.
-    duplicates="$(tail -n +2 "$WORK/check.out" | sort -n | uniq -d | wc -l | tr -d ' ')"
+    duplicates="$(sort -n "$WORK/ids.txt" | uniq -d | wc -l | tr -d ' ')"
     if [ "$duplicates" != "0" ]; then
         fail "round $round: $duplicates duplicated rows after the recovery"
     fi
 
     # The rows of the uncommitted transaction must be absent.
-    ghosts="$(tail -n +2 "$WORK/check.out" | awk -v base="$base" \
-        '$1 > base + 100000 && $1 <= base + 100020' | wc -l | tr -d ' ')"
+    ghosts="$(awk -v base="$base" \
+        '$1 > base + 100000 && $1 <= base + 100020' "$WORK/ids.txt" | wc -l | tr -d ' ')"
     if [ "$ghosts" != "0" ]; then
         fail "round $round: $ghosts rows of the uncommitted transaction are visible"
     fi
@@ -194,7 +232,7 @@ for round in $(seq 1 "$ROUNDS"); do
     # The rows that were committed before the crash must still be there.
     missing=0
     for id in $(seq 1 "$BATCH"); do
-        if ! tail -n +2 "$WORK/check.out" | grep -qx "$id"; then
+        if ! grep -qx "$id" "$WORK/ids.txt"; then
             missing=$((missing + 1))
         fi
     done
@@ -217,7 +255,9 @@ if [ "$final_count" -lt "$initial_count" ]; then
     fail "the final state has $final_count rows, fewer than the initial $initial_count"
 fi
 
-duplicates="$(list_rows t | uniq -d | wc -l | tr -d ' ')"
+list_rows t >"$WORK/final_ids.txt"
+
+duplicates="$(sort -n "$WORK/final_ids.txt" | uniq -d | wc -l | tr -d ' ')"
 if [ "$duplicates" != "0" ]; then
     fail "the final state has $duplicates duplicated rows"
 fi
@@ -225,7 +265,7 @@ fi
 # The rows of the very first batch must still be there.
 missing=0
 for id in $(seq 1 "$BATCH"); do
-    if ! list_rows t | grep -qx "$id"; then
+    if ! grep -qx "$id" "$WORK/final_ids.txt"; then
         missing=$((missing + 1))
     fi
 done
@@ -239,7 +279,7 @@ for round in $(seq 1 "$ROUNDS"); do
     base=$((round * BATCH))
     for i in $(seq 1 20); do
         id=$((base + 100000 + i))
-        if list_rows t | grep -qx "$id"; then
+        if grep -qx "$id" "$WORK/final_ids.txt"; then
             ghosts=$((ghosts + 1))
         fi
     done

@@ -1,20 +1,19 @@
 //! Result formatting and output.
 //!
-//! The wire format follows the MySQL `mysqltest` style used by seekdb's own
-//! test suite: a header line with tab separated column names followed by one
-//! tab separated line per row, and errors rendered as
-//! `ERROR <code>: <message>`.
+//! The wire format of the competition is JSON Lines: one JSON object per
+//! line, on stdin and on stdout. The `session` module owns that protocol and
+//! the `json` module is the dependency free reader and writer it uses.
 //!
-//! A second format is available for the case runner of the published public
-//! samples. It writes one JSON object per statement, whose fields are the
-//! same as the fields of the published `.result` files: `affected_rows`,
-//! `columns` and `rows`. That format keeps the type of every value, so an
-//! integer is not confused with a float.
+//! The older text formats are kept for the local development scripts: a
+//! header line with tab separated column names followed by one tab separated
+//! line per row, and errors rendered as `ERROR <code>: <message>`.
 //!
-//! Everything the driver reads goes to stdout; diagnostics go to stderr. The
+//! Everything the judge reads goes to stdout; diagnostics go to stderr. The
 //! stdout buffer is flushed after every statement so that the driver never
 //! waits on a result that has already been produced.
 
+pub mod json;
+pub mod session;
 pub mod split;
 
 use crate::config::OutputFormat;

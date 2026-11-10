@@ -101,8 +101,29 @@ def compare_answer(expected, actual, where):
     """Compare the answer of one statement with its expectation."""
     if not isinstance(actual, dict):
         raise Failure("%s: the answer is not an object: %r" % (where, actual))
-    if "error" in actual:
-        raise Failure("%s: the statement failed: %r" % (where, actual["error"]))
+
+    # An expectation that names an error means the statement has to fail.
+    # The judge only checks that the failure carries a non-empty code, so
+    # the name of the code is compared as well when the expectation gives
+    # one.
+    if "error" in expected:
+        if actual.get("ok") is not False:
+            raise Failure("%s: the statement should have failed: %r" % (where, actual))
+        error = actual.get("error")
+        if not isinstance(error, dict):
+            raise Failure("%s: the failure carries no error object: %r" % (where, actual))
+        code = error.get("code")
+        if not isinstance(code, str) or not code:
+            raise Failure("%s: the failure carries no error code: %r" % (where, error))
+        want = expected["error"]
+        if isinstance(want, str) and want and code != want:
+            raise Failure(
+                "%s: expected the error %r, got %r" % (where, want, code)
+            )
+        return
+
+    if actual.get("ok") is not True:
+        raise Failure("%s: the statement failed: %r" % (where, actual))
 
     if "affected_rows" in expected:
         got = actual.get("affected_rows")
@@ -131,29 +152,50 @@ class Database:
         env = dict(os.environ)
         env["MINIVECDB_DATA_DIR"] = data_dir
         env["MINIVECDB_MODE"] = mode
-        env["MINIVECDB_OUTPUT_FORMAT"] = "jsonl"
-        env["MINIVECDB_READY_SINK"] = "stderr"
         env["MINIVECDB_ANN_NLIST"] = str(nlist)
         if nprobe is None:
             env.pop("MINIVECDB_ANN_NPROBE", None)
         else:
             env["MINIVECDB_ANN_NPROBE"] = str(nprobe)
+        self.binary = binary
+        self.data_dir = data_dir
+        self.env = env
+        self.mode = mode
+        self.proc = None
+        self.sequence = 0
+        self.start()
+
+    def start(self):
+        """Start the process and wait for the readiness handshake."""
         self.proc = subprocess.Popen(
-            [binary],
+            [self.binary, "--data-dir", self.data_dir],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env,
+            stderr=subprocess.DEVNULL,
+            env=self.env,
             text=True,
             bufsize=1,
         )
-        line = self.proc.stderr.readline()
-        if "ready" not in line:
-            raise Failure("the database did not report readiness: %r" % line)
+        raw = self.proc.stdout.readline()
+        if not raw:
+            raise Failure("the database closed its output before the handshake")
+        try:
+            message = json.loads(raw)
+        except ValueError as exc:
+            raise Failure("the handshake is not JSON: %r (%s)" % (raw, exc))
+        if message != {"type": "ready"}:
+            raise Failure("expected a ready message, got %r" % (message,))
 
-    def run(self, sql):
+    def run(self, sql, mode=None):
         """Run one statement and return the answer object."""
-        self.proc.stdin.write(sql.rstrip() + "\n")
+        self.sequence += 1
+        request = {
+            "id": self.sequence,
+            "op": "execute",
+            "sql": sql.rstrip().rstrip(";"),
+            "search_mode": mode or self.mode,
+        }
+        self.proc.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
         self.proc.stdin.flush()
         raw = self.proc.stdout.readline()
         if not raw:
@@ -162,9 +204,21 @@ class Database:
         if not raw:
             raise Failure("the statement %r produced no answer" % sql)
         try:
-            return json.loads(raw)
+            answer = json.loads(raw)
         except ValueError as exc:
             raise Failure("the answer of %r is not JSON: %r (%s)" % (sql, raw, exc))
+        if answer.get("id") != request["id"]:
+            raise Failure(
+                "the answer of %r carries the id %r, expected %r"
+                % (sql, answer.get("id"), request["id"])
+            )
+        return answer
+
+    def restart(self):
+        """Shut the process down and start it again on the same data."""
+        self.close()
+        self.sequence = 0
+        self.start()
 
     def close(self):
         try:
@@ -178,7 +232,12 @@ class Database:
 
 
 def read_statements(path):
-    """Read the statements of a `.test` file."""
+    """Read the statements of a `.test` file.
+
+    The driver directives `--restart` and `--mode exact` / `--mode ann` are
+    kept aside: they are not statements, they change the state of the
+    session.
+    """
     statements = []
     with open(path, "r", encoding="utf-8") as fh:
         for line in fh:
@@ -195,26 +254,49 @@ def run_case(case_id, cases_dir, binary, mode, verbose):
     with open(result_path, "r", encoding="utf-8") as fh:
         expectations = json.load(fh)
     statements = read_statements(test_path)
-    if len(statements) != len(expectations):
+
+    # The directives are not statements, so they do not consume an
+    # expectation. The expectations are matched against the statements that
+    # remain.
+    plan = []
+    for line in statements:
+        if line == "--restart":
+            plan.append(("restart", None))
+        elif line in ("--mode exact", "--mode ann"):
+            plan.append(("mode", line.split()[1]))
+        else:
+            plan.append(("sql", line))
+    expected_statements = [p for p in plan if p[0] == "sql"]
+    if len(expected_statements) != len(expectations):
         raise Failure(
             "the case %s has %d statements but %d expectations"
-            % (case_id, len(statements), len(expectations))
+            % (case_id, len(expected_statements), len(expectations))
         )
 
     work = tempfile.mkdtemp(prefix="mvdb-case-")
     failures = []
     db = None
+    index = 0
     try:
         db = Database(binary, os.path.join(work, "data"), mode=mode)
-        for i, (sql, expected) in enumerate(zip(statements, expectations)):
+        for kind, value in plan:
+            if kind == "restart":
+                db.restart()
+                continue
+            if kind == "mode":
+                db.mode = value
+                continue
+            sql = value
+            expected = expectations[index]
+            index += 1
             try:
                 actual = db.run(sql)
-                compare_answer(expected, actual, "statement %d (%s)" % (i + 1, sql))
+                compare_answer(expected, actual, "statement %d (%s)" % (index, sql))
                 if verbose:
-                    print("ok    %-22s %d" % (case_id, i + 1))
+                    print("ok    %-22s %d" % (case_id, index))
             except Failure as exc:
                 failures.append(str(exc))
-                print("FAIL  %-22s %d: %s" % (case_id, i + 1, exc), file=sys.stderr)
+                print("FAIL  %-22s %d: %s" % (case_id, index, exc), file=sys.stderr)
     finally:
         if db is not None:
             db.close()

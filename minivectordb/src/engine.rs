@@ -29,71 +29,115 @@ pub enum TxnState {
 
 /// Per transaction undo information.
 ///
-/// The engine keeps the affected rows in memory and only writes them to the
-/// data files at COMMIT, which makes ROLLBACK trivial and guarantees that a
-/// failed statement leaves no partial modification.
+/// The engine keeps the affected rows in memory and only writes them to
+/// the data files at COMMIT, which makes ROLLBACK trivial and guarantees that
+/// a failed statement leaves no partial modification.
+///
+/// The staged changes are kept as an ordered log rather than as three maps.
+/// The log shape allows a statement to be undone precisely: a statement that
+/// fails must not roll back the changes of the statements that ran before it
+/// in the same transaction.
 #[derive(Debug, Default)]
 pub struct TxnBuffer {
-    /// Staged inserts per table, in insertion order: (row_id, values).
-    inserted: HashMap<u32, Vec<(u64, Vec<ColValue>)>>,
-    /// Staged updates: (table_id, row_id) -> new values.
-    updated: HashMap<(u32, u64), Vec<ColValue>>,
-    /// Staged deletes: (table_id, row_id).
-    deleted: HashMap<(u32, u64), ()>,
+    /// The staged operations, in the order they were prepared.
+    ops: Vec<TxnOp>,
 }
+
+/// One staged operation.
+#[derive(Debug, Clone)]
+pub enum TxnOp {
+    /// An inserted row.
+    Insert { table_id: u32, row_id: u64, cols: Vec<ColValue> },
+    /// An updated row. The columns are the new values of the whole row.
+    Update { table_id: u32, row_id: u64, cols: Vec<ColValue> },
+    /// A deleted row.
+    Delete { table_id: u32, row_id: u64 },
+}
+
+/// A position in the staged log, used to undo the changes of one statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TxnMark(usize);
 
 impl TxnBuffer {
     pub fn is_empty(&self) -> bool {
-        self.inserted.is_empty() && self.updated.is_empty() && self.deleted.is_empty()
+        self.ops.is_empty()
+    }
+
+    /// The current position of the staged log.
+    pub fn mark(&self) -> TxnMark {
+        TxnMark(self.ops.len())
+    }
+
+    /// Undo every operation that was staged after `mark`.
+    ///
+    /// This is what a failing statement does: it removes its own changes and
+    /// leaves the changes of the earlier statements of the transaction alone.
+    pub fn undo_to(&mut self, mark: TxnMark) {
+        self.ops.truncate(mark.0);
     }
 
     /// Stage an insert.
     pub fn stage_insert(&mut self, table_id: u32, row_id: u64, cols: Vec<ColValue>) {
-        self.inserted.entry(table_id).or_default().push((row_id, cols));
+        self.ops.push(TxnOp::Insert { table_id, row_id, cols });
     }
 
     /// Stage an update.
     pub fn stage_update(&mut self, table_id: u32, row_id: u64, cols: Vec<ColValue>) {
-        self.updated.insert((table_id, row_id), cols);
+        self.ops.push(TxnOp::Update { table_id, row_id, cols });
     }
 
     /// Stage a delete.
     pub fn stage_delete(&mut self, table_id: u32, row_id: u64) {
-        self.deleted.insert((table_id, row_id), ());
+        self.ops.push(TxnOp::Delete { table_id, row_id });
     }
 
     /// Discard everything staged.
     pub fn clear(&mut self) {
-        self.inserted.clear();
-        self.updated.clear();
-        self.deleted.clear();
+        self.ops.clear();
     }
 
-    /// Number of staged inserts for a table.
+    /// Number of staged inserts of a table.
     pub fn inserted_len(&self, table_id: u32) -> usize {
-        self.inserted.get(&table_id).map(|v| v.len()).unwrap_or(0)
+        self.ops
+            .iter()
+            .filter(|op| matches!(op, TxnOp::Insert { table_id: t, .. } if *t == table_id))
+            .count()
     }
 
     /// Staged inserts of a table, oldest first.
     pub fn inserted_of(&self, table_id: u32) -> Vec<(u64, Vec<ColValue>)> {
-        self.inserted.get(&table_id).cloned().unwrap_or_default()
+        self.ops
+            .iter()
+            .filter_map(|op| match op {
+                TxnOp::Insert { table_id: t, row_id, cols } if *t == table_id => {
+                    Some((*row_id, cols.clone()))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     /// All staged updates of a table.
     pub fn updated_of(&self, table_id: u32) -> Vec<(u64, Vec<ColValue>)> {
-        self.updated
+        self.ops
             .iter()
-            .filter(|((t, _), _)| *t == table_id)
-            .map(|((_, r), c)| (*r, c.clone()))
+            .filter_map(|op| match op {
+                TxnOp::Update { table_id: t, row_id, cols } if *t == table_id => {
+                    Some((*row_id, cols.clone()))
+                }
+                _ => None,
+            })
             .collect()
     }
 
     /// All staged deletes of a table.
     pub fn deleted_of(&self, table_id: u32) -> Vec<u64> {
-        self.deleted
+        self.ops
             .iter()
-            .filter(|((t, _), _)| *t == table_id)
-            .map(|((_, r), _)| *r)
+            .filter_map(|op| match op {
+                TxnOp::Delete { table_id: t, row_id } if *t == table_id => Some(*row_id),
+                _ => None,
+            })
             .collect()
     }
 }
@@ -491,6 +535,10 @@ impl Engine {
     ///   dropped.
     pub fn execute(&mut self, stmt: &crate::sql::ast::Statement) -> SqlResult<QueryResult> {
         let in_txn = self.txn_state == TxnState::InProgress;
+        // The position of the staged log is taken before the statement runs,
+        // so that a failure can undo exactly this statement and leave the
+        // changes of the earlier statements of the transaction alone.
+        let mark = self.txn_buffer.mark();
         let result = self.dispatch(stmt);
         match result {
             Ok(r) => {
@@ -513,8 +561,11 @@ impl Engine {
                 Ok(r)
             }
             Err(e) => {
-                // The statement failed: undo everything it staged.
-                self.txn_buffer.clear();
+                // The statement failed: undo only what it staged. The
+                // changes of the statements that ran before it in the same
+                // transaction stay, because the transaction as a whole has
+                // not failed.
+                self.txn_buffer.undo_to(mark);
                 self.wal.discard_staged();
                 Err(e)
             }

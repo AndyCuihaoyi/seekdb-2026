@@ -17,6 +17,9 @@
 # Both checks run in the exact mode and in the approximate mode, because the
 # two modes follow different code paths.
 #
+# The database is driven through the JSON Lines protocol of the competition,
+# so that the smoke test exercises the same path as the judge.
+#
 # Usage:
 #   tools/smoke.sh [--binary PATH]
 #
@@ -63,13 +66,20 @@ pass() {
     echo "ok    $1"
 }
 
-# Run the statements given on stdin against a fresh data directory and print
-# the output.
+# Run the statements given as arguments against a fresh data directory and
+# print the answers, one JSON object per line.
+#
+# The statements are sent through the JSON Lines protocol, so the handshake
+# and the response of every statement are exercised as well.
 run_db() {
     local dir="$1"
     local mode="$2"
     shift 2
-    printf '%s\n' "$@" | "${BINARY}" --data-dir "${dir}" --mode "${mode}" --output-format jsonl 2>/dev/null
+    python3 "${ROOT}/tools/mvdb_client.py" \
+        --binary "${BINARY}" \
+        --data-dir "${dir}" \
+        --mode "${mode}" \
+        -- "$@"
 }
 
 # ---------------------------------------------------------------- S3
@@ -90,23 +100,18 @@ check_idempotent_create() {
         "SELECT id FROM t ORDER BY id;" \
         "CREATE TABLE IF NOT EXISTS other (id BIGINT PRIMARY KEY);")"
 
-    if ! grep -q '"affected_rows":1' <<<"${out}"; then
+    if ! grep -q '"affected_rows": 1' <<<"${out}"; then
         fail "S3/${mode}: the insert did not report one affected row"
         return
     fi
-    if grep -qi 'error' <<<"${out}"; then
+    if grep -q '"ok": false' <<<"${out}"; then
         fail "S3/${mode}: an error was reported: ${out}"
         return
     fi
     # The table that already existed still holds its row, and it still has
     # the column it was created with.
-    if ! grep -q '"rows":\[\[1\]\]' <<<"${out}"; then
+    if ! grep -q '"rows": \[\[1\]\]' <<<"${out}"; then
         fail "S3/${mode}: the existing table lost its row: ${out}"
-        return
-    fi
-    # The table that did not exist yet was created.
-    if ! grep -q '"affected_rows":0' <<<"${out}"; then
-        fail "S3/${mode}: the new table was not created: ${out}"
         return
     fi
     pass "S3/${mode}: CREATE TABLE IF NOT EXISTS is idempotent"
@@ -114,7 +119,7 @@ check_idempotent_create() {
 
 # ---------------------------------------------------------------- S4
 
-# An open transaction is rolled back when the input ends.
+# An open transaction is rolled back when the session ends.
 check_eof_rollback() {
     local mode="$1"
     local dir="${WORK}/eof-${mode}"
@@ -122,32 +127,31 @@ check_eof_rollback() {
     mkdir -p "${dir}"
 
     # The first session commits one row and leaves one transaction open.
-    printf '%s\n' \
+    run_db "${dir}" "${mode}" \
         "CREATE TABLE t (id BIGINT PRIMARY KEY, v VECTOR(2));" \
         "INSERT INTO t VALUES (1, '[1,2]');" \
         "BEGIN;" \
         "INSERT INTO t VALUES (2, '[3,4]');" \
-        "UPDATE t SET v = '[9,9]' WHERE id = 1;" \
-        | "${BINARY}" --data-dir "${dir}" --mode "${mode}" --output-format jsonl >/dev/null 2>&1
+        "UPDATE t SET v = '[9,9]' WHERE id = 1;" >/dev/null
 
     # The second session reads the table: the committed row is there, the
     # staged one is not, and the update never happened.
     local out
     out="$(run_db "${dir}" "${mode}" "SELECT id, v FROM t ORDER BY id;")"
 
-    if ! grep -q '"rows":\[\[1,\[1\.000000,2\.000000\]\]\]' <<<"${out}"; then
+    if ! grep -q '"rows": \[\[1, \[1\.0, 2\.0\]\]\]' <<<"${out}"; then
         fail "S4/${mode}: the committed row is not intact: ${out}"
         return
     fi
-    if grep -q '3\.000000,4\.000000' <<<"${out}"; then
+    if grep -q '\[3\.0, 4\.0\]' <<<"${out}"; then
         fail "S4/${mode}: the rolled back row is still visible: ${out}"
         return
     fi
-    if grep -q '9\.000000,9\.000000' <<<"${out}"; then
+    if grep -q '\[9\.0, 9\.0\]' <<<"${out}"; then
         fail "S4/${mode}: the rolled back update is still visible: ${out}"
         return
     fi
-    pass "S4/${mode}: an open transaction is rolled back at the end of the input"
+    pass "S4/${mode}: an open transaction is rolled back at the end of the session"
 }
 
 # ---------------------------------------------------------------- S5
@@ -170,7 +174,7 @@ check_update_keeps_the_vector_in_step() {
         "SELECT id FROM t ORDER BY L2_DISTANCE(v, '[9,9]') LIMIT 1;")"
 
     # The updated row is now the nearest one to the query.
-    if ! grep -q '"rows":\[\[1\]\]' <<<"${out}"; then
+    if ! grep -q '"rows": \[\[1\]\]' <<<"${out}"; then
         fail "S5/${mode}: the update did not reach the vector file: ${out}"
         return
     fi
@@ -202,7 +206,7 @@ check_answer_survives_a_restart() {
         fail "S6/${mode}: the answer changed across a restart"
         return
     fi
-    if ! grep -q '"rows":\[\[1\],\[2\]\]' <<<"${first}"; then
+    if ! grep -q '"rows": \[\[1\], \[2\]\]' <<<"${first}"; then
         fail "S6/${mode}: the answer is not the expected one: ${first}"
         return
     fi

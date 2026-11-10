@@ -59,8 +59,6 @@ exec docker run --rm -i \
     -v "$DATA_DIR":/data \
     -u "$HOST_UID:$HOST_GID" \
     -e MINIVECDB_MODE \
-    -e MINIVECDB_OUTPUT_FORMAT \
-    -e MINIVECDB_READY_SINK \
     -e MINIVECDB_ANN_NLIST \
     -e MINIVECDB_ANN_NPROBE \
     -e MINIVECDB_CONTAINER_ARGS \

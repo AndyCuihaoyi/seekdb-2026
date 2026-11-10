@@ -275,7 +275,7 @@ impl Engine {
 
     fn exec_begin(&mut self) -> SqlResult<QueryResult> {
         if self.txn_state == TxnState::InProgress {
-            return Err(SqlError::not_supported("nested transactions are not supported"));
+            return Err(SqlError::transaction_state("nested transactions are not supported"));
         }
         self.txn_state = TxnState::InProgress;
         self.wal.set_txn_id(self.next_txn_id);
@@ -284,7 +284,7 @@ impl Engine {
 
     fn exec_commit(&mut self) -> SqlResult<QueryResult> {
         if self.txn_state != TxnState::InProgress {
-            return Err(SqlError::not_supported("there is no active transaction"));
+            return Err(SqlError::transaction_state("there is no active transaction"));
         }
         self.commit_buffer()?;
         self.txn_state = TxnState::Auto;
@@ -295,7 +295,7 @@ impl Engine {
 
     fn exec_rollback(&mut self) -> SqlResult<QueryResult> {
         if self.txn_state != TxnState::InProgress {
-            return Err(SqlError::not_supported("there is no active transaction"));
+            return Err(SqlError::transaction_state("there is no active transaction"));
         }
         self.wal
             .log_rollback()

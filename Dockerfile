@@ -35,17 +35,17 @@ RUN mkdir -p /data && chmod 1777 /data
 VOLUME ["/data"]
 
 ENV MINIVECDB_DATA_DIR=/data
-ENV MINIVECDB_OUTPUT_FORMAT=tsv
-ENV MINIVECDB_READY_SINK=stderr
 ENV MINIVECDB_MODE=exact
 ENV MINIVECDB_DURABILITY=os
 ENV MINIVECDB_BUFFER_POOL_MB=64
 
-# The server reads SQL from stdin and writes results to stdout.
+# The server speaks the JSON Lines protocol of the competition over stdin and
+# stdout: it announces itself with `{"type":"ready"}`, answers every
+# `execute` request with one response object, and answers the `shutdown`
+# request before it exits with code 0.
 #
-# The command line matches the example of the statement, so that the image
-# runs the same way when it is started with a plain `docker run`. The
-# environment variables above are still there, and a flag on the command line
-# takes precedence over them.
+# The image therefore has to start the server in that mode by default. It must
+# not fall back to an SQL prompt or start a network service, because the judge
+# drives the process over its standard streams.
 ENTRYPOINT ["/usr/local/bin/minivectordb"]
 CMD ["--data-dir", "/data"]
