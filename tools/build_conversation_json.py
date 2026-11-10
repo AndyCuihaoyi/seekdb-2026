@@ -190,6 +190,18 @@ USER_PROMPTS = [
         "source": "student",
         "excerpt": "按顺序分别处理两项工作",
     },
+    {
+        "id": "up-15",
+        "time": "2026-11-10T12:25:00+08:00",
+        "content": "再次查看上游仓库是否更新了新的文件",
+        "source": "student",
+        "excerpt": "再次查看上游仓库是否更新了新的文件",
+        "note": (
+            "学生在上游发布新题包后主动复查，而不是等到提测当天才发现。"
+            "这次复查直接改变了提交内容：原实现用的是纯 SQL 协议，"
+            "按新协议提测会在准入环节直接判 0 分。"
+        ),
+    },
 ]
 
 
@@ -568,6 +580,101 @@ CONVERSATIONS = [
             ),
         ],
     },
+    {
+        "id": "c-11",
+        "topic": "上游改版协议：假设被推翻，动手之前先量清楚代价",
+        "turns": [
+            turn(
+                "student",
+                "再次查看上游仓库是否更新了新的文件",
+                "再次查看上游仓库是否更新了新的文件",
+                "/user_prompts/14/excerpt",
+            ),
+            turn(
+                "agent",
+                "**上游确实更新了，而且是决定性更新。** "
+                "`2026-competition-round2` 从 `a3dba559c` 推进到 `f4d4e2665`，"
+                "新增 3 个提交、50 个文件：`STDIO_PROTOCOL.md`（正式协议规范）、"
+                "`protocol_check/`（**官方协议检查工具**，含 `_transport.py`、"
+                "`_assertions.py`、`config.json`）、"
+                "`mysqltest/`（用例从 5 组扩到 20 组）。\n"
+                "**我当前的实现与新协议完全不兼容。**",
+                "**我当前的实现与新协议完全不兼容。**",
+                "/conversations/10/turns/1/excerpt",
+            ),
+            turn(
+                "agent",
+                "协议对照：\n"
+                "| 项 | 我现在 | 官方要求 |\n"
+                "|---|---|---|\n"
+                "| 协议 | 纯 SQL 文本 stdin | **JSON Lines**：每行一个 JSON 请求/响应 |\n"
+                "| 握手 | stdout 无 ready；`ready` 写 stderr | "
+                "**stdout 第一行必须是 `{\"type\":\"ready\"}`** |\n"
+                "| 响应 | TSV 或自造的 `jsonl` | "
+                "`{\"id\":N,\"ok\":true,\"columns\":[...],\"rows\":[...]}` |\n"
+                "| 错误 | `ERROR 23000: ...` 文本 | "
+                "`{\"id\":N,\"ok\":false,\"error\":{\"code\":\"duplicate_key\",...}}` |\n"
+                "| 关闭 | EOF 退出 | `{\"id\":N,\"op\":\"shutdown\"}` → 退出码 0 |\n\n"
+                "**这意味着：按我现在这个版本提测，准入会直接判 0 分**"
+                "（`invalid JSON response`）。必须先改协议层。",
+                "**这意味着：按我现在这个版本提测，准入会直接判 0 分**",
+                "/conversations/10/turns/2/excerpt",
+            ),
+            turn(
+                "agent",
+                "动手顺序：\n"
+                "1. **先写零依赖的 JSON 读写器** —— 评测环境离线，"
+                "crate 必须保持空依赖图，`cargo build --offline --locked` 才可复现。\n"
+                "2. **协议层只做协议的事**：握手、请求分发、响应封装、关闭；"
+                "引擎、存储、索引一行不动。\n"
+                "3. **用官方工具验证**，而不是自写驱动："
+                "`protocol_check/run.py` 的沙箱比题目文字更严"
+                "（`--network=none --read-only --cap-drop=ALL --pids-limit=128`），"
+                "而且每次发请求前会检查 stdout 有没有多余输出。\n"
+                "4. **把官方用例接进本地回归**，让 `--restart` / `--mode ann` "
+                "这两个此前没处理过的指令也能跑。",
+                "**用官方工具验证**，而不是自写驱动",
+                "/conversations/10/turns/3/excerpt",
+            ),
+        ],
+    },
+    {
+        "id": "c-12",
+        "topic": "官方用例暴露的事务语义缺陷：撤销范围与语句原子性",
+        "turns": [
+            turn(
+                "agent",
+                "20 组官方用例**全部 PASS**，真实镜像 + 官方判题器。"
+                "但本地回归脚本报了 4 条失败，其中 3 条不是格式问题，"
+                "是真的语义缺陷 —— 恰好是此前 5 组用例测不到的那一类：\n"
+                "1. `transaction_failed_insert`：失败的 INSERT 只应撤销**自己**，"
+                "同一事务里先前 UPDATE 的结果要保留；"
+                "旧实现语句失败时清空整个事务缓冲，把先前的修改也一起撤销了。\n"
+                "2. `transaction_autocommit_atomic`：多行 INSERT 里有一行非法时，"
+                "**整条语句都不生效**；旧实现逐行插入，第一行已经落盘。\n"
+                "**根因是同一个**：事务缓冲是「三张表」（inserted/updated/deleted），"
+                "结构上没有「撤销到某一位置」的概念。"
+                "改成一条有序日志 `Vec<TxnOp>` + 一个 `TxnMark` 游标，"
+                "失败时按游标截断，就只撤销本语句。",
+                "旧实现语句失败时清空整个事务缓冲，把先前的修改也一起撤销了",
+                "/conversations/11/turns/0/excerpt",
+            ),
+            turn(
+                "agent",
+                "修完之后的判断依据不是「我觉得对了」，而是三件事同时成立：\n"
+                "1. 官方判题器 `protocol_check/run.py` 对真实镜像 20/20 PASS；\n"
+                "2. 本地 `run_public_cases.py` exact 与 ann 双模式全绿；\n"
+                "3. 新增的 12 个协议级集成测试全绿 —— "
+                "覆盖握手形状、id 原样回传、空结果集仍带 `rows`、"
+                "失败语句不终止会话、畸形请求不终止会话、"
+                "shutdown 后不再输出且退出码为 0、会话结束时未提交事务被回滚。\n"
+                "第 3 条是前两条测不到的：判题器检查的是协议，"
+                "SQL 层测试查不到「stdout 有没有多余输出」。",
+                "判题器检查的是协议，SQL 层测试查不到「stdout 有没有多余输出」",
+                "/conversations/11/turns/1/excerpt",
+            ),
+        ],
+    },
 ]
 
 
@@ -814,6 +921,167 @@ EXPERIMENTS = [
             "没有引入额外开销。"
         ),
     },
+    {
+        "id": "e-11",
+        "name": "上游复查推翻了此前的协议假设",
+        "hypothesis": (
+            "此前依据题面「不再采用 JSON 请求/响应封装」把协议做成了纯 SQL 流；"
+            "若上游已发布正式协议与测试驱动，则当前实现按原样提测会直接判 0 分。"
+        ),
+        "command": (
+            "git fetch upstream 2026-competition-round2；"
+            "git diff --stat c842a368c upstream/2026-competition-round2"
+        ),
+        "result": (
+            " STDIO_PROTOCOL.md                                  |   311 +++++++++++++++\n"
+            " mysqltest/README.md                                |    93 ++++++\n"
+            " protocol_check/README.md                            |    69 +++++\n"
+            " protocol_check/_assertions.py                       |    42 ++++\n"
+            " protocol_check/_transport.py                        |   181 +++++++\n"
+            " protocol_check/config.json                          |    12 +\n"
+            " protocol_check/run.py                               |   128 +++++\n"
+            " 50 files changed, 1726 insertions(+)"
+        ),
+        "result_excerpt": "50 files changed, 1726 insertions(+)",
+        "interpretation": (
+            "假设被证伪，而且证伪得毫无余地：新增的 `STDIO_PROTOCOL.md` 明确要求"
+            "「JSON Lines 协议，不是直接输入 SQL 的交互终端」，"
+            "判题器按「发一个请求、等一个响应」执行。"
+            "更严重的是第 8 节的故障定位表写着 `invalid JSON response` —— "
+            "按旧实现提测，准入环节会直接判 0 分，"
+            "性能分与 Agent 分一并作废。"
+            "值得注意的是：此前并非没有留后手，"
+            "旧实现的协议层本来就是参数化的（输出格式、就绪信号、错误格式都是开关），"
+            "所以这次改动只落在协议层，引擎、存储、索引一行未动。"
+        ),
+    },
+    {
+        "id": "e-12",
+        "name": "官方协议检查工具的全量公开用例",
+        "hypothesis": (
+            "实现 JSONL 协议层后，官方 `protocol_check/run.py` 对真实镜像的"
+            "20 组公开用例应全部 PASS；任何一组失败都说明协议语义仍有偏差。"
+        ),
+        "command": (
+            "docker build -t mvdb-jsonl:local .；"
+            "python3 protocol_check/run.py --image mvdb-jsonl:local --output <new-dir>"
+        ),
+        "result": (
+            "sql_crud: PASS\nsql_comparisons: PASS\nsql_ordering: PASS\n"
+            "sql_empty: PASS\nsql_primary_key: PASS\nsql_unicode: PASS\n"
+            "sql_bigint: PASS\nsql_unsupported: PASS\nstorage_restart: PASS\n"
+            "vector_euclidean: PASS\ntransaction_commit: PASS\n"
+            "transaction_rollback: PASS\nstorage_mutations: PASS\n"
+            "storage_multiple_tables: PASS\nvector_ties_and_filter: PASS\n"
+            "vector_float32: PASS\nvector_index_maintenance: PASS\n"
+            "transaction_failed_insert: PASS\n"
+            "transaction_autocommit_atomic: PASS\n"
+            "transaction_shutdown_rollback: PASS\n"
+            "Report: /tmp/protocol_check_out2/result.json"
+        ),
+        "result_excerpt": (
+            "sql_crud: PASS\nsql_comparisons: PASS\nsql_ordering: PASS\n"
+            "sql_empty: PASS\nsql_primary_key: PASS"
+        ),
+        "interpretation": (
+            "20/20 全绿，而且是**在真实 Docker 镜像上**、用**组织方自己的检查器**跑出来的。"
+            "这个工具的沙箱比题目文字更严："
+            "`--network=none --read-only --cap-drop=ALL --pids-limit=128`，"
+            "并且每次发请求前会检查 stdout 有没有多余输出"
+            "（`unsolicited or duplicate response`）。"
+            "换句话说「能跑」和「按协议跑」是两件事，"
+            "只有用官方工具才测得出后者。"
+        ),
+    },
+    {
+        "id": "e-13",
+        "name": "官方用例暴露的两处事务语义缺陷",
+        "hypothesis": (
+            "`transaction_failed_insert` 与 `transaction_autocommit_atomic` "
+            "这两组新用例会暴露事务语义的缺陷："
+            "语句失败时的撤销范围与多行 INSERT 的原子性。"
+        ),
+        "command": "python3 tools/run_public_cases.py",
+        "result": (
+            "FAIL  sql_primary_key        3: statement 3 (INSERT INTO docs VALUES (1, '重复');): "
+            "the statement failed: {'code': 'duplicate_key', ...}\n"
+            "FAIL  transaction_failed_insert 5: statement 5 (INSERT INTO docs VALUES "
+            "(4,'新','四','[0,0]'),(2,'新','重复','[0,0]');): the statement failed: "
+            "{'code': 'duplicate_key', ...}\n"
+            "FAIL  transaction_autocommit_atomic 3: statement 3 (INSERT INTO docs VALUES "
+            "(4,'新','四','[0,0]'),(5,'新','错误','[0]');): the statement failed: "
+            "{'code': 'dimension_mismatch', ...}\n"
+            "4 check(s) failed\n"
+            "ok    sql_crud\nok    sql_comparisons\nok    sql_ordering"
+        ),
+        "result_excerpt": (
+            "FAIL  transaction_failed_insert 5: statement 5 (INSERT INTO docs VALUES "
+            "(4,'新','四','[0,0]'),(2,'新','重复','[0,0]');): the statement failed: "
+            "{'code': 'duplicate_key', ...}"
+        ),
+        "interpretation": (
+            "这两条失败不是协议格式问题，是**真的语义缺陷**，"
+            "而且是此前 5 组公开用例没能暴露的那一类："
+            "`transaction_failed_insert` 期望失败的 INSERT 只撤销自己、"
+            "保留同一事务里先前 UPDATE 的结果；"
+            "`transaction_autocommit_atomic` 期望多行 INSERT 里"
+            "有一行非法时**整条语句都不生效**。"
+            "旧实现两处都不满足：语句失败时清空整个事务缓冲，"
+            "于是把先前语句的修改也一起撤销了；"
+            "多行 INSERT 是逐行插入的，第一行已经落盘。"
+            "修法是把事务缓冲从「三张表」改成「一条有序日志」，"
+            "失败时按位置截断，只撤销本语句；"
+            "多行 INSERT 则先把整句求值完再统一暂存。"
+        ),
+    },
+    {
+        "id": "e-14",
+        "name": "协议改造后的全量回归与性能复核",
+        "hypothesis": (
+            "协议层重写不应影响性能三轴与正确性："
+            "查询 T/B/M 应与改造前持平，Recall@10 仍为 1.0；"
+            "单测、公开用例、差分自测、冒烟、崩溃恢复应全绿。"
+        ),
+        "command": (
+            "cargo test --release --offline --locked；"
+            "python3 tools/run_public_cases.py；"
+            "python3 tools/selftest.py；"
+            "bash tools/smoke.sh；"
+            "bash tools/killtest.sh；"
+            "python3 tools/bench.py --mode ann"
+        ),
+        "result": (
+            "test result: ok. 108 passed; 0 failed\n"
+            "test result: ok. 12 passed; 0 failed\n"
+            "all checks passed          (公开用例 exact)\n"
+            "all checks passed          (公开用例 ann)\n"
+            "all checks passed          (差分自测)\n"
+            "smoke: all checks passed\n"
+            "all checks passed          (崩溃恢复 12 轮)\n"
+            "  \"query\": {\n"
+            "    \"io_bytes\": 7378838,\n"
+            "    \"peak_rss_kb\": 14820,\n"
+            "    \"recall_filtered\": 1.0,\n"
+            "    \"recall_unfiltered\": 1.0,\n"
+            "    \"t_ms\": 3095.602\n"
+            "  }"
+        ),
+        "result_excerpt": (
+            "test result: ok. 108 passed; 0 failed\n"
+            "test result: ok. 12 passed; 0 failed"
+        ),
+        "interpretation": (
+            "查询 T 3096 ms、I/O 7.38 MB、峰值 RSS 14.8 MB，"
+            "与改造前的 2950 ms / 7.20 MB / 14.9 MB 持平，"
+            "Recall@10 仍是 1.0 —— 说明协议改造确实只落在协议层。"
+            "另外新增了 12 个协议级集成测试，"
+            "覆盖握手形状、id 原样回传、空结果集仍带 `rows`、"
+            "失败语句不终止会话、畸形请求不终止会话、"
+            "shutdown 后不再输出且退出码为 0、重启后数据仍在、"
+            "会话结束时未提交事务被回滚。"
+            "这些是判题器会检查、但 SQL 层测试测不到的点。"
+        ),
+    },
 ]
 
 
@@ -866,6 +1134,30 @@ RETROSPECTIVE = {
                 "修复后是 1.57 秒，比优化前还快。"
             ),
         },
+        {
+            "title": "协议层一开始就做成可切换的，才让改版只落在协议层",
+            "detail": (
+                "最初的协议层把「输出格式、就绪信号、错误格式」做成了开关，"
+                "而不是写死一种。这一看似多余的抽象在改版时兑现了价值："
+                "上游把协议从纯 SQL 流改成 JSON Lines 时，"
+                "引擎、存储、索引一行未动，"
+                "只重写了协议层与事务缓冲的数据结构。"
+                "性能三轴持平（3096 ms vs 2950 ms）、Recall 仍为 1.0，"
+                "说明改动范围确实是可控的。"
+            ),
+        },
+        {
+            "title": "用官方检查器，而不是自写驱动",
+            "detail": (
+                "协议改完后如果自己写个驱动跑一遍就收工，"
+                "很可能漏掉判题器真正在意的点。"
+                "官方 `protocol_check/run.py` 在 `--network=none --read-only "
+                "--cap-drop=ALL --pids-limit=128` 的沙箱里跑，"
+                "并且每次发请求前检查 stdout 有没有多余输出。"
+                "正是它把 20 组公开用例跑到了 20/20 PASS，"
+                "也让「自写驱动能通」和「按协议跑通」的差别变得可见。"
+            ),
+        },
     ],
     "what_did_not_work": [
         {
@@ -899,6 +1191,24 @@ RETROSPECTIVE = {
                 "而不是落在镜像里的某个文件上。"
             ),
         },
+        {
+            "title": "把题面里的一句话当成了协议的最终形态",
+            "detail": (
+                "最初的协议判断依据是题面里的一句「不再采用 JSON 请求/响应封装」，"
+                "据此把协议做成了纯 SQL 文本流。"
+                "这个推断在当时是自洽的（官方 README 当时也这么写），"
+                "但它经不起上游改版。"
+                "上游随后发布的 `STDIO_PROTOCOL.md` 明确要求 JSON Lines，"
+                "并附带了官方检查器与 20 组用例 —— "
+                "按旧实现提测会在准入环节直接判 0 分。"
+                "教训是：协议类的约定不能只依赖题面转述，"
+                "要么以官方检查器为准，要么在实现时把协议层做成可切换的。"
+            ),
+            "lesson": (
+                "对外部约定的推断要留出可替换的余地。"
+                "这次恰好因为协议层是参数化的，改版才只花了协议层一个模块。"
+            ),
+        },
     ],
     "what_would_be_done_differently": [
         {
@@ -908,6 +1218,18 @@ RETROSPECTIVE = {
                 "如果第一条基准就带 `--dump-baseline`，"
                 "那么每一次性能改动都能立刻确认「快了但没变」，"
                 "而不是等到最后一次性比对。"
+            ),
+        },
+        {
+            "title": "协议改版应该由官方检查器来驱动，而不是先自己实现再验证",
+            "detail": (
+                "这次的顺序是：读懂 `STDIO_PROTOCOL.md` → 自己实现 JSONL → "
+                "用官方检查器验证。"
+                "这个顺序本身没错，但更好的做法是"
+                "**先跑一次官方检查器看它到底要什么**（哪怕必然失败），"
+                "把「它检查什么」变成可执行的判据，再去实现。"
+                "这样能更早发现像「stdout 有多余输出」这类"
+                "自己写驱动时根本不会注意到的约束。"
             ),
         },
         {
@@ -938,9 +1260,12 @@ RETROSPECTIVE = {
         "有限的 `--ann-nprobe` 才会给出真正近似的答案，此时召回率依赖数据分布。",
         "向量索引不落盘，启动时重建。题面允许这样做，"
         "但重建成本会计入恢复时间。",
-        "本文件只覆盖 MiniVectorDB 的开发过程；"
-        "题面所称「正式题包」中的事务、持久化、恢复、资源约束用例尚未随包发布，"
-        "因此本地的 13 组差分自测是对这些类别的近似覆盖，不是官方回归结果。",
+        "本材料覆盖的官方验证以 `2026-competition-round2` 分支上"
+        "已发布的 20 组公开用例为限；上游若在提测前再改协议，"
+        "本结论需重新验证。",
+        "事务语义的覆盖依赖 `protocol_check` 已发布的用例；"
+        "更细的隔离级别（READ COMMITTED / REPEATABLE READ / SERIALIZABLE）"
+        "与显式锁语义尚未实现，按约定返回错误。",
     ],
 }
 
@@ -970,9 +1295,12 @@ LIMITATIONS = {
         "对话记录中的思考过程未收录。题面 §3.4.5 明确不要求提交隐藏思维链。",
         "部分早期对话被会话摘要压缩，摘要中被省略的中间步骤没有重建；"
         "凡是引用到的内容都保留了原始措辞。",
-        "官方正式题包与测试驱动在材料整理时尚未发布，"
-        "因此没有「官方回归通过」这类结论；"
-        "所有结论都标明是本地工具跑出来的。",
+        "官方回归的结论以 `2026-competition-round2` 分支已发布的 "
+        "`protocol_check/` 与 `mysqltest/`（20 组公开用例）为准；"
+        "上游尚未公开的隐藏用例不在本材料的验证范围内。",
+        "协议改版前的那一版实现（纯 SQL 文本流）已不再保留为可运行状态，"
+        "因此「改版前后」的对比是通过设计上的隔离（协议层参数化）"
+        "与性能三轴持平来间接证明的，而非同一份代码的两次运行。",
     ],
     "redaction": [
         "仓库 URL 中的访问令牌已移除，只保留仓库名与分支名。",
