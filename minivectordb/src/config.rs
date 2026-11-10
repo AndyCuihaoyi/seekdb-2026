@@ -62,6 +62,13 @@ pub struct Config {
     /// `None` means "visit cells until the distance bound proves that no
     /// remaining cell can improve the answer", which is an exact search.
     pub ann_nprobe: Option<usize>,
+    /// The size in bytes the log may reach before a checkpoint empties it.
+    ///
+    /// The log holds a copy of every committed row, so without a checkpoint
+    /// the data directory holds the data twice. The checkpoint is also what
+    /// keeps the page cache of the kernel from growing with the size of the
+    /// data set.
+    pub checkpoint_bytes: u64,
 }
 
 impl Default for Config {
@@ -77,6 +84,7 @@ impl Default for Config {
             vector_block_rows: 4096,
             ann_nlist: 64,
             ann_nprobe: None,
+            checkpoint_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -136,6 +144,9 @@ impl Config {
         }
         if let Some(v) = env_usize("MINIVECDB_ANN_NPROBE") {
             self.ann_nprobe = Some(v.max(1));
+        }
+        if let Some(v) = env_usize("MINIVECDB_CHECKPOINT_MB") {
+            self.checkpoint_bytes = (v.max(1) as u64) * 1024 * 1024;
         }
     }
 }

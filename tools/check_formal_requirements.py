@@ -164,6 +164,49 @@ def check_statement_atomicity(results, binary):
         server.close()
 
 
+def check_checkpoint(results, binary):
+    """The log must not hold a second copy of the data.
+
+    The official README says the implementation has to cope with data that
+    is larger than the memory limit. The log holds a copy of every
+    committed row, so without a checkpoint the data directory holds the
+    data twice, and the page cache the kernel keeps grows with it.
+    """
+    data_dir = tempfile.mkdtemp(prefix="checkpoint-")
+    server = Server(binary, data_dir)
+    try:
+        server.ask("CREATE TABLE c (id BIGINT PRIMARY KEY, e VECTOR(16));")
+        for batch in range(20):
+            values = ", ".join(
+                "(%d, '[%s]')" % (batch * 500 + i,
+                                  ",".join(["%d" % ((i + j) % 7) for j in range(16)]))
+                for i in range(500))
+            answer = server.ask("INSERT INTO c VALUES %s;" % values)
+            if not ok(answer):
+                report(results, "checkpoint/the-insert-works", False, code(answer))
+                return
+        server.close()
+
+        total = 0
+        for root, _dirs, files in os.walk(data_dir):
+            for name in files:
+                total += os.path.getsize(os.path.join(root, name))
+        wal = os.path.getsize(os.path.join(data_dir, "wal.dat"))
+        # The log must stay small compared with the data it protects.
+        report(results, "checkpoint/the-log-stays-small",
+               wal < total / 2, "%d bytes of %d" % (wal, total))
+
+        # The rows are still all there after a restart.
+        server = Server(binary, data_dir)
+        answer = server.ask("SELECT id FROM c WHERE id = 9999;")
+        report(results, "checkpoint/the-rows-survive",
+               ok(answer) and answer.get("rows") == [[9999]],
+               str(answer.get("rows")))
+    finally:
+        server.close()
+        shutil.rmtree(data_dir, ignore_errors=True)
+
+
 def check_crash_recovery(results, binary):
     """Requirement 3: a kill keeps what was committed, and the recovery
     itself may be interrupted."""
@@ -287,6 +330,7 @@ def main():
         "vectors": check_bad_vectors,
         "atomicity": check_statement_atomicity,
         "crash": check_crash_recovery,
+        "checkpoint": check_checkpoint,
         "large": check_large_data,
         "ann": check_ann,
     }

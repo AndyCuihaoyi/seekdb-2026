@@ -242,6 +242,11 @@ impl Wal {
         self.len = 0;
         Ok(())
     }
+
+    /// The number of bytes the log occupies on the disk.
+    pub fn size(&self) -> u64 {
+        self.len
+    }
 }
 
 /// Read every record from a log file, stopping at the first truncated or
