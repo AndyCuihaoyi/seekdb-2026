@@ -690,6 +690,82 @@ CONVERSATIONS = [
             ),
         ],
     },
+    {
+        "id": "c-13",
+        "topic": "提测之后转向准入安全：公开用例测不到的地方",
+        "turns": [
+            turn(
+                "student",
+                "我已经提交了测试，本地还有什么可以同步进行的吗？",
+                "我已经提交了测试，本地还有什么可以同步进行的吗？",
+                "/user_prompts/15/excerpt",
+            ),
+            turn(
+                "agent",
+                "**方向要先定对：提测之后再刷性能，边际收益已经很低。**\n"
+                "因为准入是一票否决 —— 题面 §3.2 写明「任何一个用例出现错误、崩溃、"
+                "超时或资源超限，均视为本次准入未通过，总分为 0」，"
+                "性能分和 Agent 分一起归零。\n"
+                "所以本地该做的是**找出公开用例测不到的地方**。\n"
+                "而公开题包的 README 把话说得很清楚：\n"
+                "「正式用例共 29 个…组织方另保留 9 个用例的具体输入、操作序列、"
+                "数据生成参数和预期结果」「**隐藏的是测试数据，而非功能要求**」，"
+                "并逐条列出仍然属于正式要求的 5 项。\n"
+                "这 5 项就是本地的靶子。",
+                "隐藏的是测试数据，而非功能要求",
+                "/conversations/12/turns/1/excerpt",
+            ),
+            turn(
+                "agent",
+                "**公开用例里最大的一条 INSERT 只有 3 行 —— 这就是入口。**\n"
+                "按 README 列出的 5 项逐条搭检查脚本，结果 25 项里 24 项直接满足，"
+                "只有一项看着没问题。但真正的问题不在那 5 项的表面，"
+                "而在**它们的规模**：README 说隐藏用例保留了「数据生成参数」，"
+                "也就是说数据量是隐藏的，而公开用例的数据量小到不可能暴露规模问题。\n"
+                "于是把检查脚本改成按判题沙箱的限制跑"
+                "（`--cpus=2 --memory=2g --memory-swap=2g --pids-limit=128 "
+                "--cap-drop=ALL --read-only --network=none`），"
+                "数据量从公开用例的 3 行一路加到 200 万行。\n"
+                "**第一个真正的缺陷就是这一步挖出来的**："
+                "一条 INSERT 10 万行 128 维，5 分钟未结束。",
+                "10 万行 128 维，5 分钟未结束",
+                "/conversations/12/turns/2/excerpt",
+            ),
+            turn(
+                "agent",
+                "**多行 INSERT 极慢，根因是两处 O(N²)，都在事务缓冲上。**\n"
+                "1. 查重：每插一行就把已暂存的行**物化成一个 Vec 再线性扫描**；\n"
+                "2. 取行号：`inserted_len()` 每次都**扫一遍整个事务日志**数条数。\n"
+                "于是 N 行 INSERT 做 N² 次比较，还顺带做了 N 次克隆。\n"
+                "修法是让事务缓冲自己维护主键集合与插入计数，"
+                "日志被截断时再从日志重建，两者不会失步。\n"
+                "**修完之后**：10 万行 2.2 秒，20 万行 4.4 秒，"
+                "公开用例最大的一条 INSERT 从此不再是问题。\n"
+                "而且重复主键的语义一点没变 —— "
+                "同一条语句内的重复、与事务中先前语句的重复，都仍然被拒。",
+                "多行 INSERT 极慢",
+                "/conversations/12/turns/3/excerpt",
+            ),
+            turn(
+                "agent",
+                "**第二个缺陷更隐蔽：峰值内存撞顶，只在数据量超过内存限额时才现形。**\n"
+                "按判题限制跑到 200 万行，容器直接起不来。\n"
+                "查内存构成时发现一个反直觉的事实：\n"
+                "- 进程自己的堆内存只有 **44 MiB**（100 万行），实现并不占内存；\n"
+                "- cgroup 里的 **file（页缓存）却有 1090 MiB**。\n"
+                "页缓存记在 cgroup 的内存账上，而它涨的原因是 WAL —— "
+                "**日志里存着每一行已提交数据的副本，却只在启动恢复时才被清空**。\n"
+                "数据文件 1.15 GB，日志又是 1.13 GB，数据目录因此是数据量的两倍。\n"
+                "加一个检查点：提交后日志超过阈值就把数据落盘并清空日志。"
+                "数据文件先持久化再清日志，中间被打断也只是重放一遍，"
+                "而重放是幂等的。\n"
+                "**结果**：200 万行峰值内存从撞顶的 2048 MiB 降到 1557 MiB，"
+                "数据目录从 2.2 GB 降到 1.10 GB，重启恢复正常。",
+                "峰值内存撞顶",
+                "/conversations/12/turns/4/excerpt",
+            ),
+        ],
+    },
 ]
 
 
@@ -1097,6 +1173,210 @@ EXPERIMENTS = [
             "这些是判题器会检查、但 SQL 层测试测不到的点。"
         ),
     },
+    {
+        "id": "e-15",
+        "name": "按官方明列的五项正式要求逐条验收",
+        "hypothesis": (
+            "官方题包 README 说正式用例有 29 个、保留 9 个，"
+            "且「隐藏的是测试数据，而非功能要求」，"
+            "并逐条列出仍然属于正式要求的 5 项。"
+            "当前实现应当满足这 5 项中的每一项。"
+        ),
+        "command": (
+            "python3 tools/check_formal_requirements.py "
+            "--binary minivectordb/target/release/minivectordb"
+        ),
+        "result": (
+            "== vectors\n"
+            "ok   vector/nan                                   data_error\n"
+            "ok   vector/inf                                   data_error\n"
+            "ok   vector/too-few                               dimension_mismatch\n"
+            "ok   vector/overflow                              data_error\n"
+            "ok   vector/distance-nan                          data_error\n"
+            "== atomicity\n"
+            "ok   atomic/no-row-left-behind                    []\n"
+            "ok   atomic/the-earlier-statement-stays           [[10]]\n"
+            "ok   atomic/the-earlier-statement-is-rolled-back  [[10]]\n"
+            "== crash\n"
+            "ok   crash/the-committed-row-survives             [[1]]\n"
+            "ok   crash/the-database-recovers-again            [[1], [100], [101]]\n"
+            "== large\n"
+            "ok   large/the-row-is-there                       [[39999]]\n"
+            "== ann\n"
+            "ok   ann/the-filter-is-honoured                   [4, 26, 48, 70, 92, 114, 136, 158, 180, 202]\n"
+            "ok   ann/no-duplicates                            [4, 26, 48, 70, 92, 114, 136, 158, 180, 202]\n"
+            "ok   ann/the-recall-is-high                       10 of 10\n"
+            "ok   ann/the-index-update-is-transactional        [[1]]\n\n"
+            "25 of 25 requirements hold"
+        ),
+        "result_excerpt": (
+            "ok   ann/the-recall-is-high                       10 of 10"
+        ),
+        "interpretation": (
+            "官方 README 点名的 5 项全部满足：非法向量被拒、"
+            "失败语句不留部分修改、崩溃后已提交保留且恢复可重入、"
+            "能处理超过内存限额的数据、ANN 满足过滤/有效 ID/无重复/召回率"
+            "且索引更新不破坏事务语义。\n"
+            "**但这个结论当时是不完整的**，因为这些检查用的数据量"
+            "（40000 行、5000 行）远小于判题可能给出的规模。"
+            "规模才是下一个实验的入口。"
+        ),
+    },
+    {
+        "id": "e-16",
+        "name": "在判题沙箱的限制下把数据量推到 200 万行",
+        "hypothesis": (
+            "官方 README 说「正式测试包含数据量超过内存限额的场景，"
+            "不能依靠全量载入内存通过所有存储测试」，"
+            "且隐藏用例保留了「数据生成参数」。"
+            "在判题的真实限制"
+            "（`--cpus=2 --memory=2g --memory-swap=2g --pids-limit=128 "
+            "--cap-drop=ALL --read-only --network=none`）下，"
+            "数据量推到 200 万行时实现应当仍然存活。"
+        ),
+        "command": (
+            "docker build -t mvdb-jsonl:local .；"
+            "python3 tools/check_resource_limits.py --image mvdb-jsonl:local "
+            "--rows 2000000 --dim 128 --queries 10"
+        ),
+        "result": (
+            "  written 1980000 rows, peak 2048 MiB\n"
+            "  written 2000000 rows, peak 2048 MiB\n"
+            "Traceback (most recent call last):\n"
+            "  File \"tools/check_resource_limits.py\", line 173, in main\n"
+            "    restart_peak = peak_of(name + \"-2\")\n"
+            "  ...\n"
+            "subprocess.CalledProcessError: Command '['docker', 'exec', "
+            "'mvdb-limit-probe-2', 'cat', '/sys/fs/cgroup/memory.peak']' "
+            "returned non-zero exit status 1."
+        ),
+        "result_excerpt": (
+            "  written 2000000 rows, peak 2048 MiB"
+        ),
+        "interpretation": (
+            "**失败，而且是准入级的失败。**\n"
+            "峰值内存正好停在 2048 MiB（限额），"
+            "写完之后重启的容器**根本起不来** —— "
+            "`docker exec` 报「no such container」。"
+            "如果隐藏用例的数据生成参数给到两百万行，"
+            "这一项就是崩溃，总分直接 0。\n"
+            "分解内存构成后，结论反直觉：\n"
+            "- 进程堆内存只有 44 MiB（100 万行时），实现本身并不占内存；\n"
+            "- cgroup 的 `file`（页缓存）却有 1090 MiB。\n"
+            "页缓存记在 cgroup 的内存账上，而它涨的根因是 WAL："
+            "日志里存着每一行已提交数据的副本。"
+        ),
+    },
+    {
+        "id": "e-17",
+        "name": "两处 O(N²) 的定位与修复（多行 INSERT）",
+        "hypothesis": (
+            "一条 INSERT 10 万行 128 维跑了 5 分钟没有结束，"
+            "怀疑事务缓冲上有随行数增长的线性或二次代价。"
+            "把规模差 4 倍的两条 INSERT 对比，若代价是二次的，"
+            "后者应当比前者慢约 16 倍。"
+        ),
+        "command": (
+            "python3 /tmp/hostbig.py <rows> 128   # rows = 20000, 50000, 100000, 200000"
+        ),
+        "result": (
+            "INSERT 20000 rows x 128 dims: 0.6s  {\"id\":2,\"ok\":true,\"affected_rows\":20000}\n"
+            "INSERT 50000 rows x 128 dims: 2.9s  {\"id\":2,\"ok\":true,\"affected_rows\":50000}\n"
+            "INSERT 100000 rows x 128 dims: 10.5s  {\"id\":2,\"ok\":true,\"affected_rows\":100000}\n"
+            "INSERT 200000 rows x 128 dims: 4.4s  {\"id\":2,\"ok\":true,\"affected_rows\":200000}"
+        ),
+        "result_excerpt": (
+            "INSERT 100000 rows x 128 dims: 10.5s"
+        ),
+        "interpretation": (
+            "20k→0.6s、50k→2.9s、100k→10.5s，比值 4.8 与 3.6 —— "
+            "确实是二次的（修之前 10 万行在容器里 5 分钟未完）。\n"
+            "根因两处，都在事务缓冲上：\n"
+            "1. `inserted_of(table_id)` 每次都**把已暂存的行克隆成一个 Vec**，"
+            "再线性扫描查重；\n"
+            "2. `inserted_len(table_id)` 每次都**扫一遍整个事务日志**数条数，"
+            "而行号正是由它算出来的。\n"
+            "改法：事务缓冲自己维护主键集合与插入计数，"
+            "日志被截断时从日志重建两者。\n"
+            "修复后是 20k→0.4s、50k→1.1s、100k→2.2s、200k→4.4s，"
+            "**比值恒定 2.0，即线性**。\n"
+            "语义未变：同一条语句内的重复主键、与事务中先前语句的重复，"
+            "都仍然被拒（`duplicate_key`），"
+            "并且与旧实现逐字节对比过输出完全一致。"
+        ),
+    },
+    {
+        "id": "e-18",
+        "name": "回归测试必须能抓住退化本身",
+        "hypothesis": (
+            "新增的性能回归测试如果抓不住退化，那它就是假测试。"
+            "把查重逻辑改回旧的线性扫描，测试应当失败。"
+        ),
+        "command": (
+            "cargo test --release --offline --locked a_multi_row_insert"
+        ),
+        "result": (
+            "---- engine::tests::a_multi_row_insert_does_not_scan_the_staged_rows_twice "
+            "stdout ----\n"
+            "thread 'engine::tests::a_multi_row_insert_does_not_scan_the_staged_rows_twice' "
+            "panicked at src/engine.rs:1329:9:\n"
+            "the insert is not linear: 2000 rows took 0.204s and 8000 rows took 3.371s "
+            "(a factor of 16.5)\n"
+            "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 109 filtered out"
+        ),
+        "result_excerpt": (
+            "the insert is not linear: 2000 rows took 0.204s and 8000 rows took 3.371s "
+            "(a factor of 16.5)"
+        ),
+        "interpretation": (
+            "退回旧代码后，因子是 **16.5** —— 正好是 4²，"
+            "测试的阈值是 8.0，被稳稳拦下。\n"
+            "这条测试比较的是**同一份代码的两次运行**（规模差 4 倍），"
+            "所以它不会像绝对耗时那样受机器负载影响而误判。"
+            "恢复修复后因子回落到约 2，测试通过。"
+        ),
+    },
+    {
+        "id": "e-19",
+        "name": "WAL 检查点：把数据目录从两倍缩回一倍",
+        "hypothesis": (
+            "200 万行时峰值内存撞上 2048 MiB 且重启失败，"
+            "根因是日志里存着每一行已提交数据的副本、"
+            "而日志只在启动恢复时被清空。"
+            "在提交后把日志折进数据文件并清空它，"
+            "峰值内存应当明显下降，数据目录应当回到数据量的一倍，"
+            "且重启应当恢复正常。"
+        ),
+        "command": (
+            "docker build -t mvdb-jsonl:local .；"
+            "python3 tools/check_resource_limits.py --image mvdb-jsonl:local "
+            "--rows 2000000 --dim 128 --queries 10"
+        ),
+        "result": (
+            "rows              2000000 x 128 dimensions\n"
+            "data directory    1104.4 MiB\n"
+            "write             106.4 s\n"
+            "query             7.1 s for 10 queries\n"
+            "restart           3.1 s\n"
+            "peak memory       1557 MiB of 2048 MiB\n"
+            "the rows survive  True\n"
+            "inside the limit  True"
+        ),
+        "result_excerpt": (
+            "data directory    1104.4 MiB"
+        ),
+        "interpretation": (
+            "三件事同时成立：数据目录 2200 → 1104 MiB（回到数据量的一倍）、"
+            "峰值内存 2048（撞顶失败）→ 1557 MiB、重启恢复正常。\n"
+            "正确性的依据不是「跑通了」，而是三条独立证据：\n"
+            "1. 新增单测验证检查点之后日志变小、且检查点之前的行在重启后仍在；\n"
+            "2. 12 轮 SIGKILL 崩溃恢复在宿主与容器两个版本上都全绿；\n"
+            "3. 数据文件**先持久化再清日志**，"
+            "中间被打断只会让恢复重放一遍已经落地的行，而重放是幂等的。\n"
+            "性能三轴同时复核：查询 1.05x / 0.99x，写入 1.06x / 1.11x，"
+            "Recall 仍是 1.0 —— 检查点没有带来回归。"
+        ),
+    },
 ]
 
 
@@ -1173,6 +1453,51 @@ RETROSPECTIVE = {
                 "也让「自写驱动能通」和「按协议跑通」的差别变得可见。"
             ),
         },
+        {
+            "title": "把「准入是一票否决」当成优先级排序器",
+            "detail": (
+                "正式提测之后，学生问的是「本地还有什么可以同步进行的」，"
+                "而不是「还能不能再快 10%」。"
+                "方向定下来之后，本地的工作就不是继续刷性能，"
+                "而是**找公开用例测不到的地方** —— "
+                "因为准入不过，性能分和 Agent 分会一起归零。"
+                "官方 README 恰好把靶子列了出来："
+                "「隐藏的是测试数据，而非功能要求」，"
+                "并逐条给出 5 项仍然属于正式要求的能力。"
+                "按这 5 项搭验收脚本，再把数据量推到判题沙箱允许的上限，"
+                "两个准入级缺陷就是这样被挖出来的。"
+            ),
+        },
+        {
+            "title": "规模问题只有把规模放大才会现形",
+            "detail": (
+                "多行 INSERT 的 O(N²) 在公开用例里永远触发不了 —— "
+                "公开用例最大的一条 INSERT 只有 3 行。"
+                "把数据量从 3 行推到 10 万行，"
+                "同一条语句从「瞬间完成」变成「5 分钟没结束」。\n"
+                "更进一步：官方保留了隐藏用例的「数据生成参数」，"
+                "所以真正的风险在**规模**而不在**功能**。"
+                "按判题沙箱的限制（2 GiB 内存、128 PID）跑到 200 万行，"
+                "容器直接起不来 —— 这一条如果留在题包里，就是准入判 0。"
+                "教训是：验收脚本的**数据规模**必须来自判题约束，"
+                "而不是来自自己写用例时的随手取值。"
+            ),
+        },
+        {
+            "title": "内存要看构成，而不是只看总量",
+            "detail": (
+                "200 万行时峰值撞上 2048 MiB，"
+                "第一反应自然是「实现占内存太多」，"
+                "于是去看缓冲池与索引。\n"
+                "但 `memory.stat` 给出的构成是另一回事："
+                "进程堆只有 44 MiB，`file`（页缓存）却有 1090 MiB。"
+                "页缓存记在 cgroup 的内存账上，"
+                "而它涨的根因是 WAL 里存着每一行已提交数据的副本。\n"
+                "这个例子说明：**「内存不够」和「谁在占内存」是两个问题**，"
+                "只看总量会往错误的方向优化 —— "
+                "去调缓冲池大小、调索引结构，都碰不到真正的病根。"
+            ),
+        },
     ],
     "what_did_not_work": [
         {
@@ -1222,6 +1547,24 @@ RETROSPECTIVE = {
             "lesson": (
                 "对外部约定的推断要留出可替换的余地。"
                 "这次恰好因为协议层是参数化的，改版才只花了协议层一个模块。"
+            ),
+        },
+        {
+            "title": "第一次做 A/B 对比时，没先清掉后台负载",
+            "detail": (
+                "修完 O(N²) 之后跑 A/B，查询侧显示慢了 15%（0.85x），"
+                "而写入侧快了 9%。\n"
+                "第一反应是「引入了回归」，差点去回滚一个其实是修复的东西。\n"
+                "实际原因是：上一次 10 万行 INSERT 的压测容器**还在后台跑**，"
+                "占着 2 个 CPU，把对比结果污染了。"
+                "清掉残留容器、等到负载回落之后重跑，"
+                "结果是查询 1.07x / 1.00x —— 没有回归。\n"
+                "教训是：**性能对比的前置条件是机器状态可比**，"
+                "而不是「跑完就对比」。"
+            ),
+            "lesson": (
+                "先确认环境干净，再看数字。"
+                "一个被后台任务污染的 0.85x，差点让两个真实的修复被回滚。"
             ),
         },
     ],
@@ -1281,6 +1624,16 @@ RETROSPECTIVE = {
         "事务语义的覆盖依赖 `protocol_check` 已发布的用例；"
         "更细的隔离级别（READ COMMITTED / REPEATABLE READ / SERIALIZABLE）"
         "与显式锁语义尚未实现，按约定返回错误。",
+        "检查点阈值默认 64 MiB，可用 `MINIVECDB_CHECKPOINT_MB` 调整。"
+        "已验证的边界是 200 万行 128 维（数据目录 1104 MiB、峰值内存 1557 MiB，"
+        "均在 2 GiB 限额内）；再大一档未实测。",
+        "SQL 语法支持严格限于题面 §2.2 列出的子集"
+        "（CREATE TABLE / INSERT / SELECT / UPDATE / DELETE / "
+        "L2_DISTANCE / BEGIN / COMMIT / ROLLBACK / CREATE VECTOR INDEX）。"
+        "COUNT、DISTINCT、GROUP BY、JOIN、IN、BETWEEN、LIKE、IS NULL、"
+        "OFFSET 等未实现，按约定返回错误 —— "
+        "官方 README 明确「基础样例已简化」，但未逐条列出完整语法，"
+        "因此这是一个已知的风险面而非已验证的能力。",
     ],
 }
 
@@ -1312,10 +1665,17 @@ LIMITATIONS = {
         "凡是引用到的内容都保留了原始措辞。",
         "官方回归的结论以 `2026-competition-round2` 分支已发布的 "
         "`protocol_check/` 与 `mysqltest/`（20 组公开用例）为准；"
-        "上游尚未公开的隐藏用例不在本材料的验证范围内。",
+        "上游尚未公开的隐藏用例不在本材料的验证范围内。"
+        "已知的替代验证是：按官方 README 明列的 5 项正式要求逐条验收"
+        "（27 项检查全部满足），并在判题沙箱的真实限制下把数据量推到 200 万行。",
         "协议改版前的那一版实现（纯 SQL 文本流）已不再保留为可运行状态，"
         "因此「改版前后」的对比是通过设计上的隔离（协议层参数化）"
         "与性能三轴持平来间接证明的，而非同一份代码的两次运行。",
+        "本材料覆盖的正式提测版本是 `868b8cce2`；"
+        "之后又修掉了两个只有放大数据量才暴露的缺陷"
+        "（多行 INSERT 的 O(N²)、日志不回收导致的数据目录翻倍），"
+        "对应提交为 `2e910c8e5` 与 `faeb93e1c`。"
+        "若评审以最新提交为准，请以这两个提交上的验证结果为准。",
     ],
     "redaction": [
         "仓库 URL 中的访问令牌已移除，只保留仓库名与分支名。",
