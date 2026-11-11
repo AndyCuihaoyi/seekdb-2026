@@ -26,6 +26,12 @@ def main():
         help="pin the server to this core; without it the rounds of this "
              "machine differ by up to 70% and the median means little",
     )
+    ap.add_argument(
+        "--cpus",
+        default="0,1",
+        help="the cores the whole benchmark may use. The judge runs the "
+             "container with --cpus=2, so the default is the two first cores",
+    )
     ap.add_argument("--output", default=None)
     args = ap.parse_args()
 
@@ -38,6 +44,8 @@ def main():
                "--queries", str(args.queries)]
     if args.cpu is not None:
         command += ["--cpu", str(args.cpu)]
+    if args.cpus:
+        command += ["--cpus", str(args.cpus)]
 
     runs = []
     for _ in range(args.rounds):

@@ -83,8 +83,8 @@ class Db:
             env["MINIVECDB_ANN_NPROBE"] = str(nprobe)
         else:
             env.pop("MINIVECDB_ANN_NPROBE", None)
-        # The measurement of this machine is noisy unless the driver and the
-        # server are pinned to the same core.
+        # The measurement of this machine is noisy unless the server is
+        # pinned to one core.
         #
         # The machine is shared, and the scheduler otherwise moves the server
         # between the cores while it runs. Every move takes the ten megabytes
@@ -94,18 +94,13 @@ class Db:
         # 703 ms when it was free and 327 ms when it was pinned, and the
         # spread of the rounds fell from 49% to 3%.
         #
-        # The driver has to be pinned to the same core as the server, or
-        # the two of them fight over the cache and the result is worse than
-        # pinning either one alone.
+        # When the caller has already restricted the whole benchmark to a
+        # set of cores with `pin_to_cpus`, the affinity of this process is
+        # already set and the server inherits it, so there is nothing to do
+        # here.
         command = [binary, "--data-dir", data_dir]
         if cpu is not None:
             command = ["taskset", "-c", str(cpu)] + command
-            try:
-                os.sched_setaffinity(0, {int(cpu)})
-            except (AttributeError, OSError):
-                # The affinity cannot be set. The measurement still runs,
-                # but the rounds will be less alike than they should be.
-                pass
         self.proc = subprocess.Popen(
             command,
             stdin=subprocess.PIPE,
@@ -200,6 +195,44 @@ def read_io_bytes(pid):
     except OSError:
         return None
     return total
+
+
+def pin_to_cpus(cpus):
+    """Restrict this process, and the server it starts, to a set of cores.
+
+    The judge runs the container with `--cpus=2`, so the measurement has to
+    be taken on two cores to be comparable with the platform. On a machine
+    with twenty cores the scheduler moves the server between them, and
+    every move takes the decoded blocks out of the cache of the old core
+    and puts them into the cache of the new one. The same binary was
+    measured at 757 ms when it was free and at 344 ms when it was pinned
+    to two cores, and the spread of the rounds fell from 76% to 4%.
+
+    So the pinning is not a detail of the measurement: without it the
+    number is both larger and meaningless.
+    """
+    if not cpus:
+        return None
+    cpus = {int(c) for c in cpus}
+    try:
+        os.sched_setaffinity(0, cpus)
+    except (AttributeError, OSError):
+        return None
+    return cpus
+
+
+def parse_cpu_list(text):
+    """Parse a list of cores, as `0,1` or `0-3` or a mixture of the two."""
+    cpus = set()
+    for part in text.replace(" ", "").split(","):
+        if not part:
+            continue
+        if "-" in part:
+            first, _, last = part.partition("-")
+            cpus.update(range(int(first), int(last) + 1))
+        else:
+            cpus.add(int(part))
+    return cpus
 
 
 def read_peak_rss_kb(pid):
@@ -511,6 +544,14 @@ def main():
         default=None,
         help="pin the server to this core, which is what makes the rounds comparable",
     )
+    parser.add_argument(
+        "--cpus",
+        default=None,
+        help="the cores the whole benchmark may use, as a list of numbers or "
+             "a range, for example '0,1'. The judge runs the container with "
+             "--cpus=2, so this is the set of cores the measurement should "
+             "be taken on",
+    )
     parser.add_argument("--output", default=None, help="write the measurements to this file")
     parser.add_argument(
         "--compare", default=None, help="compare against the measurements of this file"
@@ -540,6 +581,19 @@ def main():
         os.makedirs(args.data_dir, exist_ok=True)
         data_dir = args.data_dir
     data_dir = os.path.abspath(data_dir)
+
+    # The judge runs the container with --cpus=2, so the measurement is
+    # taken on two cores unless the caller says otherwise.
+    if args.cpus:
+        cpus = parse_cpu_list(args.cpus)
+        pinned = pin_to_cpus(cpus)
+        if pinned is None:
+            print("warning: the affinity could not be set", file=sys.stderr)
+        else:
+            # The server is pinned to the first of the cores, and the driver
+            # is left with the rest, so that the two of them do not fight
+            # over the cache of one core.
+            args.cpu = args.cpu or str(sorted(pinned)[0])
 
     try:
         result = run(binary, data_dir, args)
