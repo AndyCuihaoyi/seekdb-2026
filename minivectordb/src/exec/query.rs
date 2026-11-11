@@ -761,7 +761,7 @@ impl Engine {
             Expr::Str(s) => s.as_str(),
             _ => return Ok(None),
         };
-        let query = crate::prof::measure("q.parse_literal", || Vector::parse_literal(literal))?;
+        let query = Vector::parse_literal(literal)?;
         // The query vector must have the dimension of the column. Checking it
         // here keeps a mismatch from reaching the distance kernel, which
         // assumes two vectors of equal length.
@@ -785,19 +785,13 @@ impl Engine {
             .get(&def.name.to_ascii_lowercase())
             .map(|t| t.id)
             .unwrap_or(0);
-        let updated: HashSet<u64> = crate::prof::measure("q.txn_updated", || {
-            self.txn_buffer
-                .updated_of(table_id)
-                .into_iter()
-                .map(|(row_id, _)| row_id)
-                .collect()
-        });
-        let deleted: HashSet<u64> = crate::prof::measure("q.txn_deleted", || {
-            self.txn_buffer
-                .deleted_of(table_id)
-                .into_iter()
-                .collect()
-        });
+        let updated: HashSet<u64> = self
+            .txn_buffer
+            .updated_of(table_id)
+            .into_iter()
+            .map(|(row_id, _)| row_id)
+            .collect();
+        let deleted: HashSet<u64> = self.txn_buffer.deleted_of(table_id).into_iter().collect();
         // The number of committed rows. A row whose identifier is below it
         // exists in the index; the staged rows have identifiers at or above
         // it.
@@ -884,9 +878,7 @@ impl Engine {
                 // the block cache.
                 let vec = state.store.read_vector_cached(&meta)?;
                 Ok(Some(crate::vector::dist::l2_dispatch(&vec, query)))            };
-            let scan = crate::prof::measure("q.ann_scan", || {
-                index.scan_ordered(query, nprobe, topk.k, &mut fetch, &mut hits)
-            });
+            let scan = index.scan_ordered(query, nprobe, topk.k, &mut fetch, &mut hits);
             // The index goes back into the table.
             if let Some(state) = self.tables.get_mut(&key) {
                 state.index = Some(index);
@@ -961,15 +953,13 @@ impl Engine {
                     None => Ok(true),
                 }
             };
-            let hits = crate::prof::measure("q.exact_scan", || {
-                crate::vector::exact::scan_exact_topk_candidates(
-                    store,
-                    topk.query.as_slice(),
-                    topk.k,
-                    if needs_filter { Some(&mut filter) } else { None },
-                    candidate_rows.as_deref(),
-                )
-            })?;
+            let hits = crate::vector::exact::scan_exact_topk_candidates(
+                store,
+                topk.query.as_slice(),
+                topk.k,
+                if needs_filter { Some(&mut filter) } else { None },
+                candidate_rows.as_deref(),
+            )?;
             for hit in hits {
                 candidates.push((hit.pk, hit.dist_sq.sqrt(), hit.row_id));
             }
@@ -1050,8 +1040,8 @@ impl Engine {
         // Only the rows of the answer are materialised, so the rendering
         // costs one read per row of the answer, not per row of the table.
         let wanted: Vec<u64> = candidates.iter().map(|(_, _, row_id)| *row_id).collect();
-        let rows = crate::prof::measure("q.materialize", || self.materialize_rows(def, &wanted))?;
-        let row_index = crate::prof::measure("q.rowindex", || RowIndex::build(&rows));
+        let rows = self.materialize_rows(def, &wanted)?;
+        let row_index = RowIndex::build(&rows);
         let mut out: Vec<Vec<Cell>> = Vec::with_capacity(candidates.len());
         for (pk, _d, row_id) in &candidates {
             let row = match row_index.row(&rows, *row_id) {

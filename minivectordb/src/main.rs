@@ -12,7 +12,6 @@ mod config;
 mod engine;
 mod error;
 mod exec;
-mod prof;
 mod proto;
 mod sql;
 mod storage;
@@ -124,7 +123,6 @@ fn parse_args(cfg: &mut Config) {
 
 /// Main loop.
 fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
-    prof::enable();
     let mut engine = Engine::open(cfg)?;
     let mut session = Session::stdio();
 
@@ -136,8 +134,8 @@ fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         // The search mode is a property of the request, not of the process,
         // so it is applied before the statement runs.
         engine.mode = session::parse_mode(Some(&req.mode));
-        let stmt = prof::measure("parse_sql", || sql::parser::parse(req.sql.trim()))?;
-        let query_result = prof::measure("engine_execute", || engine.execute(&stmt))?;
+        let stmt = sql::parser::parse(req.sql.trim())?;
+        let query_result = engine.execute(&stmt)?;
         Ok(session::execute_response(&req.id, &query_result))
     });
 
@@ -145,6 +143,5 @@ fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     // stdin. Either way the engine is shut down cleanly: an open transaction
     // is rolled back and the committed data is flushed to the disk.
     engine.shutdown()?;
-    prof::dump();
     result.map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
 }
