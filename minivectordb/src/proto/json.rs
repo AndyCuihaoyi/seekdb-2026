@@ -221,6 +221,8 @@ impl<'a> Parser<'a> {
     fn string(&mut self) -> Result<String, JsonError> {
         self.expect(b'"')?;
         let mut out = String::new();
+        // The run of plain ASCII that was copied in one go.
+        let mut ascii_start = self.pos;
         loop {
             let c = match self.peek() {
                 Some(c) => c,
@@ -228,10 +230,13 @@ impl<'a> Parser<'a> {
             };
             match c {
                 b'"' => {
+                    // The run of ASCII ends here.
+                    self.push_ascii(&mut out, ascii_start, self.pos);
                     self.pos += 1;
                     return Ok(out);
                 }
                 b'\\' => {
+                    self.push_ascii(&mut out, ascii_start, self.pos);
                     self.pos += 1;
                     let esc = self.peek().ok_or_else(|| self.err("unterminated escape"))?;
                     self.pos += 1;
@@ -271,23 +276,61 @@ impl<'a> Parser<'a> {
                             return Err(self.err(&format!("invalid escape '\\{}'", other as char)))
                         }
                     }
+                    ascii_start = self.pos;
                 }
                 c if c < 0x20 => return Err(self.err("control character in string")),
                 _ => {
                     // Copy one whole UTF-8 sequence.
-                    let start = self.pos;
-                    let len = utf8_len(c);
-                    if start + len > self.bytes.len() {
-                        return Err(self.err("truncated UTF-8 sequence"));
+                    //
+                    // A string that holds a long run of plain ASCII - a
+                    // vector literal is one - is copied in one go. Copying
+                    // one character at a time meant a validation call and a
+                    // push per character, which is the whole cost of reading
+                    // a large request.
+                    //
+                    // The run of ASCII ends before a sequence of more than
+                    // one byte, because the run is copied as ASCII. A plain
+                    // ASCII character is not copied here; it stays in the
+                    // run and is copied when the run ends.
+                    if c >= 0x80 {
+                        self.push_ascii(&mut out, ascii_start, self.pos);
+                        ascii_start = self.pos;
+                        let start = self.pos;
+                        let len = utf8_len(c);
+                        if start + len > self.bytes.len() {
+                            return Err(self.err("truncated UTF-8 sequence"));
+                        }
+                        let slice = &self.bytes[start..start + len];
+                        match std::str::from_utf8(slice) {
+                            Ok(s) => out.push_str(s),
+                            Err(_) => return Err(self.err("invalid UTF-8 sequence")),
+                        }
+                        self.pos += len;
+                        ascii_start = self.pos;
+                    } else {
+                        self.pos += 1;
                     }
-                    let slice = &self.bytes[start..start + len];
-                    match std::str::from_utf8(slice) {
-                        Ok(s) => out.push_str(s),
-                        Err(_) => return Err(self.err("invalid UTF-8 sequence")),
-                    }
-                    self.pos += len;
                 }
             }
+        }
+    }
+
+    /// Copy a run of plain ASCII into the string.
+    ///
+    /// The run is known to hold no quote, no backslash and no control
+    /// character, because the caller only gathers the characters that are
+    /// none of those. Every byte of it is therefore an ASCII character, so
+    /// the run is valid UTF-8 and can be copied without a check.
+    fn push_ascii(&self, out: &mut String, start: usize, end: usize) {
+        if end <= start {
+            return;
+        }
+        let run = &self.bytes[start..end];
+        debug_assert!(run.iter().all(|b| b.is_ascii() && *b >= 0x20 && *b != b'"' && *b != b'\\'));
+        // The bytes are ASCII, so the conversion cannot fail.
+        match std::str::from_utf8(run) {
+            Ok(s) => out.push_str(s),
+            Err(_) => out.push_str(&String::from_utf8_lossy(run)),
         }
     }
 
