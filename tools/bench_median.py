@@ -20,21 +20,28 @@ def main():
     ap.add_argument("--dim", type=int, default=128)
     ap.add_argument("--queries", type=int, default=1000)
     ap.add_argument("--rounds", type=int, default=3)
+    ap.add_argument(
+        "--cpu",
+        default=None,
+        help="pin the server to this core; without it the rounds of this "
+             "machine differ by up to 70% and the median means little",
+    )
     ap.add_argument("--output", default=None)
     args = ap.parse_args()
 
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     binary = args.binary or os.path.join(root, "minivectordb", "target", "release", "minivectordb")
 
+    command = [sys.executable, os.path.join(root, "tools", "bench.py"),
+               "--binary", binary, "--mode", args.mode,
+               "--rows", str(args.rows), "--dim", str(args.dim),
+               "--queries", str(args.queries)]
+    if args.cpu is not None:
+        command += ["--cpu", str(args.cpu)]
+
     runs = []
     for _ in range(args.rounds):
-        out = subprocess.run(
-            [sys.executable, os.path.join(root, "tools", "bench.py"),
-             "--binary", binary, "--mode", args.mode,
-             "--rows", str(args.rows), "--dim", str(args.dim),
-             "--queries", str(args.queries)],
-            capture_output=True, text=True,
-        )
+        out = subprocess.run(command, capture_output=True, text=True)
         if out.returncode != 0:
             sys.stderr.write(out.stdout[-3000:])
             sys.stderr.write(out.stderr[-3000:])

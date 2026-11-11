@@ -1,16 +1,15 @@
 {
+  "cpu": 7,
   "mode": "exact",
-  "rows": 10000,
+  "note": "the driver and the server are pinned to the same core; without it the spread of the rounds is up to 70%",
   "queries": 1000,
-  "rounds": 3,
-  "query_t_ms": 900.644,
   "query_io_bytes": 1610808,
-  "query_peak_rss_kb": 14988,
-  "write_t_ms": 1412.092,
-  "write_io_bytes": 23104906,
-  "write_peak_rss_kb": 4020,
+  "query_peak_rss_kb": 14980,
+  "query_t_ms": 320.736,
   "recall_filtered": 1.0,
   "recall_unfiltered": 1.0,
+  "rounds": 5,
+  "rows": 10000,
   "runs": [
     {
       "config": {
@@ -24,20 +23,20 @@
         "seed": 42
       },
       "index": {
-        "t_ms": 114.386
+        "t_ms": 58.771
       },
       "query": {
         "io_bytes": 1610808,
-        "peak_rss_kb": 15024,
+        "peak_rss_kb": 14980,
         "recall_filtered": 1.0,
         "recall_unfiltered": 1.0,
         "sample_size": 20,
-        "t_ms": 900.644
+        "t_ms": 320.91
       },
       "write": {
         "io_bytes": 23104906,
-        "peak_rss_kb": 4020,
-        "t_ms": 1582.724
+        "peak_rss_kb": 3856,
+        "t_ms": 578.562
       }
     },
     {
@@ -52,20 +51,20 @@
         "seed": 42
       },
       "index": {
-        "t_ms": 84.806
+        "t_ms": 62.382
       },
       "query": {
         "io_bytes": 1610808,
-        "peak_rss_kb": 14984,
+        "peak_rss_kb": 14980,
         "recall_filtered": 1.0,
         "recall_unfiltered": 1.0,
         "sample_size": 20,
-        "t_ms": 567.414
+        "t_ms": 319.858
       },
       "write": {
         "io_bytes": 23104906,
-        "peak_rss_kb": 4148,
-        "t_ms": 1294.423
+        "peak_rss_kb": 3860,
+        "t_ms": 556.914
       }
     },
     {
@@ -80,21 +79,80 @@
         "seed": 42
       },
       "index": {
-        "t_ms": 113.36
+        "t_ms": 62.254
       },
       "query": {
         "io_bytes": 1610808,
-        "peak_rss_kb": 14988,
+        "peak_rss_kb": 14960,
         "recall_filtered": 1.0,
         "recall_unfiltered": 1.0,
         "sample_size": 20,
-        "t_ms": 946.199
+        "t_ms": 321.515
       },
       "write": {
         "io_bytes": 23104906,
-        "peak_rss_kb": 3992,
-        "t_ms": 1412.092
+        "peak_rss_kb": 3944,
+        "t_ms": 556.462
+      }
+    },
+    {
+      "config": {
+        "batch": 100,
+        "dim": 128,
+        "filter_ratio": 0.5,
+        "k": 10,
+        "mode": "exact",
+        "queries": 1000,
+        "rows": 10000,
+        "seed": 42
+      },
+      "index": {
+        "t_ms": 59.251
+      },
+      "query": {
+        "io_bytes": 1610808,
+        "peak_rss_kb": 14968,
+        "recall_filtered": 1.0,
+        "recall_unfiltered": 1.0,
+        "sample_size": 20,
+        "t_ms": 319.352
+      },
+      "write": {
+        "io_bytes": 23104906,
+        "peak_rss_kb": 3940,
+        "t_ms": 552.866
+      }
+    },
+    {
+      "config": {
+        "batch": 100,
+        "dim": 128,
+        "filter_ratio": 0.5,
+        "k": 10,
+        "mode": "exact",
+        "queries": 1000,
+        "rows": 10000,
+        "seed": 42
+      },
+      "index": {
+        "t_ms": 59.248
+      },
+      "query": {
+        "io_bytes": 1610808,
+        "peak_rss_kb": 14980,
+        "recall_filtered": 1.0,
+        "recall_unfiltered": 1.0,
+        "sample_size": 20,
+        "t_ms": 320.736
+      },
+      "write": {
+        "io_bytes": 23104906,
+        "peak_rss_kb": 3872,
+        "t_ms": 577.724
       }
     }
-  ]
+  ],
+  "write_io_bytes": 23104906,
+  "write_peak_rss_kb": 3872,
+  "write_t_ms": 556.914
 }

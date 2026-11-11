@@ -1,0 +1,158 @@
+{
+  "cpu": 7,
+  "mode": "exact",
+  "note": "the driver and the server are pinned to the same core; without it the spread of the rounds is up to 70%",
+  "queries": 1000,
+  "query_io_bytes": 7380838,
+  "query_peak_rss_kb": 14696,
+  "query_t_ms": 969.699,
+  "recall_filtered": 1.0,
+  "recall_unfiltered": 1.0,
+  "rounds": 5,
+  "rows": 10000,
+  "runs": [
+    {
+      "config": {
+        "batch": 100,
+        "dim": 128,
+        "filter_ratio": 0.5,
+        "k": 10,
+        "mode": "exact",
+        "queries": 1000,
+        "rows": 10000,
+        "seed": 42
+      },
+      "index": {
+        "t_ms": 72.858
+      },
+      "query": {
+        "io_bytes": 7380838,
+        "peak_rss_kb": 14816,
+        "recall_filtered": 1.0,
+        "recall_unfiltered": 1.0,
+        "sample_size": 20,
+        "t_ms": 969.699
+      },
+      "write": {
+        "io_bytes": 23104906,
+        "peak_rss_kb": 3976,
+        "t_ms": 724.258
+      }
+    },
+    {
+      "config": {
+        "batch": 100,
+        "dim": 128,
+        "filter_ratio": 0.5,
+        "k": 10,
+        "mode": "exact",
+        "queries": 1000,
+        "rows": 10000,
+        "seed": 42
+      },
+      "index": {
+        "t_ms": 76.829
+      },
+      "query": {
+        "io_bytes": 7380838,
+        "peak_rss_kb": 14696,
+        "recall_filtered": 1.0,
+        "recall_unfiltered": 1.0,
+        "sample_size": 20,
+        "t_ms": 980.681
+      },
+      "write": {
+        "io_bytes": 23104906,
+        "peak_rss_kb": 3856,
+        "t_ms": 778.028
+      }
+    },
+    {
+      "config": {
+        "batch": 100,
+        "dim": 128,
+        "filter_ratio": 0.5,
+        "k": 10,
+        "mode": "exact",
+        "queries": 1000,
+        "rows": 10000,
+        "seed": 42
+      },
+      "index": {
+        "t_ms": 72.316
+      },
+      "query": {
+        "io_bytes": 7380838,
+        "peak_rss_kb": 14696,
+        "recall_filtered": 1.0,
+        "recall_unfiltered": 1.0,
+        "sample_size": 20,
+        "t_ms": 972.719
+      },
+      "write": {
+        "io_bytes": 23104906,
+        "peak_rss_kb": 3856,
+        "t_ms": 746.624
+      }
+    },
+    {
+      "config": {
+        "batch": 100,
+        "dim": 128,
+        "filter_ratio": 0.5,
+        "k": 10,
+        "mode": "exact",
+        "queries": 1000,
+        "rows": 10000,
+        "seed": 42
+      },
+      "index": {
+        "t_ms": 73.773
+      },
+      "query": {
+        "io_bytes": 7380838,
+        "peak_rss_kb": 14696,
+        "recall_filtered": 1.0,
+        "recall_unfiltered": 1.0,
+        "sample_size": 20,
+        "t_ms": 964.916
+      },
+      "write": {
+        "io_bytes": 23104906,
+        "peak_rss_kb": 3856,
+        "t_ms": 745.074
+      }
+    },
+    {
+      "config": {
+        "batch": 100,
+        "dim": 128,
+        "filter_ratio": 0.5,
+        "k": 10,
+        "mode": "exact",
+        "queries": 1000,
+        "rows": 10000,
+        "seed": 42
+      },
+      "index": {
+        "t_ms": 72.002
+      },
+      "query": {
+        "io_bytes": 7380838,
+        "peak_rss_kb": 14812,
+        "recall_filtered": 1.0,
+        "recall_unfiltered": 1.0,
+        "sample_size": 20,
+        "t_ms": 968.191
+      },
+      "write": {
+        "io_bytes": 23104906,
+        "peak_rss_kb": 3972,
+        "t_ms": 732.235
+      }
+    }
+  ],
+  "write_io_bytes": 23104906,
+  "write_peak_rss_kb": 3856,
+  "write_t_ms": 745.074
+}

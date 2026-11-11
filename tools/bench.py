@@ -74,7 +74,7 @@ class Db:
     protocol bug shows up here rather than in the measurement.
     """
 
-    def __init__(self, binary, data_dir, mode="ann", nlist=64, nprobe=None):
+    def __init__(self, binary, data_dir, mode="ann", nlist=64, nprobe=None, cpu=None):
         env = dict(os.environ)
         env["MINIVECDB_DATA_DIR"] = data_dir
         env["MINIVECDB_MODE"] = mode
@@ -83,8 +83,31 @@ class Db:
             env["MINIVECDB_ANN_NPROBE"] = str(nprobe)
         else:
             env.pop("MINIVECDB_ANN_NPROBE", None)
+        # The measurement of this machine is noisy unless the driver and the
+        # server are pinned to the same core.
+        #
+        # The machine is shared, and the scheduler otherwise moves the server
+        # between the cores while it runs. Every move takes the ten megabytes
+        # of the decoded blocks out of the cache of the old core and puts
+        # them back into the cache of the new one, so the scan pays for the
+        # reads again. The effect is large: the same binary measured
+        # 703 ms when it was free and 327 ms when it was pinned, and the
+        # spread of the rounds fell from 49% to 3%.
+        #
+        # The driver has to be pinned to the same core as the server, or
+        # the two of them fight over the cache and the result is worse than
+        # pinning either one alone.
+        command = [binary, "--data-dir", data_dir]
+        if cpu is not None:
+            command = ["taskset", "-c", str(cpu)] + command
+            try:
+                os.sched_setaffinity(0, {int(cpu)})
+            except (AttributeError, OSError):
+                # The affinity cannot be set. The measurement still runs,
+                # but the rounds will be less alike than they should be.
+                pass
         self.proc = subprocess.Popen(
-            [binary, "--data-dir", data_dir],
+            command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -340,7 +363,7 @@ def run(binary, data_dir, args):
     queries = make_queries(args.seed, args.queries, args.dim)
     categories = ["c%d" % i for i in range(CATEGORY_COUNT)]
 
-    db = Db(binary, data_dir, mode=args.mode)
+    db = Db(binary, data_dir, mode=args.mode, cpu=args.cpu)
     try:
         pid = db.proc.pid
 
@@ -465,6 +488,11 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="the seed of the data set")
     parser.add_argument("--mode", default="ann", choices=("exact", "ann"))
     parser.add_argument("--data-dir", default=None, help="the data directory to use")
+    parser.add_argument(
+        "--cpu",
+        default=None,
+        help="pin the server to this core, which is what makes the rounds comparable",
+    )
     parser.add_argument("--output", default=None, help="write the measurements to this file")
     parser.add_argument(
         "--compare", default=None, help="compare against the measurements of this file"
