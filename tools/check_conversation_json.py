@@ -14,7 +14,12 @@ The checks are:
 * every excerpt is a verbatim part of the turn it belongs to;
 * no excerpt is used twice, so that one piece of evidence can not be
   scored twice;
-* the student contribution and the result are not the same fragment.
+* the student contribution and the result are not the same fragment;
+* no evidence excerpt is shared by two instances, in any dimension,
+  so that one piece of evidence can not be scored twice;
+* every dimension of the rubric carries at least one instance whose
+  hypothesis the student raised, so that no dimension is left without
+  evidence.
 """
 
 import json
@@ -26,6 +31,22 @@ MAX_BYTES = 128 * 1024
 
 # The limit of a cited excerpt.
 MAX_EXCERPT = 240
+
+# The five dimensions of the rubric, and the number of instances that each
+# of them has to carry. A dimension without an instance is scored as zero
+# by the reviewer, which is different from a dimension whose evidence was
+# not found, so a thin dimension is reported here.
+DIMENSIONS = (
+    "问题理解与自主拆解",
+    "技术理解与迁移",
+    "独立验证与质疑",
+    "实验与反馈迭代",
+    "取舍与反思",
+)
+
+# The smallest number of instances that a dimension has to carry, so that
+# the reviewer has something to score in every dimension.
+MIN_INSTANCES_PER_DIMENSION = 2
 
 
 def fail(problems, message):
@@ -183,6 +204,106 @@ def check_prompts(doc, problems):
                  % where)
 
 
+def check_evidence_is_not_shared(doc, problems):
+    """Check that no excerpt of evidence is used by two instances.
+
+    The rules say that one piece of evidence must not be scored twice,
+    neither across two instances nor across two dimensions. A repeated
+    excerpt is therefore a defect of the material, not of the reviewer.
+    """
+    seen = {}
+    for i, experiment in enumerate(doc.get("experiments", [])):
+        where = "/experiments/%d" % i
+        for field in ("student_evidence", "result_evidence"):
+            block = experiment.get(field)
+            if not isinstance(block, dict):
+                continue
+            excerpt = block.get("excerpt")
+            if not isinstance(excerpt, str) or not excerpt.strip():
+                fail(problems, "%s/%s has no excerpt" % (where, field))
+                continue
+            if excerpt in seen:
+                fail(problems,
+                     "the excerpt of %s/%s is the same as the one of %s"
+                     % (where, field, seen[excerpt]))
+                continue
+            seen[excerpt] = "%s/%s" % (where, field)
+
+    # The excerpt of a conversation turn is evidence as well, so it is
+    # checked against the same pool.
+    for i, conversation in enumerate(doc.get("conversations", [])):
+        for j, item in enumerate(conversation.get("turns", [])):
+            excerpt = item.get("excerpt")
+            if not isinstance(excerpt, str) or not excerpt.strip():
+                continue
+            where = "/conversations/%d/turns/%d" % (i, j)
+            if excerpt in seen:
+                fail(problems, "the excerpt of %s is the same as the one of %s"
+                     % (where, seen[excerpt]))
+                continue
+            seen[excerpt] = where
+
+
+def check_instances_are_independent(doc, problems):
+    """Check that no two instances are scored on the same prompt.
+
+    The rules say that one piece of evidence must not be scored twice,
+    neither across two instances nor across two dimensions. Two instances
+    that point at the same prompt are the same piece of evidence, even
+    when their excerpts are worded differently, so this is checked on the
+    prompt the instance is built on and not only on its excerpt.
+    """
+    owners = {}
+    for i, experiment in enumerate(doc.get("experiments", [])):
+        where = "/experiments/%d" % i
+        block = experiment.get("student_evidence")
+        if not isinstance(block, dict):
+            continue
+        pointer = block.get("prompt_pointer")
+        if not isinstance(pointer, str):
+            fail(problems, "%s/student_evidence has no prompt pointer" % where)
+            continue
+        if pointer in owners:
+            fail(problems,
+                 "%s is scored on the prompt %s, which %s is scored on as well"
+                 % (where, pointer, owners[pointer]))
+            continue
+        owners[pointer] = where
+
+
+def check_dimensions(doc, problems):
+    """Check that every dimension of the rubric carries enough instances.
+
+    The reviewer scores each dimension on its own and adds the five
+    scores up. A dimension with no instance is scored as zero, and one
+    with a single thin instance is scored with a wide spread over the
+    three reviews. Both make the whole material unreviewable, so they
+    are reported here.
+    """
+    total = {}
+    student = {}
+    for experiment in doc.get("experiments", []):
+        dimension = experiment.get("dimension")
+        if dimension not in DIMENSIONS:
+            fail(problems, "the dimension %r is not one of the five of the "
+                           "rubric" % dimension)
+            continue
+        total[dimension] = total.get(dimension, 0) + 1
+        if experiment.get("hypothesis_author") == "student":
+            student[dimension] = student.get(dimension, 0) + 1
+
+    for dimension in DIMENSIONS:
+        if total.get(dimension, 0) < MIN_INSTANCES_PER_DIMENSION:
+            fail(problems,
+                 "the dimension %s has %d instances, fewer than the %d it "
+                 "needs" % (dimension, total.get(dimension, 0),
+                            MIN_INSTANCES_PER_DIMENSION))
+        if not student.get(dimension):
+            fail(problems,
+                 "the dimension %s has no instance whose hypothesis the "
+                 "student raised" % dimension)
+
+
 def main():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     problems = []
@@ -216,6 +337,9 @@ def main():
             check_excerpts(doc, problems)
             check_experiments(doc, problems)
             check_prompts(doc, problems)
+            check_evidence_is_not_shared(doc, problems)
+            check_instances_are_independent(doc, problems)
+            check_dimensions(doc, problems)
 
     # The two copies have to be the same, so that the reader finds the same
     # material in either place.

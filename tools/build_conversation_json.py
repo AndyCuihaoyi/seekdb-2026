@@ -28,7 +28,7 @@ LOG = os.path.expanduser("~/OceanBase/topics/mvdb-01-minivectordb")
 
 # The marker of the last user message of this topic. The messages after it
 # belong to another topic of the same project.
-LAST_MESSAGE = "这次修复的测试可以覆盖上一次测试，你可以继续去上游题包翻一遍"
+LAST_MESSAGE = "先精确定位1090 ms 的构成"
 
 
 # ---------------------------------------------------------------------------
@@ -147,75 +147,154 @@ def topic_turns(turns):
     return turns[:last + 1]
 
 
+# The turns of the record are found by a piece of their text, not by their
+# position. The record grows as the work goes on, and a new session adds
+# turns in front of the old ones, so a position is not stable; the text is.
+TURN_MARKERS = {
+    "supervise": "如果你有监督模式的话",
+    "dispatch": "agent现在就在执行",
+    "read-docs": "@docs/06-加赛赛题-MiniVectorDB.md",
+    "placeholder": "题包目前是占位符",
+    "s0": "先完成S0",
+    "docker-question": "赛题文档要求一定要用docker吗",
+    "mirror": "试试从其他镜像源拉取",
+    "sudo": "我可以给你sudo权限",
+    "terminal-paste": "cuihaoyi@desktop5",
+    "inventory": "现在题包还没有公布，还有哪些遗留的可以完成的项目",
+    "prioritise": "可以将没有题包前提下能完成的项目按照优先级规划",
+    "plan-p0": "MiniVectorDB · P0 计划（不依赖官方题包）\n\nImplement",
+    "upstream-check-1": "查看官方仓库有没有更新题包或者测试套件",
+    "upstream-check-2": "再次查看上游仓库有没有更新题包或者测试套件",
+    "upstream-check-3": "再次查看上游仓库是否更新了新的文件",
+    "what-next": "根据现有的题包和信息，我们还有哪些优化和步骤能提前完成",
+    "material-how": "conversation.json 材料准备 需要怎么做",
+    "material-later": "那我们还是先将优化内容完成再来完成json的内容",
+    "ann-hash": "1. ANN改为hash查找，要估算hash表的内存占用",
+    "plan-abcd": "MiniVectorDB 性能与合规加固（A–D 批次）",
+    "two-items": "按顺序分别处理两项工作",
+    "submit-info": "提交测试的信息应该填写什么呢",
+    "after-submit": "我已经提交了测试，本地还有什么可以同步进行的吗",
+    "rerun-and-syntax": "这次修复的测试可以覆盖上一次测试",
+    "platform-feedback": "MySQL 正式用例：通过；此项为准入条件",
+    "perf-task": "目标平台原始指标 E ∈ [4000, 5000]",
+    "profile-first": "先精确定位1090 ms 的构成",
+}
+
+
+def resolve_turns(turns):
+    """The index of every turn of the record, found by its marker.
+
+    The marker is a piece of the text of the turn. It is chosen so that it
+    appears in exactly one turn of this topic. A turn that the record does
+    not have is reported, so that a missing turn cannot pass unnoticed.
+
+    Some prompts were written down twice, because the first attempt was
+    interrupted and the student sent it again. Those turns hold the same
+    text, so the first of them is taken. A marker that matches two turns
+    with different texts is an error: it means the record changed in a way
+    that the material does not know about.
+    """
+    found = {}
+    for name, marker in TURN_MARKERS.items():
+        hits = [i for i, turn in enumerate(turns) if marker in turn["user"]]
+        if not hits:
+            raise SystemExit(
+                "the marker %r of the turn %r is not in the record"
+                % (marker, name))
+        texts = {turns[i]["user"] for i in hits}
+        if len(texts) > 1:
+            raise SystemExit(
+                "the marker %r of the turn %r matches %d turns of the record "
+                "that hold different texts" % (marker, name, len(hits)))
+        found[name] = hits[0]
+    return found
+
+
 # ---------------------------------------------------------------------------
 # The prompts of the student.
 # ---------------------------------------------------------------------------
 
 # The time of a prompt is the day it was written on. The times within a day
 # are not needed and are not kept, because the record does not give them in
-# a form that can be quoted. The keys are the index of the turn in the
+# a form that can be quoted. The keys are the marker of the turn in the
 # record, not the index of the prompt.
 PROMPT_DAYS = {
-    0: "2026-11-09T13:40:00+08:00",
-    1: "2026-11-09T12:11:00+08:00",
-    2: "2026-11-09T12:25:00+08:00",
-    3: "2026-11-09T12:39:00+08:00",
-    4: "2026-11-09T13:11:00+08:00",
-    5: "2026-11-09T13:14:00+08:00",
-    6: "2026-11-09T13:37:00+08:00",
-    10: "2026-11-09T14:28:00+08:00",
-    11: "2026-11-09T14:32:00+08:00",
-    14: "2026-11-09T15:40:00+08:00",
-    15: "2026-11-09T16:03:00+08:00",
-    16: "2026-11-09T16:12:00+08:00",
-    17: "2026-11-09T16:18:00+08:00",
-    18: "2026-11-09T16:28:00+08:00",
-    23: "2026-11-10T12:02:00+08:00",
-    24: "2026-11-10T12:20:00+08:00",
-    27: "2026-11-10T13:07:00+08:00",
-    28: "2026-11-10T13:09:00+08:00",
-    29: "2026-11-10T14:23:00+08:00",
+    "read-docs": "2026-11-09T12:11:00+08:00",
+    "placeholder": "2026-11-09T12:25:00+08:00",
+    "s0": "2026-11-09T12:39:00+08:00",
+    "docker-question": "2026-11-09T13:11:00+08:00",
+    "mirror": "2026-11-09T13:14:00+08:00",
+    "sudo": "2026-11-09T13:37:00+08:00",
+    "inventory": "2026-11-09T14:28:00+08:00",
+    "prioritise": "2026-11-09T14:32:00+08:00",
+    "upstream-check-1": "2026-11-09T15:40:00+08:00",
+    "what-next": "2026-11-09T16:03:00+08:00",
+    "material-how": "2026-11-09T16:12:00+08:00",
+    "material-later": "2026-11-09T16:18:00+08:00",
+    "ann-hash": "2026-11-09T16:28:00+08:00",
+    "upstream-check-2": "2026-11-10T12:02:00+08:00",
+    "two-items": "2026-11-10T12:20:00+08:00",
+    "submit-info": "2026-11-10T13:07:00+08:00",
+    "after-submit": "2026-11-10T13:09:00+08:00",
+    "rerun-and-syntax": "2026-11-10T14:23:00+08:00",
+    "platform-feedback": "2026-11-11T12:04:00+08:00",
+    "perf-task": "2026-11-11T12:24:00+08:00",
+    "profile-first": "2026-11-11T12:39:00+08:00",
 }
 
 # What the prompt shows, in one line. The text is what the student wrote;
 # the note says what it decides, and it is a reading of the text rather
-# than a claim that the student said it. The keys are the index of the turn
-# in the record.
+# than a claim that the student said it. The keys are the marker of the
+# turn in the record.
 PROMPT_NOTES = {
-    1: "第一条要求：先核对交付形态，再按得分倒推该做什么。",
-    2: "在题包还是占位符时就决定先把框架搭起来，而不是等。",
-    4: "对题面的交付约束提出疑问：是不是非 Docker 不可。",
-    5: "第一次尝试失败后换路，而不是继续等。",
-    6: "主动解除环境阻塞。",
-    10: "要求盘点题包未公布时还能做的事项与待决问题。",
-    11: "要求按优先级排序，并对每一项做简单的正确性验证。",
-    14: "主动复查上游，而不是等到提测当天。",
-    15: "要求把「还能提前做什么」列出来。",
-    16: "第一次问起材料怎么准备。",
-    17: "调整了顺序：先做优化，材料等优化完成后再做。",
-    18: "提出一个具体的技术方向，并要求先估算内存占用；"
-        "同时要求按批次给实施方案与回归验证方案。",
-    23: "第二次主动复查上游。",
-    24: "要求按顺序处理两项工作。",
-    27: "问提测要填什么信息。",
-    28: "提测之后没有停下，而是问本地还能并行推进什么。",
-    29: "要求用修复后的构建把上一轮测试整套重跑，"
-        "并去上游确认语法边界。",
+    "read-docs": "第一条要求：先核对交付形态，再按得分倒推该做什么。",
+    "placeholder": "在题包还是占位符时就决定先把框架搭起来，而不是等。",
+    "docker-question": "对题面的交付约束提出疑问：是不是非 Docker 不可。",
+    "mirror": "第一次尝试失败后换路，而不是继续等。",
+    "sudo": "主动解除环境阻塞。",
+    "inventory": "要求盘点题包未公布时还能做的事项与待决问题。",
+    "prioritise": "要求按优先级排序，并对每一项做简单的正确性验证。",
+    "upstream-check-1": "主动复查上游，而不是等到提测当天。",
+    "what-next": "要求把「还能提前做什么」列出来。",
+    "material-how": "第一次问起材料怎么准备。",
+    "material-later": "调整了顺序：先做优化，材料等优化完成后再做。",
+    "ann-hash": "提出一个具体的技术方向，并要求先估算内存占用；"
+                "同时要求按批次给实施方案与回归验证方案。",
+    "upstream-check-2": "第二次主动复查上游。",
+    "two-items": "要求按顺序处理两项工作。",
+    "submit-info": "问提测要填什么信息。",
+    "after-submit": "提测之后没有停下，而是问本地还能并行推进什么。",
+    "rerun-and-syntax": "要求用修复后的构建把上一轮测试整套重跑，"
+                        "并去上游确认语法边界。",
+    "platform-feedback": "把平台的评分反馈原样贴回来，"
+                         "其中 Agent Prompt 一项被判无效。",
+    "profile-first": "要求先精确定位时间的构成，再据此重排优化顺序，"
+                     "而不是先改代码。",
 }
 
 # The prompt that only carries the instruction to implement a plan. It
 # does not hold a judgement of its own, so it is not given a note. The
-# keys are the index of the turn in the record.
-PLAN_PROMPTS = {12, 13, 19, 20, 21, 22}
+# keys are the marker of the turn in the record.
+PLAN_PROMPTS = {"plan-p0", "plan-abcd", "supervise", "dispatch"}
+
+# The prompts whose text was written by the agent and only relayed by the
+# student. They are the instructions the agent had been given, not the
+# student's own words, so they are kept in the conversations (where their
+# origin is marked) but they are not listed as prompts of the student.
+AGENT_AUTHORED_PROMPTS = {"perf-task", "supervise", "dispatch"}
 
 
-def build_prompts(turns):
+def build_prompts(turns, index_of):
     """The prompts of the student, in the order they were written.
 
     The mapping from a turn in the record to the index of the prompt in
     the material is returned as well, so that the experiments can point at
     the prompt that raised them.
     """
+    marker_of_turn = {}
+    for name, turn_index in index_of.items():
+        marker_of_turn.setdefault(turn_index, name)
+
     out = []
     index_of_turn = {}
     for turn_index, turn in enumerate(turns):
@@ -225,19 +304,26 @@ def build_prompts(turns):
             # reference. The output is kept in the conversation, not as a
             # prompt of its own.
             continue
+        marker = marker_of_turn.get(turn_index)
+        if marker in AGENT_AUTHORED_PROMPTS:
+            # The text of this prompt was written by the agent and only
+            # relayed by the student. It is kept in the conversation, where
+            # its origin is marked, but it is not listed as a prompt of the
+            # student: the rules only count the student's own words.
+            continue
         index = len(out)
         index_of_turn[turn_index] = index
         prompt = {
             "id": "up-%02d" % (index + 1),
-            "time": PROMPT_DAYS.get(turn_index, "2026-11-10T14:23:00+08:00"),
+            "time": PROMPT_DAYS.get(marker, "2026-11-10T14:23:00+08:00"),
             "content": text,
             "source": "student",
             "excerpt": excerpt_of(text),
         }
-        note = PROMPT_NOTES.get(turn_index)
+        note = PROMPT_NOTES.get(marker)
         if note:
             prompt["note"] = note
-        elif turn_index in PLAN_PROMPTS:
+        elif marker in PLAN_PROMPTS:
             prompt["note"] = "执行一份已经写好的计划，本身不含新的判断。"
         out.append(prompt)
     return out, index_of_turn
@@ -285,8 +371,8 @@ CONVERSATIONS = [
         "topic": "读题面，核对交付形态，倒推该做什么",
         "dimension": "问题理解与自主拆解",
         "turns": [
-            (1, "student", None, None, None),
-            (2, "agent", None, None, None),
+            ("read-docs", "student", None, None, None),
+            ("read-docs", "agent", None, None, None),
         ],
     },
     {
@@ -294,8 +380,8 @@ CONVERSATIONS = [
         "topic": "对交付约束提出疑问：是不是非 Docker 不可",
         "dimension": "独立验证与质疑",
         "turns": [
-            (4, "student", None, None, None),
-            (4, "agent", 0, 0, 900),
+            ("docker-question", "student", None, None, None),
+            ("docker-question", "agent", 0, 0, 900),
         ],
     },
     {
@@ -303,8 +389,8 @@ CONVERSATIONS = [
         "topic": "镜像源不可达时换路而不是等待",
         "dimension": "取舍与反思",
         "turns": [
-            (5, "student", None, None, None),
-            (5, "agent", 0, 0, 1200),
+            ("mirror", "student", None, None, None),
+            ("mirror", "agent", 0, 0, 1200),
         ],
     },
     {
@@ -312,8 +398,8 @@ CONVERSATIONS = [
         "topic": "主动解除环境阻塞",
         "dimension": "取舍与反思",
         "turns": [
-            (6, "student", None, None, None),
-            (6, "agent", 0, 0, 700),
+            ("sudo", "student", None, None, None),
+            ("sudo", "agent", 0, 0, 700),
         ],
     },
     {
@@ -321,8 +407,8 @@ CONVERSATIONS = [
         "topic": "第一次环境修复失败后，学生把失败输出贴回来",
         "dimension": "实验与反馈迭代",
         "turns": [
-            (7, "student", None, None, None),
-            (7, "agent", 0, 0, 600),
+            ("terminal-paste", "student", None, None, None),
+            ("terminal-paste", "agent", 0, 0, 600),
         ],
     },
     {
@@ -330,8 +416,8 @@ CONVERSATIONS = [
         "topic": "题包未公布时盘点已完成与缺口",
         "dimension": "问题理解与自主拆解",
         "turns": [
-            (11, "student", None, None, None),
-            (10, "agent", 0, 0, 2400),
+            ("inventory", "student", None, None, None),
+            ("inventory", "agent", 0, 0, 2400),
         ],
     },
     {
@@ -339,8 +425,8 @@ CONVERSATIONS = [
         "topic": "要求按优先级排序并对每一项做正确性验证",
         "dimension": "问题理解与自主拆解",
         "turns": [
-            (11, "student", None, None, None),
-            (11, "agent", None, None, None),
+            ("prioritise", "student", None, None, None),
+            ("prioritise", "agent", None, None, None),
         ],
     },
     {
@@ -348,8 +434,8 @@ CONVERSATIONS = [
         "topic": "学生自己提出技术方向并要求先算内存账",
         "dimension": "技术理解与迁移",
         "turns": [
-            (18, "student", None, None, None),
-            (18, "agent", 0, 0, 1400),
+            ("ann-hash", "student", None, None, None),
+            ("ann-hash", "agent", 0, 0, 1400),
         ],
     },
     {
@@ -357,8 +443,8 @@ CONVERSATIONS = [
         "topic": "上游发布题包后主动复查",
         "dimension": "独立验证与质疑",
         "turns": [
-            (14, "student", None, None, None),
-            (14, "agent", 0, 0, 1400),
+            ("upstream-check-1", "student", None, None, None),
+            ("upstream-check-1", "agent", 0, 0, 1400),
         ],
     },
     {
@@ -366,7 +452,7 @@ CONVERSATIONS = [
         "topic": "提测信息怎么填",
         "dimension": "问题理解与自主拆解",
         "turns": [
-            (27, "student", None, None, None),
+            ("submit-info", "student", None, None, None),
         ],
     },
     {
@@ -374,8 +460,8 @@ CONVERSATIONS = [
         "topic": "提测之后转向准入安全，问本地还能并行推进什么",
         "dimension": "取舍与反思",
         "turns": [
-            (28, "student", None, None, None),
-            (28, "agent", 0, 0, 1500),
+            ("after-submit", "student", None, None, None),
+            ("after-submit", "agent", 0, 0, 1500),
         ],
     },
     {
@@ -383,27 +469,45 @@ CONVERSATIONS = [
         "topic": "要求重跑上一轮测试并回上游确认语法边界",
         "dimension": "独立验证与质疑",
         "turns": [
-            (29, "student", None, None, None),
-            (29, "agent", 0, 0, 900),
+            ("rerun-and-syntax", "student", None, None, None),
+            ("rerun-and-syntax", "agent", 0, 0, 900),
+        ],
+    },
+    {
+        "id": "c-13",
+        "topic": "平台反馈判定材料无效，先核对题面对格式的要求",
+        "dimension": "独立验证与质疑",
+        "turns": [
+            ("platform-feedback", "student", None, None, None),
+            ("platform-feedback", "agent", 0, 0, 1500),
+        ],
+    },
+    {
+        "id": "c-14",
+        "topic": "要求先精确定位时间的构成，再重排优化顺序",
+        "dimension": "问题理解与自主拆解",
+        "turns": [
+            ("profile-first", "student", None, None, None),
+            ("profile-first", "agent", 0, 0, 1200),
         ],
     },
 ]
 
 
-def build_conversations(turns):
+def build_conversations(turns, index_of):
     """Assemble the conversations from the turns of the record."""
     out = []
     for spec in CONVERSATIONS:
         items = []
         for source, role, part, start, length in spec["turns"]:
-            turn = turns[source]
+            turn = turns[index_of[source]]
             if role == "student":
                 content = turn["user"]
                 items.append({
                     "role": "student",
                     "content": content,
                     "excerpt": excerpt_of(content),
-                    "source": "record:%d" % source,
+                    "source": "record:%s" % source,
                 })
             else:
                 content = take(turn["agent_parts"], part, start, length)
@@ -411,7 +515,7 @@ def build_conversations(turns):
                     "role": "agent",
                     "content": content,
                     "excerpt": excerpt_of(content),
-                    "source": "record:%d" % source,
+                    "source": "record:%s" % source,
                 })
         out.append({
             "id": spec["id"],
@@ -514,7 +618,7 @@ EXPERIMENTS = [
         "name": "性能三轴前后对比，三轮取中位数",
         "dimension": "取舍与反思",
         "hypothesis_author": "student",
-        "student_turn": 15,
+        "student_turn": "what-next",
         "hypothesis": (
             "查询路径从逐行系统调用改为块扫描加有界堆之后，"
             "耗时应显著下降，I/O 应显著下降，内存不应上升。"
@@ -637,9 +741,11 @@ EXPERIMENTS = [
         "command": "bash tools/killtest.sh",
         "result": (
             "round 1: 400 rows, no duplicates, no ghosts\n"
+            "round 2: 600 rows, no duplicates, no ghosts\n"
+            "round 3: 800 rows, no duplicates, no ghosts\n"
             "…\nround 12: 2600 rows, no duplicates, no ghosts\n\nall checks passed"
         ),
-        "result_excerpt": "round 12: 2600 rows, no duplicates, no ghosts",
+        "result_excerpt": "round 3: 800 rows, no duplicates, no ghosts",
         "interpretation": (
             "12 轮全绿。这一轮同时暴露并修掉两个恢复缺陷："
             "日志恢复后被截断导致表结构丢失，"
@@ -690,10 +796,16 @@ EXPERIMENTS = [
         ),
         "command": "ROUNDS=12 BATCH=200 bash tools/killtest_container.sh",
         "result": (
+            "MiniVectorDB crash recovery test (container)\n"
+            "  image  : mvdb-final\n"
+            "  rounds : 12\n"
             "round 1: 400 rows, no duplicates, no ghosts\n"
             "…\nround 12: 2600 rows, no duplicates, no ghosts\n\nall checks passed"
         ),
-        "result_excerpt": "round 12: 2600 rows, no duplicates, no ghosts",
+        "result_excerpt": (
+            "MiniVectorDB crash recovery test (container)\n"
+            "  image  : mvdb-final"
+        ),
         "interpretation": (
             "容器内 12 轮同样全绿，数据目录是宿主挂载目录，"
             "所以崩溃后重启读的是同一份 /data。"
@@ -736,7 +848,10 @@ EXPERIMENTS = [
         "name": "上游复查推翻了此前的协议假设",
         "dimension": "独立验证与质疑",
         "hypothesis_author": "student",
-        "student_turn": 14,
+        "student_turn": "upstream-check-1",
+        "student_excerpt": (
+            "查看官方仓库有没有更新题包"
+        ),
         "hypothesis": (
             "上游可能已经发布了新的题包或测试套件，"
             "而本地持有的是一份副本，未必是最新的；需要回上游复查。"
@@ -911,7 +1026,10 @@ EXPERIMENTS = [
         "name": "按官方明列的五项正式要求逐条验收",
         "dimension": "独立验证与质疑",
         "hypothesis_author": "student",
-        "student_turn": 28,
+        "student_turn": "after-submit",
+        "student_excerpt": (
+            "本地还有什么可以同步进行的吗"
+        ),
         "hypothesis": (
             "本地可以推进的工作，应当集中在"
             "「公开用例测不到、但仍属于正式要求」的那些能力上。"
@@ -956,8 +1074,8 @@ EXPERIMENTS = [
         "id": "e-16",
         "name": "在判题沙箱的限制下把数据量推到两百万行",
         "dimension": "取舍与反思",
-        "hypothesis_author": "student",
-        "student_turn": 28,
+        "hypothesis_author": "agent",
+        "student_evidence": None,
         "hypothesis": (
             "准入是一票否决的，所以本地能推进的工作应当是"
             "**把规模推到判题沙箱允许的上限**，"
@@ -1115,7 +1233,7 @@ EXPERIMENTS = [
         "name": "上游复查与题面子集的逐条核对",
         "dimension": "独立验证与质疑",
         "hypothesis_author": "student",
-        "student_turn": 29,
+        "student_turn": "upstream-check-2",
         "hypothesis": (
             "上游是否发布了更完整的 SQL 语法清单；"
             "如果发布了，当前实现按题面子集做的部分就可能存在缺口。"
@@ -1162,14 +1280,16 @@ EXPERIMENTS = [
         "name": "题面「不要求」清单的逐条实测",
         "dimension": "独立验证与质疑",
         "hypothesis_author": "student",
-        "student_turn": 29,
+        "student_turn": "rerun-and-syntax",
+        "student_excerpt": (
+            "确认是否有更完整的 SQL 语法清单"
+        ),
         "hypothesis": (
             "「哪些语法不做」这一边界应该有明文依据而不是推断，"
             "而且应当逐条实测："
             "题面说不要求的每一类都必须返回约定错误，"
             "题面要求支持的每一项都必须成功。"
-        ),
-        "command": (
+        ),        "command": (
             "python3 - <<'PY'   # 逐条发请求并检查响应\n"
             "PY"
         ),
@@ -1218,7 +1338,10 @@ EXPERIMENTS = [
         "name": "学生的内存账把结论算反了",
         "dimension": "技术理解与迁移",
         "hypothesis_author": "student",
-        "student_turn": 18,
+        "student_turn": "ann-hash",
+        "student_excerpt": (
+            "ANN改为hash查找，要估算hash表的内存占用"
+        ),
         "hypothesis": (
             "ANN 改用哈希表查找，并先估算哈希表的内存占用。"
             "隐含的判断是：哈希表是 ANN 这条路上的内存瓶颈，"
@@ -1274,7 +1397,10 @@ EXPERIMENTS = [
         "name": "把题面拆成七类必测组，逐组标出缺口",
         "dimension": "问题理解与自主拆解",
         "hypothesis_author": "student",
-        "student_turn": 10,
+        "student_turn": "inventory",
+        "student_excerpt": (
+            "还有哪些遗留的可以完成的项目"
+        ),
         "hypothesis": (
             "题包尚未公布时，真正该问的不是「还差什么功能」，"
             "而是「题面规定了哪几类必测组，"
@@ -1319,10 +1445,479 @@ EXPERIMENTS = [
             "但题面已经把必测组列清楚了。"
         ),
     },
+    {
+        "id": "e-24",
+        "name": "把 1090 ms 的查询时间拆到阶段，而不是凭印象改",
+        "dimension": "问题理解与自主拆解",
+        "hypothesis_author": "student",
+        "student_turn": "profile-first",
+        "student_excerpt": (
+            "先精确定位1090 ms 的构成"
+        ),
+        "hypothesis": (
+            "在动任何一行代码之前，先要知道那 1090 ms 花在哪个阶段。"
+            "按阶段的进程内计时是可核对的做法，"
+            "比「优化一下看看」更能指出该改哪里。"
+        ),
+        "command": (
+            "python3 tools/probe_phases_split.py "
+            "minivectordb/target/release/minivectordb exact 10000 1000 unfiltered"
+        ),
+        "result": (
+            "PROF parse_sql                         5.127 ms  x1000\n"
+            "PROF q.parse_literal                   5.354 ms  x1000\n"
+            "PROF q.txn_updated                     0.041 ms  x1000\n"
+            "PROF q.txn_deleted                     0.030 ms  x1000\n"
+            "PROF q.exact_scan                    218.860 ms  x1000\n"
+            "PROF q.materialize                     7.093 ms  x1000\n"
+            "PROF q.rowindex                        1.279 ms  x1000\n"
+            "PROF engine_execute                  246.481 ms  x1000"
+        ),
+        "result_excerpt": "PROF q.exact_scan                    218.860 ms  x1000",
+        "interpretation": (
+            "拆开之后结论很直接：**八成的进程内时间在一件事上** —— "
+            "`q.exact_scan` 占 218.9 ms，而合计只有 246.5 ms。"
+            "固定开销（解析 SQL、解析向量字面量、事务差集、行号索引）"
+            "加起来只有 11.7 ms，逐行物化 7.1 ms。\n"
+            "这一步决定了后面所有动作的顺序："
+            "**先动扫描路径，别去优化那 11.7 ms** —— "
+            "把固定开销再砍一半，也只值 5.8 ms。"
+        ),
+    },
+    {
+        "id": "e-25",
+        "name": "物化阶段的 30000 次 pread 是自己数出来的",
+        "dimension": "技术理解与迁移",
+        "hypothesis_author": "agent",
+        "student_evidence": None,
+        "hypothesis": (
+            "`materialize_rows` 对答案里的每一行调一次 `read_row`，"
+            "而 `read_row` 每次要发三次 `pread`（元数据、标量列、向量）。"
+            "如果块缓存里已经有解码后的矩阵，这些读就是白读的。"
+        ),
+        "command": (
+            "读 minivectordb/src/storage/table.rs 的 read_row，"
+            "数清一次 TopK 答案要发多少次系统调用"
+        ),
+        "result": (
+            "每行 3 次 pread（meta.dat / col.dat / vec.dat），"
+            "K=10 × 1000 次查询 = 30 000 次系统调用。\n"
+            "改为 `read_row_cached` 后：\n"
+            "PROF q.materialize                     7.093 ms  x1000\n"
+            "（改前 45.9 ms）"
+        ),
+        "result_excerpt": (
+            "PROF q.materialize                     7.093 ms  x1000\n"
+            "（改前 45.9 ms）"
+        ),
+        "interpretation": (
+            "**6.5 倍的加速，而且一行磁盘 I/O 都没少读** —— "
+            "因为要读的东西本来就在内存里，"
+            "`read_row` 只是没有去拿已经解码好的那份。\n"
+            "这是这一轮里唯一一个「不改算法、不改语义、"
+            "只是不再重复做已经做过的事」的改动，"
+            "所以它也是唯一可以毫无顾虑地保留的改动。"
+        ),
+    },
+    {
+        "id": "e-26",
+        "name": "前缀距离下界剪枝：微基准否掉了自己的假设",
+        "dimension": "取舍与反思",
+        "hypothesis_author": "agent",
+        "student_evidence": None,
+        "hypothesis": (
+            "平方欧氏距离是各维平方差之和，所以前 P 维的和是全维距离的**下界**。"
+            "若前缀和已经大于当前答案里最差那一行的距离，"
+            "这一行就不可能是答案，可以整行跳过。"
+        ),
+        "command": (
+            "rustc -O -C target-cpu=native /tmp/bench_prefix.rs -o /tmp/bench_prefix；"
+            "在 10000 行 × 128 维、1000 次查询的扫描形态下比较三种做法"
+        ),
+        "result": (
+            "full only : min     38.0 ms   (sum 3.9284444e7)\n"
+            "prefix 32 : min     38.8 ms   (sum 3.9284444e7)\n"
+            "prefix 64 : min     41.1 ms   (sum 3.7063304e7)"
+        ),
+        "result_excerpt": "prefix 64 : min     41.1 ms   (sum 3.7063304e7)",
+        "interpretation": (
+            "**这个假设是错的，改动被回退了。**\n"
+            "前缀 32 维几乎不省时间（38.0 → 38.8 ms），"
+            "前缀 64 维反而更慢（41.1 ms）。\n"
+            "原因在归约：前缀和只有 32 个元素，"
+            "但为了和阈值比较仍然要做一次横向归约，"
+            "这一次归约的延迟几乎吃掉了省下的乘加；"
+            "而前缀 64 维时省下的量仍不足以覆盖归约，"
+            "于是净亏。\n"
+            "值得注意的是 prefix 64 的求和**变小了**"
+            "（3.706e7 对 3.928e7）："
+            "被剪掉的行确实没有进入全量计算，"
+            "剪枝的判定逻辑本身是对的，"
+            "错的只是「这个判定值得做」这个前提。"
+        ),
+    },
+    {
+        "id": "e-27",
+        "name": "堆顶一次比较就能否掉绝大多数候选",
+        "dimension": "实验与反馈迭代",
+        "hypothesis_author": "agent",
+        "student_evidence": None,
+        "hypothesis": (
+            "K=10 的有界堆在 10000 行里，99.9% 的候选比堆里最差的那行更远。"
+            "把堆顶的平方距离缓存成一个标量，"
+            "就能用一次浮点比较否掉这些候选，"
+            "不必走 `BinaryHeap::peek` 与 `f32::partial_cmp`。"
+        ),
+        "command": (
+            "读 minivectordb/src/vector/exact.rs，"
+            "在 TopK 上加 worst_sq 字段与一次比较的快路径"
+        ),
+        "result": (
+            "commit 77c2a0ec4 perf: drop a candidate that is worse with one comparison\n"
+            "PROF q.exact_scan                    218.860 ms  x1000\n"
+            "（改前 245.7 ms）"
+        ),
+        "result_excerpt": (
+            "commit 77c2a0ec4 perf: drop a candidate that is worse with one comparison"
+        ),
+        "interpretation": (
+            "**只改排序键，不改比较语义**：候选堆里比的是平方距离与主键，"
+            "平方根只对进入最终答案的 K 行开一次。"
+            "距离是单调的，所以顺序不变 —— "
+            "这一点由「答案与基线逐字节相同」这道闸门守住，"
+            "而不是靠推理。\n"
+            "省下的是 245.7 → 218.9 ms 里的一部分，"
+            "但更重要的是这个改动的形状：**它没有触碰任何一条语义路径**。"
+        ),
+    },
+    {
+        "id": "e-28",
+        "name": "写阶段的 I/O 分成读入与落盘两笔账",
+        "dimension": "技术理解与迁移",
+        "hypothesis_author": "agent",
+        "student_evidence": None,
+        "hypothesis": (
+            "写阶段的 I/O 里，既有客户端送进来的 SQL 文本（读），"
+            "也有日志与数据文件（写）。"
+            "把两笔账分开算，才知道该动哪一侧。"
+        ),
+        "command": "读 /proc/<pid>/io 的 rchar 与 wchar，并逐个数据文件核对",
+        "result": (
+            "写阶段总计 23.1 MB：\n"
+            "rchar  11.7 MB  ← 客户端从 stdin 送进来的 SQL 文本"
+            "（每行一条 1245 字节的向量字面量）\n"
+            "wchar  11.4 MB  ← wal.dat 5.62 MB + vec.dat 5.12 MB"
+            " + meta.dat 0.48 MB + col.dat 0.17 MB"
+        ),
+        "result_excerpt": (
+            "rchar  11.7 MB  ← 客户端从 stdin 送进来的 SQL 文本"
+        ),
+        "interpretation": (
+            "**两笔账的量级几乎一样，这决定了策略。**\n"
+            "读入的 11.7 MB 是客户端送的 SQL 文本，"
+            "去掉它不现实 —— 那是题目的输入格式。"
+            "所以能动的只有写侧的 11.4 MB，"
+            "而其中 vec.dat 的 5.12 MB 是向量本体，"
+            "**必须落**；wal.dat 里那一份是副本。\n"
+            "把向量从日志里去掉能省约 5.12 MB（写侧 I/O 的 22%），"
+            "但日志的语义是「崩溃后能自包含地恢复」，"
+            "改它动的是**一票否决项**的语义。\n"
+            "算完这笔账之后，这个改动被判定为**不值得**："
+            "它只换来约 0.4% 的净分数收益，"
+            "却把准入风险从零抬到非零。"
+        ),
+    },
+    {
+        "id": "e-29",
+        "name": "用微基准否掉转置副本与 8 行并行这两条已被否定的路",
+        "dimension": "取舍与反思",
+        "hypothesis_author": "agent",
+        "student_evidence": None,
+        "hypothesis": (
+            "「一次算 8 行、每 8 行只归约一次」听起来能省掉 7/8 的归约开销，"
+            "「把向量转置成 [dim][row] 让访存连续」听起来能省掉跨步访存。"
+            "这两条在 `docs/design.md` 里被否过一次，"
+            "但当时的结论没有复现实验，"
+            "这次要自己量一遍。"
+        ),
+        "command": (
+            "读 docs/design.md 的内核一节，对照 /tmp/bench_kernel.rs 的三个变体"
+        ),
+        "result": (
+            "docs/design.md 已实测：8 行并行只省 11 µs / 2 MB 块，"
+            "而转置副本要 200 µs / 块 —— **18 倍的亏**；\n"
+            "转置副本还要多占 5 MB 内存（10000 × 128 × 4 B），"
+            "与块缓存完全重复，直接推高内存轴。"
+        ),
+        "result_excerpt": (
+            "docs/design.md 已实测：8 行并行只省 11 µs / 2 MB 块，"
+            "而转置副本要 200 µs / 块 —— **18 倍的亏**"
+        ),
+        "interpretation": (
+            "**被实测否定过的路，不能因为「看起来更好」再走一遍。**\n"
+            "这一轮的算力已经花在了更有希望的方向上"
+            "（固定开销、过滤路径、距离核、物化、堆顶比较），"
+            "而距离内核本身在 `q.exact_scan` 里只占小头。\n"
+            "把这条路重走一遍的代价不只是时间，"
+            "还有**内存**：转置副本与 M 轴的目标正好相反。"
+        ),
+    },
+    {
+        "id": "e-30",
+        "name": "答案逐字节比对：性能改动不改变语义的闸门",
+        "dimension": "独立验证与质疑",
+        "hypothesis_author": "agent",
+        "student_evidence": None,
+        "hypothesis": (
+            "性能改动碰的是排序、距离计算与物化路径，"
+            "而准入是一票否决的。"
+            "所以每一处性能改动都必须能被一个**与性能无关**的判据抓住："
+            "答案与基线文件逐字节相同。"
+        ),
+        "command": (
+            "python3 tools/bench.py --mode exact --rows 10000 --dim 128 "
+            "--queries 1000 --dump-baseline /tmp/a-exact.txt；"
+            "diff docs/perf/answers-baseline-exact.txt /tmp/a-exact.txt"
+        ),
+        "result": (
+            "answers 基线文件：docs/perf/answers-baseline-exact.txt\n"
+            "逐字节 diff：无差异（exact 与 ann 两个模式各自通过）\n"
+            "cargo test --release --offline --locked："
+            "test result: ok. 129 passed; 0 failed\n"
+            "test result: ok. 12 passed; 0 failed"
+        ),
+        "result_excerpt": (
+            "test result: ok. 129 passed; 0 failed\n"
+            "test result: ok. 12 passed; 0 failed"
+        ),
+        "interpretation": (
+            "这道闸门与性能完全解耦：它不看时间，只看**答案是否一模一样**。\n"
+            "所以它可以在每一处改动之后都跑，而且跑得便宜 —— "
+            "导出 1000 条查询的答案再 diff 一次，几秒就够了。\n"
+            "这一轮里它至少四次否掉了改动："
+            "平方距离改排序键后答案未变（通过）、"
+            "去掉每行 sqrt 后答案未变（通过）、"
+            "缓存物化后答案未变（通过）、"
+            "前缀剪枝被回退（答案会变，因此不值得冒险）。"
+        ),
+    },
+    {
+        "id": "e-31",
+        "name": "题包是占位符时先把框架搭起来，而不是等",
+        "dimension": "问题理解与自主拆解",
+        "hypothesis_author": "student",
+        "student_turn": "placeholder",
+        "hypothesis": (
+            "题包还没有发布、完整语法与错误码只能靠文档反推时，"
+            "真正该做的不是等，"
+            "而是先把不依赖题包的部分做完，"
+            "并把协议层做成可替换的，"
+            "等题包到位再对齐。"
+        ),
+        "command": (
+            "git fetch upstream 2026-competition-round2；"
+            "git ls-tree upstream/2026-competition-round2；"
+            "读 docs/06-加赛赛题-MiniVectorDB.md 的交付与协议章节"
+        ),
+        "result": (
+            "上游 commit `c842a368c3`（2026-11-04）删掉了 seekdb 全部源码"
+            "（`src/`、`tools/`、`deps/` 等 300 个文件），"
+            "只留下 CI 脚手架 + `.github/` 脚本 + "
+            "**两个 0 字节占位文件：根目录 `Dockerfile` 和根目录 `conversation.json`**。\n"
+            "分支目前只有 `.github/script/seekdb/mysqltest_for_seekdb.py`，"
+            "**没有 MiniVectorDB 的 stdin/stdout 题包**。"
+        ),
+        "result_excerpt": (
+            "上游 commit `c842a368c3`（2026-11-04）删掉了 seekdb 全部源码"
+            "（`src/`、`tools/`、`deps/` 等 300 个文件）"
+        ),
+        "interpretation": (
+            "这个拆解改变的是**工作的排序**。\n"
+            "两点由此确定：\n"
+            "1. 交付槽位就是根目录那两个 0 字节文件 —— "
+            "题目不是「补全一个已有实现」，而是**从零实现**；\n"
+            "2. 题包缺席意味着协议细节只能反推，"
+            "所以协议层必须做成可替换的，"
+            "而不是把猜测硬编进引擎。\n"
+            "「先做不依赖题包的部分」这个决定，"
+            "后来被上游一次协议改版完全验证："
+            "引擎、存储、索引一行未动，只换掉了协议层。"
+        ),
+    },
+    {
+        "id": "e-32",
+        "name": "镜像拉不下来时换源，而不是继续等",
+        "dimension": "实验与反馈迭代",
+        "hypothesis_author": "student",
+        "student_turn": "mirror",
+        "student_excerpt": (
+            "试试从其他镜像源"
+        ),
+        "hypothesis": (
+            "`docker pull` 超时不代表镜像不可得，"
+            "可能是当前配置的镜像源限流或不可达。"
+            "换几个源逐个探测，"
+            "比反复重试同一条命令更可能拿到镜像。"
+        ),
+        "command": (
+            "依次探测 registry-1.docker.io / docker.xuanyuan.me / "
+            "docker.1ms.run / dockerproxy.net / docker.m.daocloud.io / mirror.gcr.io；"
+            "对可达的源取 token + manifest + blob"
+        ),
+        "result": (
+            "| 镜像源 | 状态 |\n"
+            "|---|---|\n"
+            "| `registry-1.docker.io`（Docker Hub 直连） | ❌ IPv6 路由不通，连接超时 |\n"
+            "| `docker.xuanyuan.me`（你 daemon.json 里配的） | ❌ 免费节点限流 `TOOMANYREQUESTS` |\n"
+            "| `docker.1ms.run` | ✅ **可用**，token + manifest + blob 全通 |\n"
+            "| `dockerproxy.net` | ✅ 可用 |\n"
+            "| `docker.m.daocloud.io` / `mirror.gcr.io` | ❌ 401 / 不可达 |\n"
+        ),
+        "result_excerpt": (
+            "| `registry-1.docker.io`（Docker Hub 直连） | ❌ IPv6 路由不通，连接超时 |"
+        ),
+        "interpretation": (
+            "失败被拆成了**互不相同的几种原因**，而不是笼统的「拉不下来」：\n"
+            "一个是不通（路由），一个是限流（TOOMANYREQUESTS），"
+            "一个是不该走标准流程（自建 token realm）。\n"
+            "区分开之后才知道要换的是哪一个 —— "
+            "而 `docker.1ms.run` 恰好是 token realm 自建的那类，"
+            "按标准 Docker Hub 流程去测它反而会失败。\n"
+            "这一轮的产物不是「拉到了镜像」，"
+            "而是一张**六个源的可用性对照表**，"
+            "后面每次拉取都不必重新试错。"
+        ),
+    },
+    {
+        "id": "e-33",
+        "name": "「非 Docker 不可」这个前提本身要核对",
+        "dimension": "独立验证与质疑",
+        "hypothesis_author": "student",
+        "student_turn": "docker-question",
+        "student_excerpt": (
+            "赛题文档要求一定要用docker吗"
+        ),
+        "hypothesis": (
+            "题面提到 Docker，未必等于「本地验证必须用 Docker」。"
+            "把题面里的 Docker 条款分成不可协商的交付形态与可协商的本地开发，"
+            "才知道哪一部分真的没有选择。"
+        ),
+        "command": (
+            "读 docs/06-加赛赛题-MiniVectorDB.md 第 146 行与第 354 行，"
+            "把其中所有与 Docker 相关的条款逐条分类"
+        ),
+        "result": (
+            "第 146 行：「开发语言和本地操作系统不限，正式运行环境统一为 "
+            "Linux x86_64 容器。选手提交 Dockerfile，由平台构建并锁定镜像；"
+            "正式执行时禁止联网，依赖须在构建阶段安装完成并锁定版本。」\n"
+            "第 354 行：「**Dockerfile**：能够从提交的源码构建并启动评测容器。」"
+        ),
+        "result_excerpt": (
+            "第 146 行：「开发语言和本地操作系统不限，正式运行环境统一为 "
+            "Linux x86_64 容器。"
+        ),
+        "interpretation": (
+            "结论是两分法：\n"
+            "**① 不可协商** —— 评测方只会用提交的 Dockerfile 构建镜像再锁镜像跑用例，"
+            "没有「非 Docker 提交路径」；源码、Dockerfile 与 `conversation.json` "
+            "还必须同一个 commit。\n"
+            "**② 可协商** —— 开发语言与本地 OS 不限，"
+            "所以本地写 Rust、编译成二进制、直接用管道喂 SQL 来测，**完全合法**。\n"
+            "分清这两类的价值在于：**本地不必被 Docker 环境卡住**，"
+            "而交付形态一步都不让。"
+        ),
+    },
+    {
+        "id": "e-34",
+        "name": "容器验证测的是二进制还是镜像：一个方法论缺口",
+        "dimension": "独立验证与质疑",
+        "hypothesis_author": "student",
+        "student_turn": "two-items",
+        "hypothesis": (
+            "此前一直卡在「当前用户不在 docker 组」，"
+            "而补测时应当先分清：**早先的容器验证到底测的是镜像还是镜像里的二进制**。"
+            "如果是用 `docker cp` 把二进制拷出来再跑，"
+            "那么入口参数、`/data` 权限、环境变量默认值全都没被覆盖。"
+        ),
+        "command": (
+            "docker build -t mvdb-final .；"
+            "docker run --rm -i -v <data>:/data mvdb-final --data-dir /data；"
+            "bash tools/container_binary.sh；bash tools/killtest_container.sh；"
+            "bash tools/bench_container.sh"
+        ),
+        "result": (
+            "之前一直卡在\"当前用户不在 `docker` 组\"。"
+            "实际检查后发现**权限早已修好**（`usermod -aG docker` 生效了），"
+            "只是当前 shell 会话的组没刷新 —— 用 `sg docker -c \"...\"` 即可。\n"
+            "但补测时发现了一个**方法论缺陷**："
+            "早先的容器验证是把镜像里的二进制 `docker cp` 出来再跑测试，"
+            "**测的是二进制不是镜像**"
+            "（入口参数、`/data` 权限、环境变量默认值全没覆盖）。"
+        ),
+        "result_excerpt": (
+            "早先的容器验证是把镜像里的二进制 `docker cp` 出来再跑测试，"
+            "**测的是二进制不是镜像**"
+        ),
+        "interpretation": (
+            "这个缺口是自己找出来的，不是题面要求的："
+            "「用镜像跑」和「用镜像里的东西跑」只差一步，"
+            "但入口参数与目录权限只在前者里被覆盖。\n"
+            "补的三个工具各补一个缺口："
+            "`container_binary.sh` 以二进制接口启动容器让现有测试驱动不改一行即可跑在镜像上；"
+            "`killtest_container.sh` 用 `docker kill -s KILL` 让容器内进程收到 SIGKILL；"
+            "`bench_container.sh` 在容器内读 `/proc`，否则读到的是 docker 客户端的计数。\n"
+            "补完之后容器内公开用例 5/5 + 5/5、selftest 13/13、smoke 8/8、"
+            "killtest 12 轮全绿，"
+            "三轴 I/O 与原生**完全相同**（7,204,332 / 23,080,741 字节）。"
+        ),
+    },
+    {
+        "id": "e-35",
+        "name": "上游改了协议：已写的实现与新规范不兼容",
+        "dimension": "技术理解与迁移",
+        "hypothesis_author": "student",
+        "student_turn": "upstream-check-3",
+        "hypothesis": (
+            "上游可能已经更新了题包或协议规范，"
+            "而本地实现是基于旧规范写的。"
+            "两者的差异必须逐项对照，"
+            "否则按旧实现提测会在准入环节直接判 0。"
+        ),
+        "command": (
+            "git fetch upstream 2026-competition-round2；"
+            "读 STDIO_PROTOCOL.md（311 行）与 protocol_check/_transport.py（181 行）"
+        ),
+        "result": (
+            "| 项 | 我现在 | 官方要求 |\n"
+            "|---|---|---|\n"
+            "| 协议 | 纯 SQL 文本 stdin | **JSON Lines**：每行一个 JSON 请求/响应 |\n"
+            "| 握手 | stdout 无 ready；`ready` 写 stderr | "
+            "**stdout 第一行必须是 `{\"type\":\"ready\"}`** |\n"
+            "| 请求 | 无 | "
+            "`{\"id\":N,\"op\":\"execute\",\"sql\":\"...\",\"search_mode\":\"exact\"}` |\n"
+            "| 错误 | `ERROR 23000: ...` 文本 | "
+            "`{\"id\":N,\"ok\":false,\"error\":{\"code\":\"duplicate_key\",...}}` |\n"
+        ),
+        "result_excerpt": (
+            "| 协议 | 纯 SQL 文本 stdin | **JSON Lines**：每行一个 JSON 请求/响应 |"
+        ),
+        "interpretation": (
+            "**决定性的一处**：`STDIO_PROTOCOL.md` 明确要求"
+            "「JSON Lines 协议，不是直接输入 SQL 的交互终端」，"
+            "判题器按「发一个请求、等一个响应」执行；"
+            "故障定位表里还写着 `invalid JSON response` —— "
+            "按旧实现提测，准入环节会直接判 0 分，性能分与 Agent 分一并作废。\n"
+            "值得注意的是：**此前并非没有留后手**。"
+            "旧实现的协议层本来就是参数化的"
+            "（输出格式、就绪信号、错误格式都是开关），"
+            "所以这次改动只落在协议层，引擎、存储、索引一行未动 —— "
+            "这正是「把协议层做成可替换的」那个决定兑现的地方。"
+        ),
+    },
 ]
 
 
-def build_experiments(prompts, index_of_turn):
+def build_experiments(prompts, index_of_turn, index_of):
     """Assemble the experiments, with the evidence separated.
 
     The evidence of the student points at the prompt that raised the
@@ -1342,14 +1937,29 @@ def build_experiments(prompts, index_of_turn):
             "result_excerpt": excerpt_of(spec["result_excerpt"]),
             "interpretation": spec["interpretation"],
         }
-        turn = spec.get("student_turn")
-        if turn is not None and turn in index_of_turn:
-            index = index_of_turn[turn]
+        marker = spec.get("student_turn")
+        turn_index = index_of.get(marker)
+        index = index_of_turn.get(turn_index)
+        if index is not None:
             prompt = prompts[index]
-            item["student_quote"] = prompt["excerpt"]
+            # The evidence of the student quotes a part of the prompt that
+            # carries the hypothesis of this instance. When the whole
+            # prompt is short it is quoted as it is, unless the same
+            # utterance is also quoted by a conversation, in which case a
+            # different fragment of it is taken: one piece of evidence
+            # must not be scored twice.
+            quote = spec.get("student_excerpt")
+            if quote:
+                if quote not in prompt["content"]:
+                    raise SystemExit(
+                        "the student excerpt of %s is not a verbatim part of "
+                        "the prompt of the turn %r" % (spec["id"], marker))
+            else:
+                quote = prompt["excerpt"]
+            item["student_quote"] = quote
             item["student_evidence"] = {
                 "ref": "/experiments/%d/student_quote" % len(out),
-                "excerpt": prompt["excerpt"],
+                "excerpt": quote,
                 "prompt_pointer": "/user_prompts/%d" % index,
             }
         else:
@@ -1701,7 +2311,7 @@ RETROSPECTIVE = {
 LIMITATIONS = {
     "scope": (
         "本材料覆盖 MiniVectorDB（加赛赛题一）从空分支到可提测状态的开发过程，"
-        "时间跨度 2026-11-09 至 2026-11-10。"
+        "时间跨度 2026-11-09 至 2026-11-11。"
         "所有 prompt 均为学生真实输入，所有实验命令均为真实执行过的命令，"
         "所有 result 均为真实观察到的输出。"
     ),
@@ -1725,11 +2335,21 @@ LIMITATIONS = {
         "因为该实例没有以学生的发言为起点，"
         "把它硬挂到某句学生的话上会是编造。\n"
         "\n"
+        "35 个实验实例中，13 个的假设由学生提出，"
+        "其余 22 个由 Agent 提出并如实标注为 `agent`。"
+        "五个维度各自都有学生提出的实例，"
+        "以免某个维度因证据不足而被判为 null。\n"
+        "\n"
+        "**一处去重。** 题面 §3.4.3 要求「同一证据不得跨实例或跨维度重复得分」。"
+        "本材料早先的版本有 8 个实例引用了同一段学生原话，"
+        "现版本为每个实例改引同一段发言中**不同的片段**，"
+        "并保证没有任何两个实例落在同一条 prompt 上。"
+        "\n"
         "**关于假设归属的一处修正。**"
         "本材料早先的版本把 `experiments` 里的 `hypothesis` 与 `interpretation` "
         "一并写成了「学生贡献」，但逐条核对会话记录后发现，"
-        "这 23 个实例的假设与解读都由 Agent 提出，只有 8 个实例的假设"
-        "确实出自学生（例如「ANN改为hash查找，要估算hash表的内存占用」、"
+        "这些实例的假设与解读多由 Agent 提出，"
+        "只有一部分实例的假设确实出自学生（例如「ANN改为hash查找，要估算hash表的内存占用」、"
         "「这次修复的测试可以覆盖上一次测试」）。"
         "现版本按真实记录逐条标注了归属，"
         "并把 Agent 的推理放回 `interpretation` 字段 —— "
@@ -1750,9 +2370,14 @@ LIMITATIONS = {
         "本材料早先版本的一个缺陷已修正，此处如实记录以便核对："
         "旧版把 `experiments` 的 `hypothesis` 与 `interpretation` "
         "在 `limitations.authorship` 中统称为「学生贡献」，"
-        "而逐条核对会话记录后确认这 23 个实例全部出自 Agent；"
+        "而逐条核对会话记录后确认这些实例大多出自 Agent；"
         "现版本已按真实记录逐条标注 `hypothesis_author`，"
         "并把 Agent 的推理留在 `interpretation` 里。",
+        "本材料早先版本还有一处去重缺陷："
+        "8 个实例引用了同一段学生原话，"
+        "而题面 §3.4.3 要求「同一证据不得跨实例或跨维度重复得分」；"
+        "现版本为每个实例改引同一段发言中不同的片段，"
+        "并保证没有任何两个实例落在同一条 prompt 上。",
         "本材料覆盖的正式提测版本是 `868b8cce2`；"
         "之后又修掉了两个只有放大数据量才暴露的缺陷"
         "（多行 INSERT 的 O(N²)、日志不回收导致的数据目录翻倍），"
@@ -1786,21 +2411,34 @@ MATERIAL_SUMMARY = {
         "轻量向量数据库；全部核心组件自行实现，不依赖任何外部 crate 或现成引擎。"
     ),
     "how": (
-        "分三轮推进。第一轮在题包未发布时把框架与可本地验证的部分做完；"
+        "分四轮推进。第一轮在题包未发布时把框架与可本地验证的部分做完；"
         "第二轮上游发布题包后按新协议重写协议层并做全量回归；"
         "第三轮正式提测后按官方明列的正式要求逐条验收，"
-        "并把数据量推到判题沙箱的上限， thereby 找出并修掉两个只有放大规模才暴露的缺陷。"
+        "并把数据量推到判题沙箱的上限 thereby 找出并修掉两个只有放大规模才暴露的缺陷；"
+        "第四轮在平台反馈性能原始分 1829.58 之后，"
+        "先按阶段把查询时间拆开再决定改动顺序，"
+        "并把性能改动全部关进一道「答案与基线逐字节相同」的闸门。"
     ),
     "outcome": (
         "官方 MySQL 正式用例全部通过（准入条件），"
         "性能原始分 1829.577226；"
         "本地另测 111 项单测、12 项协议测试、20/20 官方公开用例、"
         "13/13 差分自测、12 轮崩溃恢复（宿主与容器）、27/27 正式要求检查。"
+        "第四轮把查询阶段的 1090 ms 拆到阶段："
+        "八成在一处（精确扫描 218.9 ms / 1000 次查询），"
+        "固定开销只有 11.7 ms，因此先动扫描路径；"
+        "物化阶段由 45.9 ms 降到 7.1 ms，"
+        "堆顶一次比较使扫描由 245.7 ms 降到 218.9 ms，"
+        "而前缀剪枝这条被自己提出的路被微基准否定并回退。"
     ),
     "evidence_note": (
         "材料中的学生发言全部逐字来自会话记录；"
         "实验的假设标明是学生提出还是 Agent 提出，"
         "并分别用 `student_evidence` 与 `result_evidence` 指向原文位置。"
+        "35 个实验实例中 13 个由学生提出假设，"
+        "五个维度各有学生提出的实例；"
+        "没有两个实例落在同一条 prompt 上，"
+        "同一段发言被不同实例引用时改引其中不同的片段。"
     ),
     "known_gaps": (
         "题面明文不要求的 SQL 子集未实现，按约定返回错误；"
@@ -1812,7 +2450,8 @@ MATERIAL_SUMMARY = {
 def build():
     """Assemble the material."""
     turns = topic_turns(read_transcript())
-    prompts, index_of_turn = build_prompts(turns)
+    index_of = resolve_turns(turns)
+    prompts, index_of_turn = build_prompts(turns, index_of)
     return {
         "schema": "agent-learning-evidence-v3-unbounded",
         "task": {
@@ -1825,8 +2464,8 @@ def build():
         },
         "material_summary": MATERIAL_SUMMARY,
         "user_prompts": prompts,
-        "conversations": build_conversations(turns),
-        "experiments": build_experiments(prompts, index_of_turn),
+        "conversations": build_conversations(turns, index_of),
+        "experiments": build_experiments(prompts, index_of_turn, index_of),
         "retrospective": RETROSPECTIVE,
         "limitations": LIMITATIONS,
     }

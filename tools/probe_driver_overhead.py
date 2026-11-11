@@ -4,6 +4,12 @@ The benchmark measures the wall clock of the round trip, so the time the
 Python driver spends building the request and parsing the response is part
 of the measurement. The platform measures the request handling on its side,
 so the two numbers have to be told apart.
+
+The comparison has to be fair: both sides have to speak the same protocol.
+An earlier version of this script compared the JSONL round trip of the
+driver with a raw SQL text round trip, but the server only speaks JSONL
+since the protocol was rewritten, so the raw path answered every request
+with an error and the comparison was meaningless.
 """
 import json
 import os
@@ -31,17 +37,6 @@ def main():
     db = B.Db(binary, workdir, mode=mode)
     B.phase_write(db, rows, 128, 100)
 
-    # The full round trip, as the benchmark does it.
-    t0 = time.monotonic()
-    for i in range(nqueries):
-        clause = " WHERE cat = 'c%d'" % (i % 8) if i % 2 == 0 else ""
-        sql = ("SELECT id, L2_DISTANCE(v,'%s') AS distance FROM t%s "
-               "ORDER BY distance LIMIT 10;" % (lits[i], clause))
-        db.run(sql)
-    roundtrip = (time.monotonic() - t0) * 1000.0
-
-    # The same statements, but the driver only writes and reads the lines,
-    # without building or parsing any JSON.
     statements = []
     for i in range(nqueries):
         clause = " WHERE cat = 'c%d'" % (i % 8) if i % 2 == 0 else ""
@@ -49,6 +44,16 @@ def main():
             "SELECT id, L2_DISTANCE(v,'%s') AS distance FROM t%s "
             "ORDER BY distance LIMIT 10;" % (lits[i], clause))
 
+    # The full round trip, as the benchmark does it.
+    t0 = time.monotonic()
+    for i in range(nqueries):
+        db.run(statements[i])
+    roundtrip = (time.monotonic() - t0) * 1000.0
+
+    # The same statements over the same protocol, but the driver only
+    # writes the request and reads the response line. Nothing is built
+    # and nothing is parsed, so what is left is the server's own time
+    # plus the cost of the pipe.
     proc = subprocess.Popen(
         [binary, "--data-dir", workdir],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -58,7 +63,8 @@ def main():
     proc.stdout.readline()
     t0 = time.monotonic()
     for i, sql in enumerate(statements):
-        proc.stdin.write(sql.replace('"', '\\"') + "\n")
+        request = {"id": i, "op": "execute", "sql": sql, "search_mode": mode}
+        proc.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
         proc.stdin.flush()
         proc.stdout.readline()
     raw = (time.monotonic() - t0) * 1000.0
@@ -82,11 +88,11 @@ def main():
     parse = (time.monotonic() - t0) * 1000.0
 
     print("round trip through the driver : %8.1f ms" % roundtrip)
-    print("raw statements, no JSON in the driver: %8.1f ms" % raw)
+    print("the same, the driver only writes and reads: %8.1f ms" % raw)
     print("driver JSON build cost        : %8.1f ms" % build)
     print("driver JSON parse cost        : %8.1f ms" % parse)
     print()
-    print("=> the database did %8.1f ms of work" % (raw,))
+    print("=> the server did %8.1f ms of work" % (raw,))
     print("=> the driver overhead is %8.1f ms" % (roundtrip - raw))
 
     db.close()
