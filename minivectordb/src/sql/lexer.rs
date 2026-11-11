@@ -168,9 +168,12 @@ impl<'a> Lexer<'a> {
     fn lex_string(&mut self, quote: u8) -> SqlResult<Token> {
         self.pos += 1; // opening quote
         let mut out = String::new();
+        // The run of plain ASCII that is copied in one go.
+        let mut ascii_start = self.pos;
         while self.pos < self.src.len() {
             let c = self.src[self.pos];
             if c == b'\\' && self.pos + 1 < self.src.len() {
+                self.flush_ascii(&mut out, ascii_start, self.pos);
                 let e = self.src[self.pos + 1];
                 out.push(match e {
                     b'n' => '\n',
@@ -180,26 +183,57 @@ impl<'a> Lexer<'a> {
                     other => other as char,
                 });
                 self.pos += 2;
+                ascii_start = self.pos;
                 continue;
             }
             if c == quote {
                 if self.src.get(self.pos + 1) == Some(&quote) {
+                    self.flush_ascii(&mut out, ascii_start, self.pos);
                     out.push(quote as char);
                     self.pos += 2;
+                    ascii_start = self.pos;
                     continue;
                 }
+                self.flush_ascii(&mut out, ascii_start, self.pos);
                 self.pos += 1;
                 return Ok(Token::Str(out));
             }
+            if c < 0x80 {
+                // A plain ASCII character stays in the run and is copied
+                // when the run ends. A vector literal is one long run.
+                self.pos += 1;
+                continue;
+            }
             // Copy raw bytes: multi-byte UTF-8 passes through untouched.
+            self.flush_ascii(&mut out, ascii_start, self.pos);
             let ch_len = utf8_len(c);
             let end = (self.pos + ch_len).min(self.src.len());
             let s = std::str::from_utf8(&self.src[self.pos..end])
                 .map_err(|_| SqlError::syntax("invalid UTF-8 in string literal"))?;
             out.push_str(s);
             self.pos = end;
+            ascii_start = self.pos;
         }
         Err(SqlError::syntax("unterminated string literal"))
+    }
+
+    /// Copy a run of plain ASCII into the string.
+    ///
+    /// The run holds no quote, no backslash and no byte of a multi-byte
+    /// sequence, because the caller keeps the run for those bytes only.
+    /// Every byte of it is therefore plain ASCII, so the run is valid
+    /// UTF-8 and can be copied without a check.
+    fn flush_ascii(&self, out: &mut String, start: usize, end: usize) {
+        if end <= start {
+            return;
+        }
+        // The room for the run is asked for in one go, so that the string
+        // does not have to grow a step at a time.
+        out.reserve(end - start);
+        match std::str::from_utf8(&self.src[start..end]) {
+            Ok(s) => out.push_str(s),
+            Err(_) => out.push_str(&String::from_utf8_lossy(&self.src[start..end])),
+        }
     }
 
     fn lex_quoted(&mut self, quote: u8) -> SqlResult<String> {

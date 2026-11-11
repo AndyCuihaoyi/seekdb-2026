@@ -327,6 +327,9 @@ impl<'a> Parser<'a> {
         }
         let run = &self.bytes[start..end];
         debug_assert!(run.iter().all(|b| b.is_ascii() && *b >= 0x20 && *b != b'"' && *b != b'\\'));
+        // The room for the run is asked for in one go, so that the string
+        // does not have to grow a step at a time.
+        out.reserve(run.len());
         // The bytes are ASCII, so the conversion cannot fail.
         match std::str::from_utf8(run) {
             Ok(s) => out.push_str(s),
