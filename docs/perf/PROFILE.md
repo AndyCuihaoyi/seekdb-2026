@@ -129,11 +129,33 @@ The parsing of the vector literal is 6.6% of the CPU (`parse_f32` 4.25% and
 of the answer is under 5%. Even halving all of it would buy about 6% of the
 query time, while the two items below are worth tens of percent.
 
+### 3.3 The I/O of the query phase is zero
+
+The query phase reads **nothing** from the disk. Every byte of it is
+served by the page cache of the kernel, and the counters that count the
+block device do not move at all.
+
+This is worth stating because the benchmark used to report the opposite.
+It counted `rchar` and `wchar` of `/proc/<pid>/io`, which count every byte
+the process read or wrote, **including the bytes that came in and went out
+through the pipes of the protocol**. The SQL text of the 1,000 queries is
+1.17 MB, so a large part of the reported "I/O of the query phase" was the
+pipe.
+
+The platform counts the block device (`io.stat` of the cgroup), so the
+local number has to be the same quantity, and `tools/bench.py` now counts
+`read_bytes` and `write_bytes`.
+
+The consequence for the work: **there is no I/O to remove from the query
+phase.** The improvement of the last round was real, but it was in the
+time (3.02 times), not in the bytes.
+
 ---
 
 ## 4. What follows from it
 
-In the order in which the work is worth doing:
+In the order in which the work is worth doing. The worth of each is
+computed in `docs/perf/ledger.md`, section 4.4.
 
 ### 4.1 Fuse the scan and the kernel
 

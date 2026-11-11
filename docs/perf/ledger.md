@@ -11,6 +11,22 @@ is the `memory.peak` of the cgroup of the container, so it includes the page
 cache of the files under `/data`, and not only the resident set of the
 database process.
 
+**The status of the numbers in this file.** The measurements were corrected
+twice in the round of 2026-11-11, and both corrections changed the
+conclusion:
+
+1. The rounds were noisy, because the server was floating between the cores.
+   Pinning it fixed that, and the query turned out to be 3.02 times faster
+   than the baseline rather than 1.51 times. Section 1.
+2. The bytes were counted with the wrong counter, which measured the
+   traffic of the pipe instead of the disk. The query phase reads **nothing**
+   from the disk, and the write phase writes the same bytes as the baseline.
+   Section 1.1.
+
+So the two numbers that the platform counts are these: the time of the
+query is 3.02 times better than the baseline, and **nothing else has
+moved**. Section 4.4 says what each of the remaining levers is worth.
+
 ---
 
 ## 1. The baselines
@@ -354,39 +370,96 @@ The write phase writes 11,407,360 B to the disk. The data files are
 5.50 MB and the log is 5.36 MB, so **the log is a second copy of
 everything that is written**: the write amplification is 1.98x.
 
-There are two ways to make the log smaller, and they are not the same
-decision:
+The log holds the **whole row image**, and the row image holds the vector:
+`encode_row` keeps the vector in the image so that the log record is self
+contained, and the recovery can rebuild the vector file without depending
+on the order in which the data files were flushed
+(`minivectordb/src/storage/format.rs`). The data files write the vector
+once more, into `vec.dat`, and the image without the vector into
+`col.dat`.
 
-1. **Checkpoint more often.** The log is emptied when it grows past
-   `checkpoint_bytes`, which is 64 MB by default. The log of the
-   benchmark reaches 5.36 MB and is never emptied, because it never gets
-   near 64 MB. A threshold of 1 MB would empty it four times during the
-   load, and the checkpoint writes the rows into the data files, which
-   they are written into anyway, so the total number of bytes that reach
-   the disk falls by roughly the size of the log.
-   **The risk**: the checkpoint has to be correct. It syncs the data
-   files and then empties the log, and an interruption in between means
-   that the recovery replays a log that is already applied. The recovery
-   has to be idempotent about that, and the twelve rounds of the crash
-   recovery test are the gate.
-2. **Write less into the log.** The log holds the row image of every
-   inserted row, so it holds the vector of every row in full. This is
-   what makes the recovery possible without reading the data files, and
-   it is what the rules require: a transaction that returned COMMIT must
-   survive. A log that held only a pointer to the row would not be a
-   log.
+So the row is written three times: the vector into the log, the vector
+into the vector file, and the rest of the row into the log and into the
+column file.
 
-The first one is the cheaper change, and it is the one that the rules
-allow. The threshold is a configuration value, so it can be changed
-without touching the format of anything.
+### 4.3 The checkpoint idea does not work, and the measurement says so
 
-How much it would be worth: if the log were emptied often enough that it
-never held more than a batch, the write amplification would fall from
-1.98x to about 1.1x, and `R_B` of the write phase would rise to about
-1.8. `f(1.8)` is 0.64 against `f(1)` = 0.5, and the write phase carries
-6 2/3% of the I/O weight, so the raw `e` would rise by about 0.09 and the
-printed `E` by about 8%. It is worth less than the query time was, but it
-is the only axis that is still open.
+The first idea that comes to mind is to empty the log more often. It was
+measured, and it does not work:
+
+| `MINIVECDB_CHECKPOINT_MB` | Bytes that reached the disk |
+| ---: | ---: |
+| 64 (the default) | 10,879,000 B |
+| 4 | 10,895,000 B |
+| 1 | 10,941,000 B |
+
+Checkpointing more often makes the number **larger**, not smaller. The
+reason is that the checkpoint does not remove the write of the log, it
+only empties the file afterwards: the log was already written, and then
+the file is truncated. The bytes have already reached the device.
+
+So the threshold is not a lever. The lever is the **content** of the log:
+the vector does not have to be in it.
+
+### 4.4 What each remaining lever is worth
+
+The formula is run over the numbers of this machine, with the platform
+baseline assumed to be the same as ours, and the projected printed `E` is
+compared with the 2378 of the current code:
+
+| Lever | Change | raw `e` | Projected `E` | Gain |
+| --- | --- | ---: | ---: | ---: |
+| The time of the query | 320 ms to 160 ms | 0.7139 | 2612 | **+234** |
+| The bytes of the write | 10.9 MB to 6.0 MB | 0.6757 | 2472 | +95 |
+| The bytes of the write | 10.9 MB to 3.8 MB | 0.6923 | 2533 | +155 |
+| The memory of the query | back to the baseline | 0.6506 | 2381 | +3 |
+| The time of the write | 571 ms to 285 ms | 0.6498 | 2378 | +0 |
+
+Two things are worth noticing.
+
+**The time of the write is worth nothing at all.** Halving it moves the
+projected `E` by zero, because the write phase is a third of the weight
+and `f` is already at `f(1.34) = 0.57`, so the gain of the ratio is small
+and the write time is the smaller half of the weight. The same is true of
+the memory of the query: three points.
+
+**So the two things that are worth doing are the time of the query and
+the bytes of the write.** The first one is what the profile points at, and
+the second one is the axis that has not been touched at all.
+
+### 4.5 What it would take to make the log smaller
+
+The vector has to leave the log, and the question is whether the recovery
+still works without it.
+
+The recovery reads the log and rebuilds the rows from it
+(`replay_insert`). If the vector were not in the log, the recovery would
+have to read it from `vec.dat` instead, which is possible: the directory
+entry names the block and the slot of the vector of every row, and the
+vector file holds it.
+
+**The risk is the order of the writes.** The data files are written
+*before* the commit marker reaches the log, so a transaction whose
+commit was not acknowledged leaves rows in the data files that the
+recovery has to discard. Today the recovery discards them by row id,
+because the row id is in the log record. If the vector were not in the
+log, the recovery would still know the row id, so it could still discard
+the row — but it would have to know that the vector in `vec.dat` is not
+to be trusted, which it does, because it rewrites the vector of the rows
+it applies.
+
+So the change is possible, and it is not a change of the format of the
+data files: it is a change of what the log record holds, and a change of
+the recovery to read the vector from the vector file.
+
+**This is the change that has to be thought about rather than tried.** The
+twelve rounds of the crash recovery test are the gate, and the gate is
+not only "the test passes" but "the test passes for the reason it is
+supposed to". The rule of the competition is that a transaction that
+returned COMMIT must be there after a crash, and a transaction that did
+not may be there or not. A log that no longer holds the vector makes the
+second case harder to get right, because the vector file holds the rows
+of the transactions that were rolled back as well.
 
 ---
 
