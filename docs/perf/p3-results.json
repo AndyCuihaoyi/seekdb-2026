@@ -1,0 +1,100 @@
+{
+  "mode": "exact",
+  "rows": 10000,
+  "queries": 1000,
+  "rounds": 3,
+  "query_t_ms": 579.529,
+  "query_io_bytes": 7380808,
+  "query_peak_rss_kb": 15012,
+  "write_t_ms": 1116.763,
+  "write_io_bytes": 23104906,
+  "write_peak_rss_kb": 3984,
+  "recall_filtered": 1.0,
+  "recall_unfiltered": 1.0,
+  "runs": [
+    {
+      "config": {
+        "batch": 100,
+        "dim": 128,
+        "filter_ratio": 0.5,
+        "k": 10,
+        "mode": "exact",
+        "queries": 1000,
+        "rows": 10000,
+        "seed": 42
+      },
+      "index": {
+        "t_ms": 76.624
+      },
+      "query": {
+        "io_bytes": 7380808,
+        "peak_rss_kb": 14968,
+        "recall_filtered": 1.0,
+        "recall_unfiltered": 1.0,
+        "sample_size": 20,
+        "t_ms": 553.549
+      },
+      "write": {
+        "io_bytes": 23104906,
+        "peak_rss_kb": 3888,
+        "t_ms": 1139.404
+      }
+    },
+    {
+      "config": {
+        "batch": 100,
+        "dim": 128,
+        "filter_ratio": 0.5,
+        "k": 10,
+        "mode": "exact",
+        "queries": 1000,
+        "rows": 10000,
+        "seed": 42
+      },
+      "index": {
+        "t_ms": 71.221
+      },
+      "query": {
+        "io_bytes": 7380808,
+        "peak_rss_kb": 15024,
+        "recall_filtered": 1.0,
+        "recall_unfiltered": 1.0,
+        "sample_size": 20,
+        "t_ms": 579.529
+      },
+      "write": {
+        "io_bytes": 23104906,
+        "peak_rss_kb": 3984,
+        "t_ms": 1093.249
+      }
+    },
+    {
+      "config": {
+        "batch": 100,
+        "dim": 128,
+        "filter_ratio": 0.5,
+        "k": 10,
+        "mode": "exact",
+        "queries": 1000,
+        "rows": 10000,
+        "seed": 42
+      },
+      "index": {
+        "t_ms": 65.044
+      },
+      "query": {
+        "io_bytes": 7380808,
+        "peak_rss_kb": 15012,
+        "recall_filtered": 1.0,
+        "recall_unfiltered": 1.0,
+        "sample_size": 20,
+        "t_ms": 602.107
+      },
+      "write": {
+        "io_bytes": 23104906,
+        "peak_rss_kb": 4084,
+        "t_ms": 1116.763
+      }
+    }
+  ]
+}

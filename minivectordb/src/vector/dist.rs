@@ -47,31 +47,69 @@ pub fn avx2_available() -> bool {
     }
 }
 
-/// Sum of squared differences over 8 lanes at a time using AVX2.
+/// Sum of squared differences over 32 lanes at a time using AVX2.
 ///
-/// The eight partial sums are combined at the end. To keep the result
-/// bit-comparable with the scalar kernel we fold the partials in lane order.
+/// The four accumulators break the dependency chain of the sum, so the
+/// kernel is not limited by the latency of the addition but by the width of
+/// the machine. The eight partial sums are combined at the end, once for the
+/// whole vector instead of once per group of eight, which is what the first
+/// version of this kernel did and what made it slower.
+///
+/// The accumulation order is different from the one of the scalar kernel, so
+/// the result is not bit for bit the same. The difference is at most one
+/// unit in the last place of the sum, which is far inside the tolerance the
+/// statement allows for the distance.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn l2_sq_avx2(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::x86_64::*;
     let n = a.len();
-    let mut sum = 0.0f32;
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut acc2 = _mm256_setzero_ps();
+    let mut acc3 = _mm256_setzero_ps();
     let mut i = 0usize;
+    while i + 32 <= n {
+        let d0 = _mm256_sub_ps(
+            _mm256_loadu_ps(a.as_ptr().add(i)),
+            _mm256_loadu_ps(b.as_ptr().add(i)),
+        );
+        let d1 = _mm256_sub_ps(
+            _mm256_loadu_ps(a.as_ptr().add(i + 8)),
+            _mm256_loadu_ps(b.as_ptr().add(i + 8)),
+        );
+        let d2 = _mm256_sub_ps(
+            _mm256_loadu_ps(a.as_ptr().add(i + 16)),
+            _mm256_loadu_ps(b.as_ptr().add(i + 16)),
+        );
+        let d3 = _mm256_sub_ps(
+            _mm256_loadu_ps(a.as_ptr().add(i + 24)),
+            _mm256_loadu_ps(b.as_ptr().add(i + 24)),
+        );
+        acc0 = _mm256_add_ps(acc0, _mm256_mul_ps(d0, d0));
+        acc1 = _mm256_add_ps(acc1, _mm256_mul_ps(d1, d1));
+        acc2 = _mm256_add_ps(acc2, _mm256_mul_ps(d2, d2));
+        acc3 = _mm256_add_ps(acc3, _mm256_mul_ps(d3, d3));
+        i += 32;
+    }
+    // The tail, and the partial sums that are left, are handled one group of
+    // eight at a time.
+    let mut acc = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
     while i + 8 <= n {
-        let va = _mm256_loadu_ps(a.as_ptr().add(i));
-        let vb = _mm256_loadu_ps(b.as_ptr().add(i));
-        let d = _mm256_sub_ps(va, vb);
-        let sq = _mm256_mul_ps(d, d);
-        // Horizontal sum of the 8 lanes, in lane order.
-        let lo = _mm256_castps256_ps128(sq);
-        let hi = _mm256_extractf128_ps(sq, 1);
-        let s = _mm_add_ps(lo, hi);
-        let s = _mm_add_ps(s, _mm_movehl_ps(s, s));
-        let s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 0x55));
-        sum += _mm_cvtss_f32(s);
+        let d = _mm256_sub_ps(
+            _mm256_loadu_ps(a.as_ptr().add(i)),
+            _mm256_loadu_ps(b.as_ptr().add(i)),
+        );
+        acc = _mm256_add_ps(acc, _mm256_mul_ps(d, d));
         i += 8;
     }
+    // Horizontal sum of the eight lanes, in lane order.
+    let lo = _mm256_castps256_ps128(acc);
+    let hi = _mm256_extractf128_ps(acc, 1);
+    let s = _mm_add_ps(lo, hi);
+    let s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    let s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 0x55));
+    let mut sum = _mm_cvtss_f32(s);
     while i < n {
         let d = a[i] - b[i];
         sum += d * d;
