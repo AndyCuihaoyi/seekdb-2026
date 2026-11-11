@@ -12,20 +12,42 @@ cache of the files under `/data`, and not only the resident set of the
 database process.
 
 **The status of the numbers in this file.** The measurements were corrected
-twice in the round of 2026-11-11, and both corrections changed the
+five times in the round of 2026-11-11, and every correction changed the
 conclusion:
 
-1. The rounds were noisy, because the server was floating between the cores.
-   Pinning it fixed that, and the query turned out to be 3.02 times faster
-   than the baseline rather than 1.51 times. Section 1.
+1. The rounds were noisy, because the server was floating between the
+   cores. Pinning it fixed that, and the query turned out to be 3.00 times
+   faster than the baseline rather than 1.51 times. Section 1.
 2. The bytes were counted with the wrong counter, which measured the
    traffic of the pipe instead of the disk. The query phase reads **nothing**
    from the disk, and the write phase writes the same bytes as the baseline.
    Section 1.1.
+3. The measurement was taken on the wrong number of cores. The judge runs
+   the container with `--cpus=2`, and on this machine two cores give numbers
+   three times the one-core ones. Section 1.0.
+4. The measurement was taken while the machine was busy. A build of the
+   kernel was running next to it, and three rounds of the same binary
+   differed by 45%. Section 1.0.1.
+5. The number of cores is not the number the platform gives. `--cpus=2` is a
+   quota, not an affinity, and under a quota the speedup of the code is
+   1.25x and not 3.00x. The `3.00x` is a fact about the code under this
+   protocol, not a forecast of the platform's number. Section 1.0.
 
-So the two numbers that the platform counts are these: the time of the
-query is 3.02 times better than the baseline, and **nothing else has
-moved**. Section 4.4 says what each of the remaining levers is worth.
+So the three numbers that the platform counts are these:
+
+| Axis | Baseline | Now | Note |
+| --- | ---: | ---: | --- |
+| The time of the query | 969.2 ms | 323.5 ms | 3.00x better (1.25x under a quota) |
+| The bytes of the query | 0 B | 0 B | the page cache serves all of it |
+| The memory of the query | 14,800 KB | 11,896 KB | 20% less |
+| The time of the write | 751.4 ms | 566.4 ms | 1.33x better |
+| The bytes of the write | 11,407,360 B | 11,407,360 B | **not moved** |
+
+The one that has not moved is the one that is worth the next round. The
+ratio of the query is given twice, because the placement of the two
+processes changes it, and section 1.0 says which one the platform is
+likely to see. Section 4.4 says what each of the remaining levers is
+worth.
 
 ---
 
@@ -56,28 +78,99 @@ phase became 2.2 times faster.
 python3 tools/bench_median.py --mode exact --rounds 5 --cpu 7
 ```
 
-| Measurement | Baseline `b88e0209` | Now `0e5c69985` | Ratio |
+| Measurement | Baseline `b88e0209` | Now `7ff176a53` | Ratio |
 | --- | ---: | ---: | ---: |
-| Query `T` | 967.0 ms | 320.6 ms | **3.02x faster** |
+| Query `T` | 969.2 ms | 323.5 ms | **3.00x faster** |
 | Query `B` (device) | 0 B | 0 B | both are served by the page cache |
-| Query `M` (RSS) | 14,732 KB | 14,980 KB | 1.02x more |
-| Write `T` | 750.1 ms | 571.5 ms | 1.31x faster |
+| Query `M` (RSS) | 14,800 KB | 11,896 KB | **0.80x, 20% less** |
+| Write `T` | 751.4 ms | 566.4 ms | 1.33x faster |
 | Write `B` (device) | 11,407,360 B | 11,407,360 B | 1.00x |
-| Write `M` (RSS) | 3,756 KB | 3,872 KB | 1.03x more |
+| Write `M` (RSS) | 3,960 KB | 3,988 KB | 1.01x more |
 
-The spread of the five rounds of each row is under 8%, and under 3% for
-the query phase of the current version. The measurements are in
-`docs/perf/baseline-pinned-exact.json` and
+The spread of the five rounds of each row is under 4%. The measurements
+are in `docs/perf/baseline-pinned-exact.json` and
 `docs/perf/p5-current-exact.json`.
 
-**The query is 3.02 times faster than the baseline, and the earlier
+**The query is 3.00 times faster than the baseline, and the earlier
 figure of 1.51 times was an artefact of the noise.** The earlier table of
 this file was built on unpinned rounds, in which the baseline and the
 current code were measured at different moments of the same noise, and
 the comparison landed in the middle of it.
 
 The answers of the two versions are byte for byte identical, in both the
-exact and the approximate mode (`docs/perf/answers-baseline-*.txt`).
+exact and the approximate mode (`docs/perf/answers-baseline-*.txt`). That
+was checked against the baseline binary itself, not only against the file.
+
+### 1.0 How the measurement is taken, and why it is this way
+
+Three things had to be fixed before the numbers meant anything, and each
+of them changed the conclusion.
+
+**The cores.** The judge runs the container with `--cpus=2`. On this
+machine the driver and the server are two processes, and where they run
+changes the number a lot, because the ten megabytes of the decoded blocks
+do not fit into the ten megabytes of the second level cache of one core.
+
+| Where the driver and the server run | Median | Spread |
+| --- | ---: | ---: |
+| Free, twenty cores | 757.6 ms | 76% |
+| Two cores | 950.2 ms | 2.7% |
+| One core, the driver and the server on it | 323.5 ms | 2.8% |
+
+The protocol of this file is therefore **one core, both the driver and the
+server**, and the rounds are reported as a range.
+
+**But this is where the numbers of this file have to be read with care.**
+`--cpus=2` in Docker is a *quota* on the CPU time, not a restriction of
+the cores the processes may run on, and a quota was emulated here with
+`systemd-run -p CPUQuota=200%`. Under that emulation the two-core numbers
+came out at roughly 950 ms for the current code against 1,185 ms for the
+baseline, which is a ratio of 1.25 and not of 3.00.
+
+The two measurements are not in conflict, and the reason is the order of
+the two effects. Sharing one core makes the driver and the server share
+one cache, and that is worth a factor of about 2.2 *for both versions*.
+The baseline and the current code differ in how much CPU they need, and
+that difference is worth a factor of about 3. The ratio of the two
+versions is therefore largest when the two of them share a core, and
+smallest when they are spread over two.
+
+**What this means for the ledger.** The `3.00x` of section 1 is a
+measurement of this machine under this protocol, and it is the right
+number to compare the *code* with, because both versions were measured
+the same way. It is **not** a prediction of the ratio the platform will
+see, because the platform runs with a quota and free placement. The
+honest statement is that the speedup of the code is between 1.25x and
+3.00x depending on how the two processes are placed, and that the first
+submission will tell us which end of that range the platform is at.
+
+**The counters of the I/O.** See section 1.1.
+
+**The number of rounds.** Five, and the median of them, which is what the
+platform does with three.
+
+```sh
+python3 tools/bench_median.py --mode exact --rounds 5 --cpu 3 --cpus 3
+```
+
+### 1.0.1 What contaminates a measurement on this machine
+
+Three rounds of the same binary on the same data differed by 45% and by
+67% on two separate occasions, and neither was the code. The cause was
+the machine: a build of the kernel was running next to it, with eight
+compilers at 100% and every core of the twenty loaded.
+
+The rule that follows, and that the rounds of this file obey:
+
+1. No build, no profile, and no other benchmark runs while a measurement
+   runs. `pgrep -c clang` is the cheapest way to check.
+2. The load average before a measurement is read and recorded. A load
+   above one on a twenty-core machine is a warning, not a failure.
+3. The rounds are run in turn, the baseline and the current code
+   interleaved, so that a drift of the machine hits both of them and
+   cancels out.
+4. A spread above 10% is not a measurement and does not go into this
+   file. The measurement is repeated, and the cause is looked for first.
 
 ### 1.1 The measurement of `B` was measuring the wrong thing
 
@@ -120,7 +213,7 @@ Two things follow, and they are both about the score:
    everybody, and it is the same for the baseline. The "4.58 times fewer
    bytes" that this file reported before was the pipe getting smaller,
    which the platform does not count. The improvement is real, and it is
-   in the time, where it shows up as 3.02 times.
+   in the time, where it shows up as 3.00 times.
 2. **The write phase writes the same bytes as before**, 11,407,360 B, and
    that is a number the platform does count. It is the sum of the data
    files (5.50 MB) and the log (5.36 MB), so the log is a second copy of
@@ -282,7 +375,7 @@ The order of the levers, with the numbers of this machine:
 
 1. **The time of the query.** It is 66 2/3% of the weight of the score, and
    the exact scan spends 60% of its CPU in the distance kernel. This is the
-   lever with the most room left. `R_T` is 3.02 now, and `f` is concave, so
+   lever with the most room left. `R_T` is 3.00 now, and `f` is concave, so
    the next factor of two buys less than the last one did: the ratio is
    already in the part of `f` where it flattens.
 2. **The bytes of the write.** They are 6 2/3% of the weight of the score,
@@ -290,17 +383,19 @@ The order of the levers, with the numbers of this machine:
    `R_B` of the write phase is exactly 1. This is the one axis that is
    still at the baseline, and the only one where a big factor is still
    available. It is the axis that was left for last, and the axis that
-   should be next. Section 4.2 says what it would take.
+   should be next. Section 4.5 says what it would take.
 3. **The bytes of the query.** They are 13 1/3% of the weight, and they are
    **zero in both versions**: every byte of the query phase is served by
    the page cache, so `R_B` is exactly 1 and there is nothing to win here.
    This axis is closed.
-4. **The peak memory of the query.** It is 13 1/3% of the weight, and it grew
-   by 1.7% against the baseline, so `R_M` is 0.98 and it goes the wrong way.
-   The buffer pool is the part that grows, so a smaller pool would take it
-   back, at the price of more read calls.
-5. **The time of the write.** It is 20% of the weight, and it is 1.31 times
-   faster than the baseline already.
+4. **The peak memory of the query.** It is 13 1/3% of the weight, and it
+   used to grow against the baseline. It does not any more: the block of
+   the vector file was made smaller, and the peak fell to 11,896 KB against
+   the 14,800 KB of the baseline, so `R_M` is 1.24. This axis is now on
+   the right side.
+5. **The time of the write.** It is 20% of the weight, and it is 1.33 times
+   faster than the baseline already. Section 4.4 shows that it is worth
+   nothing to improve it further.
 
 ### 4.1 The number the platform printed
 
@@ -321,23 +416,23 @@ range of `k`:
 
 | The platform baseline is | `R_T` of the current | raw `e` of the current | Projected `E` | Against the baseline |
 | --- | ---: | ---: | ---: | ---: |
-| 0.3x ours (fast) | 0.905 | 0.4357 | **2751** | +50% |
-| 0.5x ours | 1.508 | 0.5295 | 2622 | +43% |
-| 1.0x ours | 3.016 | 0.6498 | 2378 | +30% |
-| 2.0x ours | 6.032 | 0.7459 | 2160 | +18% |
-| 3.0x ours | 9.049 | 0.7880 | 2065 | +13% |
-| 5.0x ours (slow) | 15.081 | 0.8274 | 1978 | +8% |
+| 0.3x ours (fast) | 0.899 | 0.4435 | **2800** | +53% |
+| 0.5x ours | 1.498 | 0.5387 | 2668 | +46% |
+| 1.0x ours | 2.996 | 0.6600 | 2415 | +32% |
+| 2.0x ours | 5.992 | 0.7548 | 2186 | +19% |
+| 3.0x ours | 8.988 | 0.7956 | 2085 | +14% |
+| 5.0x ours (slow) | 14.980 | 0.8331 | 1992 | +9% |
 
-So the current code projects to roughly **1980 to 2750**, against the
-1829.58 of the baseline: a gain of 8% to 50%, depending on how the
+So the current code projects to roughly **1990 to 2800**, against the
+1829.58 of the baseline: a gain of 9% to 53%, depending on how the
 platform's baseline compares to ours, which is not known.
 
 The reason the gain is smaller than the gain in the raw time is the shape
 of `f`. `f(R) = R/(1+R)` is concave, so a large `R` buys less than a
-small one, and the ratio here is already large: `R_T = 3.02`. And the
-gain is smaller than it could be because **two of the three axes of the
-query phase are closed**: the bytes of the query are zero, and the memory
-of the query went the wrong way.
+small one, and the ratio here is already large: `R_T = 3.00`. And the
+gain is smaller than it could be because **one of the three axes of the
+query phase is closed**: the bytes of the query are zero, in the baseline
+and in the current code alike, so there is nothing to win there.
 
 **This projection is not calibrated.** It says what the formula gives for
 a baseline that is *assumed* to be in a certain relation to ours. It has
@@ -345,6 +440,27 @@ never been checked against a number the platform printed, because the
 platform has only printed one, for the version before this round. The
 first submission of the current code will tell us the scale, and until then
 the number above is a projection and not a forecast.
+
+**To be filled in after the first submission of this round.** The
+submission is made for the calibration and for nothing else: the version
+is the one that this file describes, with no experiment in it that has not
+been verified, so that the number the platform prints is the number this
+file predicts. What has to be written here is the printed `E`, the three
+axes of the platform, and the constant of the platform that follows from
+them.
+
+| Field | Value |
+| --- | --- |
+| The commit that was submitted | _to be filled in_ |
+| The `E` the platform printed | _to be filled in_ |
+| The three axes the platform reported | _to be filled in_ |
+| The constant of the platform, `E_printed / raw_e` | _to be filled in_ |
+| The projection of this file, for comparison | 2415 (at `k = 1.0`) |
+
+The constant is the one number that turns the projection into a
+forecast: with it, the `raw_e` of any later change can be turned into the
+`E` the platform will print, and the order of the remaining levers can be
+computed against the real scale instead of an assumed one.
 
 Two things follow from the shape of the formula, and both are worth
 keeping in mind:
@@ -354,9 +470,9 @@ keeping in mind:
    weight is 6 2/3% of the time and 6 2/3% of the I/O, and both of them
    are still at the baseline. This is the axis where the remaining room
    is.
-2. **The memory axis is slightly against us.** `R_M` of the query phase
-   is 0.98, because the buffer pool grew. It costs a fraction of a
-   percent of the score, but it is a fraction that goes the wrong way.
+2. **The memory axis is now on the right side.** `R_M` of the query phase
+   is 1.24, after the block of the vector file was made smaller. Before
+   that it was 0.99.
 
 The honest conclusion is that the ranking is decided by the distance
 between the competitors, not by this factor alone, and that the work
@@ -405,27 +521,47 @@ the vector does not have to be in it.
 
 The formula is run over the numbers of this machine, with the platform
 baseline assumed to be the same as ours, and the projected printed `E` is
-compared with the 2378 of the current code:
+compared with the 2415 of the current code:
 
 | Lever | Change | raw `e` | Projected `E` | Gain |
 | --- | --- | ---: | ---: | ---: |
-| The time of the query | 320 ms to 160 ms | 0.7139 | 2612 | **+234** |
-| The bytes of the write | 10.9 MB to 6.0 MB | 0.6757 | 2472 | +95 |
-| The bytes of the write | 10.9 MB to 3.8 MB | 0.6923 | 2533 | +155 |
-| The memory of the query | back to the baseline | 0.6506 | 2381 | +3 |
-| The time of the write | 571 ms to 285 ms | 0.6498 | 2378 | +0 |
+| The time of the query | 324 ms to 162 ms | 0.7243 | 2650 | **+235** |
+| The bytes of the write | 10.9 MB to 6.0 MB | 0.6858 | 2509 | +95 |
+| The bytes of the write | 10.9 MB to 3.8 MB | 0.7024 | 2570 | +155 |
+| The time of the write | 566 ms to 283 ms | 0.6600 | 2415 | +0 |
+| Both of the two above | | 0.7667 | 2806 | **+391** |
 
 Two things are worth noticing.
 
 **The time of the write is worth nothing at all.** Halving it moves the
 projected `E` by zero, because the write phase is a third of the weight
-and `f` is already at `f(1.34) = 0.57`, so the gain of the ratio is small
-and the write time is the smaller half of the weight. The same is true of
-the memory of the query: three points.
+and `f` is already at `f(1.33) = 0.57`, so the gain of the ratio is small
+and the write time is the smaller half of the weight.
 
 **So the two things that are worth doing are the time of the query and
 the bytes of the write.** The first one is what the profile points at, and
-the second one is the axis that has not been touched at all.
+the second one is the axis that has not been touched at all. Together they
+are worth about 390 points of the printed score, which is more than the
+time of the query alone.
+
+And one thing that was measured and is *not* worth doing: making the
+distance kernel faster by more arithmetic.
+
+| Kernel | 10,000 rows | 500 rows |
+| --- | ---: | ---: |
+| The AVX2 kernel of today | 192.4 ms | 5.3 ms |
+| The same with the fused multiply-add | 190.2 ms | 4.6 ms |
+| The same with eight accumulators | 191.9 ms | 5.5 ms |
+
+The kernel is **limited by the memory**, not by the arithmetic: it reaches
+26.6 GB/s over ten thousand rows and 48.8 GB/s over five hundred, so the
+data is what costs, and the arithmetic is nearly free. The fused
+multiply-add buys 1%, and eight accumulators buy nothing.
+
+So there is no point in fusing the scan with the kernel, or in making the
+kernel wider. The only way to make the query faster is to **measure
+fewer rows**, and the only exact way to do that is to know a bound before
+the measurement.
 
 ### 4.5 What it would take to make the log smaller
 
@@ -469,17 +605,29 @@ Every measurement of this file is reproduced by these commands:
 
 ```sh
 # the table of section 1 (the pinning is what makes the rounds alike)
-python3 tools/bench_median.py --mode exact --rounds 5 --cpu 7
-python3 tools/bench_median.py --binary <baseline binary> --mode exact --rounds 5 --cpu 7
+python3 tools/bench_median.py --mode exact --rounds 5 --cpu 3 --cpus 3
+python3 tools/bench_median.py --binary <baseline binary> --mode exact --rounds 5 --cpu 3 --cpus 3
 
-# the profile of section 2
+# the counters of the I/O, both of them side by side
+python3 tools/measure_io.py --mode exact --cpu 3
+
+# the profile of section 2. The release profile of the crate sets
+# `strip = true`, so the binary that is being delivered has no symbols and
+# `perf` cannot resolve them. The profiling build is the only build with
+# `strip = false`, and the delivered build is always `strip = true`.
 sed -i 's/^strip = true/strip = false/' minivectordb/Cargo.toml
 cargo build --offline --locked --release
-python3 tools/perf_query_only.py ./minivectordb/target/release/minivectordb exact /tmp/perfwork /tmp/perf.data
+python3 tools/perf_query_only.py ./minivectordb/target/release/minivectordb exact /tmp/perfwork /tmp/perf.data 3
 perf report -i /tmp/perf.data --stdio --no-children --percent-limit 1.2
+sed -i 's/^strip = false/strip = true/' minivectordb/Cargo.toml
+cargo build --offline --locked --release
 
 # the comparison of section 2.1
 python3 tools/probe_roundtrip.py
+
+# the kernel of section 4.4
+cargo build --offline --locked --release --bin kernelbench
+taskset -c 3 ./minivectordb/target/release/kernelbench
 
 # the memory of section 3
 python3 tools/bench_cgroup_peak.py --mode exact

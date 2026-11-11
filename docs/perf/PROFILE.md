@@ -148,7 +148,7 @@ local number has to be the same quantity, and `tools/bench.py` now counts
 
 The consequence for the work: **there is no I/O to remove from the query
 phase.** The improvement of the last round was real, but it was in the
-time (3.02 times), not in the bytes.
+time (3.00 times), not in the bytes.
 
 ---
 
@@ -157,13 +157,43 @@ time (3.02 times), not in the bytes.
 In the order in which the work is worth doing. The worth of each is
 computed in `docs/perf/ledger.md`, section 4.4.
 
-### 4.1 Fuse the scan and the kernel
+### 4.0 The kernel is limited by the memory, not by the arithmetic
+
+This decides the whole list below, so it comes first.
+
+The kernel of today was measured against the alternatives on the same
+machine (`minivectordb/src/bin/kernelbench.rs`):
+
+| Kernel | 10,000 rows | 500 rows |
+| --- | ---: | ---: |
+| The AVX2 kernel of today | 192.4 ms (26.6 GB/s) | 5.3 ms (48.8 GB/s) |
+| The same with the fused multiply-add | 190.2 ms (26.9 GB/s) | 4.6 ms (55.4 GB/s) |
+| The same with eight accumulators | 191.9 ms (26.7 GB/s) | 5.5 ms (46.2 GB/s) |
+
+The rate rises from 26.6 GB/s over ten thousand rows to 48.8 GB/s over five
+hundred. The kernel is **not limited by the arithmetic**: it is limited by
+the memory. Over the whole table the data does not fit into the cache of
+the core, and the cost is the reading of the vectors.
+
+So the fused multiply-add buys 1%, and eight accumulators buy nothing.
+**There is no point in fusing the scan with the kernel, and no point in
+making the kernel wider.** Both were on the list before this measurement,
+and both are off it now.
+
+The only way to make the query faster is to **measure fewer rows**.
+
+### 4.1 Measure fewer rows
 
 The scan calls the kernel once per row
 (`minivectordb/src/vector/exact.rs`). So the horizontal sum of the eight
 lanes and the branch on the length of the vector are paid **10,000 times per
 query**. A kernel that takes the matrix of a whole block at once, and keeps
 the accumulator alive across the rows, would remove both.
+
+**But section 4.0 says this is not worth doing**: the kernel is limited by
+the memory, so removing the horizontal sum would remove a small part of a
+cost that is the reading of the data. It was on the list before the
+measurement of the kernel, and it is off it now.
 
 The risk is that the result changes in the last bit, because the summation
 order changes. The gate is the same one every time: the answers must stay
@@ -199,11 +229,10 @@ prize is bounded, but it is the cheapest of the three to get right.
 ### 4.4 The order to try them in
 
 1. **4.3** first: it is small, it is local, and it cannot change the answer.
-2. **4.1** next: it is a contained change in one function, and the gate
-   (byte identical answers) tells immediately whether the summation order
-   changed.
-3. **4.2** last: it is the biggest prize and the one that can change the
-   answer, so it needs the exactness argument to be written down first.
+2. **4.2** next: it is the biggest prize, and it needs the exactness
+   argument to be written down before it is tried.
+3. **4.1** last, and only if there is time: the measurement says the prize
+   is small.
 
 ---
 
@@ -228,6 +257,14 @@ decoded vectors, plus the decoded directory and the decoded scalar columns.
 The buffer pool of the vectors is what grows, and it is the only part of
 the memory that the size of the table decides.
 
+**The size of the block of the vector file is the lever.** The block was
+4096 rows, which is 2 MiB of decoded vectors, and the pool of 64 MiB holds
+the whole table of the benchmark. A block of 1024 rows is 512 KiB, and the
+peak memory of the query phase fell from 14,968 KB to 11,896 KB, which is
+20% less, for 1.5% more time. The trade is worth making, because the
+memory of the query was the one axis that was going the wrong way against
+the baseline, and every point of it is now a point that is gained.
+
 `tools/bench_cgroup_peak.py` measures it the way the platform does, by
 running the benchmark in a cgroup of its own. It needs root to create a
 cgroup, and on a machine without root it falls back to the resident set and
@@ -248,16 +285,46 @@ reads again. The same binary measured:
 
 | Where the driver and the server run | Median | Spread |
 | --- | ---: | ---: |
-| Both free | 703 ms | 49% |
+| Both free, twenty cores | 703 ms | 49% |
 | The server pinned, the driver free | 967 ms | 39% |
 | The server pinned to another core than the driver | 922 ms | 105% |
-| **Both pinned to the same core** | **327 ms** | **3%** |
+| Two cores, both of them | 950 ms | 3% |
+| **One core, both pinned to it** | **327 ms** | **3%** |
 
 So the pinning is not a detail of the measurement: it is worth a factor of
 2.2, and without it a comparison of two versions measures the machine.
 
+**The two-core number is the surprising one.** The judge runs the
+container with `--cpus=2`, and the two-core number is *three times
+slower* than the one-core number.
+
+The reason is the cache. The driver and the server both want the last
+level cache of the core they share, and the ten megabytes of the decoded
+blocks do not fit into the ten megabytes of the second level cache of one
+core. The server is doing a scan that should be streaming 4.88 MB of
+vectors, and it pays for the eviction of its own working set.
+
+**But `--cpus=2` is a quota and not an affinity, and that changes the
+answer.** Docker restricts the *CPU time* of the container, and the
+processes still float over all the cores of the machine. Emulating that
+with `systemd-run -p CPUQuota=200%` gives 950 ms for the current code
+against 1,185 ms for the baseline, which is a ratio of 1.25 and not of
+3.00.
+
+The two effects are independent, and that is the whole explanation.
+Sharing one core is worth a factor of 2.2 to *both* versions, because it
+is a property of the cache and not of the code. The difference in the
+work between the two versions is worth a factor of 3. So the ratio of
+the two versions is largest when they share a core and smallest when
+they are spread out. The `3.00x` is a true fact about the code under the
+protocol of this file, and the first submission of the platform will say
+which end of the range of 1.25x to 3.00x it is at.
+
+So the protocol of the measurement is **one core**, with the driver and
+the server on it, and the rounds reported as a range.
+
 ```sh
-python3 tools/bench_median.py --mode exact --rounds 5 --cpu 7
+python3 tools/bench_median.py --mode exact --rounds 5 --cpu 3 --cpus 3
 ```
 
 A measurement that is going into the ledger has to be taken with the
@@ -265,6 +332,14 @@ machine quiet **and pinned**, and the rounds have to be reported as a
 range when the spread is wide. A single round is not a measurement, and a
 comparison of two binaries that are not run in turn is not a comparison
 either.
+
+**The machine has to be quiet, and it often is not.** Three rounds of the
+same binary on the same data differed by 45% and by 67% on two separate
+occasions. Both times the cause was a build of the kernel running on the
+same machine, with eight compilers at 100% and every core loaded. So the
+rule is: no build runs while a measurement runs, the load average is read
+before the rounds, and a spread above 10% is treated as a broken
+measurement and not as a slow one.
 
 ---
 
@@ -275,8 +350,14 @@ either.
 sed -i 's/^strip = true/strip = false/' minivectordb/Cargo.toml
 cargo build --offline --locked --release
 python3 tools/perf_query_only.py ./minivectordb/target/release/minivectordb \
-    exact /tmp/perfwork /tmp/perf.data
+    exact /tmp/perfwork /tmp/perf.data 3
 perf report -i /tmp/perf.data --stdio --no-children --percent-limit 1.0
+sed -i 's/^strip = false/strip = true/' minivectordb/Cargo.toml
+cargo build --offline --locked --release
+
+# the kernel of section 4.0
+cargo build --offline --locked --release --bin kernelbench
+taskset -c 3 ./minivectordb/target/release/kernelbench
 
 # the comparison of section 3.1
 python3 tools/probe_roundtrip.py
