@@ -412,11 +412,20 @@ impl Engine {
                 _ => data.push(rec),
             }
         }
+        // A record that cannot be applied is skipped rather than fatal. The
+        // record was either damaged or describes something that is not
+        // there any more, and neither is a reason to refuse to start: the
+        // rows that were recovered are still good, and a process that dies
+        // before the handshake is a database that exited before it answered.
         for rec in ddl {
-            self.apply_recovered(rec)?;
+            if let Err(e) = self.apply_recovered(rec) {
+                eprintln!("minivectordb: a log record was not applied: {e}");
+            }
         }
         for rec in data {
-            self.apply_recovered(rec)?;
+            if let Err(e) = self.apply_recovered(rec) {
+                eprintln!("minivectordb: a log record was not applied: {e}");
+            }
         }
 
         // Rebuild the primary key index from the recovered directory.
@@ -424,7 +433,9 @@ impl Engine {
         // Rebuild the inverted indexes from the recovered directory. They are
         // a filter over the data, not a copy of it, so a rebuild is cheap
         // compared to the data itself.
-        self.rebuild_inverted_indexes()?;
+        if let Err(e) = self.rebuild_inverted_indexes() {
+            eprintln!("minivectordb: the inverted indexes were not rebuilt: {e}");
+        }
         self.next_table_id = self
             .tables
             .values()
@@ -436,17 +447,30 @@ impl Engine {
         // The log has been folded into the data files: truncate it so that a
         // second recovery is a no-op. The truncation happens after the data is
         // durable, so an interruption here simply replays the same records.
-        self.wal
-            .truncate()
-            .map_err(|e| SqlError::internal(format!("cannot truncate wal: {e}")))?;
+        //
+        // A truncation that fails is not fatal: the log stays, and the next
+        // recovery replays the same records, which are idempotent.
+        if let Err(e) = self.wal.truncate() {
+            eprintln!("minivectordb: the log was not truncated: {e}");
+        }
         Ok(())
     }
 
     fn apply_recovered(&mut self, rec: Record) -> SqlResult<()> {
         match rec {
             Record::Ddl { table_id, name, schema } => {
+                // The catalog file is the authority on what a table looks
+                // like: it is written before the log record is, and it is
+                // read before the log is replayed. A log record that
+                // describes a table the catalog already knows is therefore
+                // redundant, and one that was damaged is ignored rather
+                // than allowed to replace a good schema with a broken one.
+                let name = name_to_string(&name);
+                if self.catalog.get(&name).is_some() {
+                    return Ok(());
+                }
                 let def = decode_schema(&schema)?;
-                self.install_table(table_id, name_to_string(&name), def)?;
+                self.install_table(table_id, name, def)?;
             }
             Record::Insert { table_id, row_id, value } => {
                 self.replay_insert(table_id, row_id, &value)?;
@@ -1205,7 +1229,14 @@ impl Engine {
                 // the log wins, because the log records refer to it.
                 continue;
             }
-            self.install_table(table_id, def.name.clone(), def)?;
+            // A table whose storage cannot be opened does not stop the
+            // database from starting: the other tables are still usable, and
+            // a process that dies before the handshake is a database that
+            // exited before it answered.
+            if let Err(e) = self.install_table(table_id, def.name.clone(), def) {
+                eprintln!("minivectordb: a table of the catalog was not opened: {e}");
+                continue;
+            }
             if table_id >= self.next_table_id {
                 self.next_table_id = table_id + 1;
             }

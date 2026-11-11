@@ -518,6 +518,64 @@ rounds against `ae6514687`, and `check_torn_data.py` fails 7 of its 9
 checks against it. The tools are therefore a check of the defect and
 not only a check of the fix.
 
+### 4.1.2 The first fix was not yet enough, and the fuzzer said so
+
+The fix of section 4.1.1 removed the panic. The fuzzer still failed, and
+the way it failed was more useful than the panic itself: **the database
+answered with an error instead of dying.** A failure of a query is a
+defect; a failure of the *process* is what the admission gate punishes.
+So the fuzzer had found the difference between the two classes.
+
+What it found was that the recovery of a damaged data directory was not
+complete. There were two more ways to lose the schemas, and both of them
+ended in a process that died before the handshake:
+
+| Damaged file | What the old code did | What the code does now |
+| --- | --- | --- |
+| `catalog.dat`, magic overwritten | `Engine::open` returned an error, the process exited with code 1 | the backup copy is read instead, the process starts |
+| `catalog.dat`, a byte of a schema flipped | the schema was read as a table with different columns, and every query answered `no_such_column` | the entry carries a checksum, the damaged file is recognised, the backup is used |
+| `meta.dat`, an offset that is far past the end of `col.dat` | the read asked for an allocation of that size, and the out of memory killer took the process | the run is not read at all, the rows of it are treated as rows that cannot be decoded |
+
+The catalog needed a second copy and a checksum, because it is the only
+place the schemas live once the log has been folded into the data files.
+The format version went from 1 to 2; a file of the old version is still
+read, but its entries cannot be checked.
+
+**What this changes about the method.** The first fix answered the
+question *"does a damaged file kill the process?"*. It did not answer
+*"does a damaged file leave the database answering correctly?"*, and
+those are different questions: a table whose schema was read as a table
+with the wrong columns answers every query with an error, and the
+admission gate counts that as a failure too. The fuzzer was extended to
+check the **answers**, not only the liveness, and it is the answers that
+found the catalog defect.
+
+**What the fix costs.** Nothing that is measured. The catalog is written
+once per schema change and read once per start, and a checksum over a few
+hundred bytes is not a cost. The peak memory at 300 000 rows is 191 388
+KB after the fix and 190 872 KB before it, a difference of 0.27% that is
+the size of the backup copy of the catalog.
+
+The state after this section:
+
+| Check | Result |
+| --- | --- |
+| `cargo test` | 146 tests, 146 pass (131 unit + 15 protocol) |
+| `tools/run_public_cases.py` | 20 of 20 |
+| `tools/check_formal_requirements.py` | 27 of 27 |
+| `tools/check_torn_data.py` | 9 of 9 |
+| `tools/fuzz_torn_data.py`, four seeds | 1600 of 1600, **no panic and no wrong answer** |
+| `tools/fuzz_kill_write.py` | 30 of 30 |
+| `tools/killtest.sh` | all rounds pass |
+| the container under `--cpus=2 --memory=2g --pids-limit=128` | starts and stays alive |
+
+Three of the protocol tests are new, and they are written so that they
+**fail against `a868b06fa` and pass against the fix**: the truncated
+column file, the damaged catalog and the directory entry with a huge
+offset. A test that passes against both versions would not have caught
+the defect, so their failure against the submitted version is part of
+their evidence.
+
 The constant is the one number that turns the projection into a
 forecast: with it, the `raw_e` of any later change can be turned into the
 `E` the platform will print, and the order of the remaining levers can be

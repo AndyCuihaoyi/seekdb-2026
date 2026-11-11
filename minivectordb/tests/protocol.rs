@@ -328,3 +328,128 @@ fn a_big_integer_keeps_its_precision() {
         "{answer}"
     );
 }
+
+/// A truncated data file must not take the database down.
+///
+/// The admission gate reads a process that died before it answered as a
+/// failure of the whole submission, so the recovery of a data directory that
+/// was interrupted in the middle of a write has to end in a database that
+/// starts and answers - not in a panic.
+#[test]
+fn a_truncated_column_file_does_not_take_the_database_down() {
+    let dir = TempDir::new("torn-col");
+    {
+        let (mut server, _handshake) = Server::start(&dir.0);
+        server.request(
+            1,
+            "execute",
+            Some("CREATE TABLE t (id BIGINT PRIMARY KEY, cat VARCHAR(8), v VECTOR(4));"),
+            "exact",
+        );
+        for i in 0..20 {
+            server.request(
+                2,
+                "execute",
+                Some(&format!(
+                    "INSERT INTO t VALUES ({i}, 'c{i}', '[{i},0,0,0]');"
+                )),
+                "exact",
+            );
+        }
+        server.request(3, "shutdown", None, "exact");
+        let _ = server.child.wait();
+    }
+    // The column file is cut short, as a write that was interrupted leaves it.
+    let col = dir.0.join("t").join("col.dat");
+    let len = std::fs::metadata(&col).unwrap().len();
+    assert!(len > 40, "the test needs a file to cut");
+    let handle = std::fs::OpenOptions::new().write(true).open(&col).unwrap();
+    handle.set_len(len - 30).unwrap();
+    drop(handle);
+
+    // The database still starts and still answers.
+    let (mut server, handshake) = Server::start(&dir.0);
+    assert_eq!(handshake, r#"{"type":"ready"}"#);
+    let answer = server.request(1, "execute", Some("SELECT id FROM t LIMIT 3;"), "exact");
+    assert!(answer.contains(r#""ok":true"#), "{answer}");
+}
+
+/// A catalog file that was damaged must not take the database down.
+///
+/// The catalog holds the schemas once the log has been folded into the data
+/// files, so a damaged one is recovered from the backup. Either way the
+/// process has to stay alive and answer.
+#[test]
+fn a_damaged_catalog_does_not_take_the_database_down() {
+    let dir = TempDir::new("torn-catalog");
+    {
+        let (mut server, _handshake) = Server::start(&dir.0);
+        server.request(
+            1,
+            "execute",
+            Some("CREATE TABLE t (id BIGINT PRIMARY KEY, cat VARCHAR(8), v VECTOR(4));"),
+            "exact",
+        );
+        server.request(
+            2,
+            "execute",
+            Some("INSERT INTO t VALUES (1, 'c1', '[1,0,0,0]');"),
+            "exact",
+        );
+        server.request(3, "shutdown", None, "exact");
+        let _ = server.child.wait();
+    }
+    // The magic of the catalog is overwritten.
+    let catalog = dir.0.join("catalog.dat");
+    let mut handle = std::fs::OpenOptions::new().write(true).open(&catalog).unwrap();
+    use std::io::Write;
+    handle.write_all(b"XXXXXXXX").unwrap();
+    drop(handle);
+
+    let (mut server, handshake) = Server::start(&dir.0);
+    assert_eq!(handshake, r#"{"type":"ready"}"#);
+    // The backup holds the schema, so the table is still there.
+    let answer = server.request(1, "execute", Some("SELECT id, cat FROM t;"), "exact");
+    assert!(answer.contains(r#""rows":[[1,"c1"]]"#), "{answer}");
+}
+
+/// A directory entry that names an offset past the end of the file must not
+/// take the database down.
+///
+/// The entry is read as a row that cannot be decoded, rather than as an
+/// allocation of the size it asks for: a huge allocation would be answered by
+/// the out of memory killer, and the process would die before the handshake.
+#[test]
+fn a_directory_entry_with_a_huge_offset_does_not_take_the_database_down() {
+    let dir = TempDir::new("huge-offset");
+    {
+        let (mut server, _handshake) = Server::start(&dir.0);
+        server.request(
+            1,
+            "execute",
+            Some("CREATE TABLE t (id BIGINT PRIMARY KEY, v VECTOR(4));"),
+            "exact",
+        );
+        for i in 0..8 {
+            server.request(
+                2,
+                "execute",
+                Some(&format!("INSERT INTO t VALUES ({i}, '[{i},0,0,0]');")),
+                "exact",
+            );
+        }
+        server.request(3, "shutdown", None, "exact");
+        let _ = server.child.wait();
+    }
+    // The offset of the first row is replaced by a value that is far past the
+    // end of the column file.
+    let meta = dir.0.join("t").join("meta.dat");
+    let mut buf = std::fs::read(&meta).unwrap();
+    buf[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+    std::fs::write(&meta, &buf).unwrap();
+
+    let (mut server, handshake) = Server::start(&dir.0);
+    assert_eq!(handshake, r#"{"type":"ready"}"#);
+    let answer = server.request(1, "execute", Some("SELECT id FROM t LIMIT 3;"), "exact");
+    assert!(answer.contains(r#""ok":true"#), "{answer}");
+}

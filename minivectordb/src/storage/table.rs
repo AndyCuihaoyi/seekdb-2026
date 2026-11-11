@@ -70,6 +70,20 @@ static NEXT_FILE_ID: AtomicU32 = AtomicU32::new(1);
 /// a cache of its own, with this budget.
 const STANDALONE_POOL_MB: usize = 64;
 
+/// The largest run of row images that is read in one call.
+///
+/// A directory entry that was damaged can name an image that is far past the
+/// end of the file. Reading such a run in one call would mean an allocation
+/// of the size the entry asks for, which the out of memory killer would
+/// answer by killing the process - and a process that dies before the
+/// handshake is a database that exited before it answered. A run that is
+/// longer than this is not read at all: the rows of the run are treated as
+/// rows that cannot be decoded, and the rest of the table is still usable.
+///
+/// The limit is generous: a row image holds a handful of values, so a run of
+/// this size holds more rows than a block of the file can hold.
+const MAX_IMAGE_SPAN: u64 = 64 * 1024 * 1024;
+
 /// The cache of the decoded vector blocks.
 pub type VectorPool = Rc<RefCell<BufferPool<Vec<f32>>>>;
 
@@ -374,14 +388,30 @@ impl TableStore {
         let mut i = 0usize;
         while i < metas.len() {
             let start = metas[i].col_offset;
-            let mut end = start + metas[i].col_len as u64;
+            let mut end = start.saturating_add(metas[i].col_len as u64);
             let mut j = i + 1;
             while j < metas.len() && metas[j].col_offset == end {
-                end += metas[j].col_len as u64;
+                end = end.saturating_add(metas[j].col_len as u64);
                 j += 1;
             }
+            // A directory entry that was damaged can name an image that is far
+            // past the end of the file. The read of such an image is refused
+            // rather than turned into an allocation of the size the entry
+            // asks for: an allocation that large would be answered by the
+            // out of memory killer, and the process would die before the
+            // handshake.
+            let span = end.saturating_sub(start);
+            if span > MAX_IMAGE_SPAN {
+                // The run is not read at all. The slots of the run get an
+                // empty image, which they decode to nothing.
+                for m in &metas[i..j] {
+                    offsets.push(u32::MAX);
+                }
+                i = j;
+                continue;
+            }
             let base = buf.len() as u64;
-            let mut chunk = vec![0u8; (end - start) as usize];
+            let mut chunk = vec![0u8; span as usize];
             let n = read_at_up_to(&self.col, &mut chunk, start)?;
             chunk.truncate(n);
             buf.extend_from_slice(&chunk);
@@ -406,6 +436,10 @@ impl TableStore {
             Some(o) => *o as usize,
             None => return &[],
         };
+        // The sentinel of a run that was not read at all.
+        if start == u32::MAX as usize {
+            return &[];
+        }
         let end = start.saturating_add(len as usize);
         if start > buf.len() || end > buf.len() {
             return &[];
@@ -535,12 +569,18 @@ impl TableStore {
         if let Some(idx) = self.vector_index {
             let matrix = self.block_matrix(meta.vec_block)?;
             let start = meta.vec_slot as usize * self.dim;
-            let end = start + self.dim;
-            if end <= matrix.len() && idx < cols.len() {
+            let end = start.saturating_add(self.dim);
+            // A row whose vector cannot be read is a row that cannot be
+            // materialised: its vector column would hold a number where a
+            // vector belongs. The row is reported as absent, so that the
+            // query skips it rather than failing on the row.
+            if idx < cols.len() && end <= matrix.len() {
                 cols[idx] = ColValue::Vector(crate::value::vector::Vector::new(
                     self.dim,
                     matrix[start..end].to_vec(),
                 ));
+            } else {
+                return Ok(None);
             }
         }
         Ok(Some((meta, cols)))
