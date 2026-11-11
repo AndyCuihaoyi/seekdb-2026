@@ -83,12 +83,20 @@ pub struct TopK {
     k: usize,
     /// The candidates, worst first.
     heap: std::collections::BinaryHeap<Candidate>,
+    /// The squared distance of the worst candidate of the heap.
+    ///
+    /// The scan offers every row of the table to the heap, and almost every
+    /// row is worse than the worst candidate the heap already holds. The
+    /// squared distance of that candidate is kept aside, so that such a row
+    /// is dropped with one comparison of two floats instead of with the
+    /// whole ordering of the candidates.
+    worst_sq: f32,
 }
 
 impl TopK {
     /// A heap that keeps the best `k` candidates.
     pub fn new(k: usize) -> TopK {
-        TopK { k, heap: std::collections::BinaryHeap::with_capacity(k) }
+        TopK { k, heap: std::collections::BinaryHeap::with_capacity(k), worst_sq: f32::INFINITY }
     }
 
     /// Offer a candidate to the heap.
@@ -101,6 +109,14 @@ impl TopK {
         }
         if self.heap.len() < self.k {
             self.heap.push(candidate);
+            self.worst_sq = self.heap.peek().map(|w| w.dist_sq).unwrap_or(f32::INFINITY);
+            return;
+        }
+        // The candidate is worse than the worst one of the heap when its
+        // distance is larger. A candidate with the very same distance is
+        // only worse when its primary key is larger, so the tie has to be
+        // broken by the full ordering.
+        if candidate.dist_sq > self.worst_sq {
             return;
         }
         // The worst candidate is at the top of the heap.
@@ -108,6 +124,7 @@ impl TopK {
             Some(worst) if candidate < *worst => {
                 self.heap.pop();
                 self.heap.push(candidate);
+                self.worst_sq = self.heap.peek().map(|w| w.dist_sq).unwrap_or(f32::INFINITY);
             }
             _ => {}
         }
