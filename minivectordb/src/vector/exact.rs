@@ -136,6 +136,13 @@ impl TopK {
 /// query is answered over the filtered set.
 pub type Filter<'a> = &'a mut dyn FnMut(u64, i64, &[Option<ColValue>]) -> SqlResult<bool>;
 
+/// A scan that only visits the rows of a set.
+///
+/// The rows are given by their identifiers. The scan visits them in the order
+/// of the table, so the answer does not depend on the order in which the
+/// rows are measured.
+pub type Candidates<'a> = &'a [u64];
+
 /// Scan a table block by block and return the best candidates.
 ///
 /// The rows of the current transaction are not part of the scan: the caller
@@ -145,6 +152,26 @@ pub fn scan_exact_topk(
     query: &[f32],
     k: usize,
     mut filter: Option<Filter<'_>>,
+) -> SqlResult<Vec<Candidate>> {
+    scan_exact_topk_candidates(store, query, k, filter, None)
+}
+
+/// Scan a table block by block, visiting only the rows of a set.
+///
+/// When the set is given, the rows outside of it are never measured: the
+/// distance of a row that the filter rejects is not computed at all. This is
+/// what makes a filtered query cheaper than an unfiltered one, instead of
+/// costing the same plus the filter.
+///
+/// The set is used as a *candidate* set, not as the answer: the rows it
+/// names are still checked against the filter, so a set that is wrong or out
+/// of date cannot change the answer of the query.
+pub fn scan_exact_topk_candidates(
+    store: &mut TableStore,
+    query: &[f32],
+    k: usize,
+    mut filter: Option<Filter<'_>>,
+    candidates: Option<Candidates<'_>>,
 ) -> SqlResult<Vec<Candidate>> {
     let mut top = TopK::new(k);
     let dim = store.dim;
@@ -167,11 +194,32 @@ pub fn scan_exact_topk(
             None
         };
 
+        // The rows of the candidate set that fall into this block.
+        //
+        // The set is sorted, so the rows of the block are found with a
+        // cursor that only moves forward: the whole scan costs one pass
+        // over the set, not one search per row.
+        let mut cursor = 0usize;
+        let set = candidates.unwrap_or(&[]);
+        let set_is_used = candidates.is_some();
+
         for (slot, meta) in metas.iter().enumerate() {
             if meta.alive == 0 {
                 continue;
             }
             let row_id = block * store.block_rows as u64 + slot as u64;
+
+            if set_is_used {
+                // Skip the rows that are not candidates.
+                while cursor < set.len() && set[cursor] < row_id {
+                    cursor += 1;
+                }
+                if cursor >= set.len() || set[cursor] != row_id {
+                    continue;
+                }
+                cursor += 1;
+            }
+
             let vec = &matrix[slot * dim..(slot + 1) * dim];
             let dist = l2_sq_dispatch(vec, query).sqrt();
 

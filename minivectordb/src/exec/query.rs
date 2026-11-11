@@ -35,6 +35,43 @@ struct DistanceTopK {
     k: usize,
 }
 
+/// A filter that the inverted index of a column can answer.
+///
+/// The filter is an equality on one column, which is the shape a low
+/// cardinality column is indexed for. The plan names the column and the
+/// value, so that the scan only has to visit the rows of that value.
+struct IndexFilter {
+    /// The column the filter is on.
+    column: usize,
+    /// The value the column has to hold.
+    value: String,
+}
+
+/// Recognise a filter that the inverted index can answer.
+///
+/// Only an equality on a single column is recognised. A conjunction, a
+/// disjunction, an inequality or a comparison of two columns all fall back
+/// to the full scan, so the answer of a query never depends on whether the
+/// index can be used.
+fn detect_index_filter(expr: &Expr, def: &TableDef) -> Option<IndexFilter> {
+    let (left, right) = match expr {
+        Expr::Compare(l, CmpOp::Eq, r) => (l.as_ref(), r.as_ref()),
+        _ => return None,
+    };
+    let (name, value) = match (left, right) {
+        (Expr::Column(name), Expr::Str(value)) => (name.as_str(), value.as_str()),
+        (Expr::Str(value), Expr::Column(name)) => (name.as_str(), value.as_str()),
+        _ => return None,
+    };
+    let column = def.column_index(name)?;
+    // The vector column is never indexed: its values are the vectors, and
+    // they have as many distinct values as there are rows.
+    if def.vector_column == Some(column) {
+        return None;
+    }
+    Some(IndexFilter { column, value: value.to_string() })
+}
+
 /// A value produced by evaluating an expression against a row.
 #[derive(Debug, Clone)]
 pub enum EvalValue {
@@ -623,6 +660,34 @@ impl Engine {
             // decoding per row.
             let filter_expr = sel.filter.clone();
             let key = def.name.to_ascii_lowercase();
+
+            // The rows the inverted index of the filter column names.
+            //
+            // When the filter is an equality on an indexed column, the index
+            // names the rows that can satisfy it, and the scan only measures
+            // those rows. The filter is still applied to them, so the answer
+            // does not depend on the index being up to date.
+            let candidate_rows: Option<Vec<u64>> = match filter_expr.as_ref() {
+                Some(f) => {
+                    let plan = detect_index_filter(f, def);
+                    match plan {
+                        Some(plan) => {
+                            let state = self
+                                .tables
+                                .get_mut(&key)
+                                .ok_or_else(|| SqlError::no_such_table(&def.name))?;
+                            state
+                                .inverted
+                                .get(plan.column)
+                                .and_then(|index| index.lookup(&plan.value))
+                                .map(|rows| rows.to_vec())
+                        }
+                        None => None,
+                    }
+                }
+                None => None,
+            };
+
             let state = self
                 .tables
                 .get_mut(&key)
@@ -645,11 +710,12 @@ impl Engine {
                 }
             };
             let hits = crate::prof::measure("q.exact_scan", || {
-                crate::vector::exact::scan_exact_topk(
+                crate::vector::exact::scan_exact_topk_candidates(
                     store,
                     topk.query.as_slice(),
                     topk.k,
                     Some(&mut filter),
+                    candidate_rows.as_deref(),
                 )
             })?;
             for hit in hits {

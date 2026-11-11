@@ -410,6 +410,10 @@ impl Engine {
 
         // Rebuild the primary key index from the recovered directory.
         self.rebuild_pk_index();
+        // Rebuild the inverted indexes from the recovered directory. They are
+        // a filter over the data, not a copy of it, so a rebuild is cheap
+        // compared to the data itself.
+        self.rebuild_inverted_indexes()?;
         self.next_table_id = self
             .tables
             .values()
@@ -488,6 +492,8 @@ impl Engine {
         }
         state.store.append_row(pk, col_offset, stored.len() as u32, block, slot)?;
         self.pk_index.entry(table_id).or_default().insert(pk, row_id);
+        // The recovered row joins the inverted indexes of its table.
+        self.inverted_insert(table_id, row_id, &cols);
         Ok(())
     }
 
@@ -534,6 +540,9 @@ impl Engine {
             },
         )?;
         self.pk_index.entry(table_id).or_default().insert(pk, row_id);
+        // The recovered row moves to the lists of its new values.
+        self.inverted_remove(table_id, row_id);
+        self.inverted_insert(table_id, row_id, &cols);
         Ok(())
     }
 
@@ -548,6 +557,8 @@ impl Engine {
         if let Some(meta) = state.store.read_meta(row_id)? {
             self.pk_index.entry(table_id).or_default().remove(&meta.pk);
         }
+        // The deleted row leaves the inverted indexes.
+        self.inverted_remove(table_id, row_id);
         Ok(())
     }
 
@@ -758,6 +769,8 @@ impl Engine {
         self.pk_index.entry(table_id).or_default().insert(pk, row_id);
         // Keep the vector index in sync with the committed data.
         self.index_insert(table_id, row_id, pk, vec.as_ref().map(|v| v.as_slice()));
+        // Keep the inverted indexes in sync with the committed data.
+        self.inverted_insert(table_id, row_id, &cols);
         Ok(row_id)
     }
 
@@ -806,6 +819,10 @@ impl Engine {
         // replaced rather than updated in place.
         self.index_remove(table_id, row_id);
         self.index_insert(table_id, row_id, pk, vec.as_ref().map(|v| v.as_slice()));
+        // The values of the row may have changed too, so the row leaves the
+        // lists of its old values and joins the lists of its new ones.
+        self.inverted_remove(table_id, row_id);
+        self.inverted_insert(table_id, row_id, &cols);
         Ok(())
     }
 
@@ -820,6 +837,8 @@ impl Engine {
         }
         // A deleted row must not be visible through the index.
         self.index_remove(table_id, row_id);
+        // The row must not be visible through the inverted indexes either.
+        self.inverted_remove(table_id, row_id);
         Ok(())
     }
 
@@ -845,6 +864,120 @@ impl Engine {
                 index.remove(row_id);
             }
         }
+    }
+
+    // ------------------------------------------------- inverted index upkeep
+
+    /// Record a row in the inverted indexes of its table.
+    ///
+    /// The value of every scalar column of the row is recorded, so that any
+    /// of the columns can answer an equality filter later. A column that
+    /// turns out to have too many distinct values drops out of the index on
+    /// its own, and the queries that would have used it fall back to the
+    /// full scan.
+    fn inverted_insert(&mut self, table_id: u32, row_id: u64, cols: &[ColValue]) {
+        let state = match self.tables.values_mut().find(|t| t.id == table_id) {
+            Some(s) => s,
+            None => return,
+        };
+        let vector_index = state.def.vector_column;
+        for (idx, value) in cols.iter().enumerate() {
+            if Some(idx) == vector_index {
+                continue;
+            }
+            let key = match value {
+                ColValue::Text(s) => s.clone(),
+                ColValue::BigInt(i) => i.to_string(),
+                // The vector column is skipped, so this is unreachable.
+                ColValue::Vector(_) => continue,
+            };
+            state.inverted.insert(idx, row_id, &key);
+        }
+    }
+
+    /// Forget a row in the inverted indexes of its table.
+    fn inverted_remove(&mut self, table_id: u32, row_id: u64) {
+        let state = match self.tables.values_mut().find(|t| t.id == table_id) {
+            Some(s) => s,
+            None => return,
+        };
+        let count = state.inverted.len();
+        for column in 0..count {
+            state.inverted.remove(column, row_id);
+        }
+    }
+
+    /// Rebuild the inverted indexes of every table.
+    ///
+    /// The indexes are not persisted: they are rebuilt from the data at
+    /// startup, in one pass over the blocks of the table, which happens
+    /// before the server reports readiness.
+    fn rebuild_inverted_indexes(&mut self) -> SqlResult<()> {
+        let table_ids: Vec<u32> = self.tables.values().map(|t| t.id).collect();
+        for table_id in table_ids {
+            let (pk_index, vector_index) = {
+                let state = match self.tables.values().find(|t| t.id == table_id) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                (state.def.pk_index, state.def.vector_column)
+            };
+            let mut indexes = crate::vector::inverted::ColumnIndexes::new();
+            {
+                let state = match self.tables.values_mut().find(|t| t.id == table_id) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let count = state.store.row_count;
+                // The rows are read block by block, so the build costs one
+                // read per block instead of one read per row.
+                for block in 0..state.store.blocks {
+                    let metas = match state.store.read_meta_block(block as u32) {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+                    if metas.is_empty() {
+                        break;
+                    }
+                    let scalars = match state.store.read_scalar_block(block as u32, &metas) {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    for (slot, meta) in metas.iter().enumerate() {
+                        if meta.alive == 0 {
+                            continue;
+                        }
+                        let row_id = block * state.store.block_rows as u64 + slot as u64;
+                        // The values of the row are the ones of its slot in
+                        // the block. The vector column is not among them, so
+                        // it is never indexed.
+                        let values = match scalars.get(slot) {
+                            Some(v) => v,
+                            None => continue,
+                        };
+                        for (idx, value) in values.iter().enumerate() {
+                            let value = match value {
+                                Some(v) => v,
+                                None => continue,
+                            };
+                            if Some(idx) == vector_index {
+                                continue;
+                            }
+                            let key = match value {
+                                ColValue::Text(s) => s.clone(),
+                                ColValue::BigInt(i) => i.to_string(),
+                                ColValue::Vector(_) => continue,
+                            };
+                            indexes.insert(idx, row_id, &key);
+                        }
+                    }
+                }
+            }
+            if let Some(state) = self.tables.values_mut().find(|t| t.id == table_id) {
+                state.inverted = indexes;
+            }
+        }
+        Ok(())
     }
 
     /// Rebuild the vector files of every table whose vector file is stale.
@@ -1451,5 +1584,137 @@ mod tests {
         assert_eq!(answer.rows.len(), 1, "the row did not survive the restart");
         let answer = run(&mut engine, "SELECT id FROM t WHERE id = 1").unwrap();
         assert_eq!(answer.rows.len(), 1, "the row before the checkpoint is gone");
+    }
+
+    // ------------------------------------------------------- inverted index
+
+    /// The rows of a search, as the primary keys the answer holds.
+    fn search_ids(engine: &mut Engine, sql: &str) -> Vec<i64> {
+        let out = run(engine, sql).unwrap();
+        out.rows
+            .iter()
+            .map(|row| match &row[0] {
+                Cell::Int(i) => *i,
+                other => panic!("the answer holds a {other:?}"),
+            })
+            .collect()
+    }
+
+    /// A table of eight categories and twenty rows.
+    fn categories_table(engine: &mut Engine) {
+        run(
+            engine,
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, cat VARCHAR(8), v VECTOR(2))",
+        )
+        .unwrap();
+        for i in 1..=20i64 {
+            let cat = format!("c{}", i % 4);
+            // The vector is the row number, so the answer is predictable.
+            run(
+                engine,
+                &format!("INSERT INTO t VALUES ({i}, '{cat}', '[{i}.0,0.0]')"),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn the_inverted_index_does_not_change_the_answer() {
+        let dir = TempDir::new("inverted-answer");
+        let mut engine = engine_in(&dir);
+        categories_table(&mut engine);
+
+        // The same search with and without a filter that the index answers.
+        for cat in ["c0", "c1", "c2", "c3"] {
+            let filtered = search_ids(
+                &mut engine,
+                &format!(
+                    "SELECT id FROM t WHERE cat = '{cat}' \
+                     ORDER BY L2_DISTANCE(v, '[0.0,0.0]') LIMIT 3"
+                ),
+            );
+            let expected: Vec<i64> = (1..=20i64)
+                .filter(|i| i % 4 == cat[1..].parse::<i64>().unwrap())
+                .take(3)
+                .collect();
+            assert_eq!(filtered, expected, "the filter on {cat} is wrong");
+        }
+    }
+
+    #[test]
+    fn an_updated_row_leaves_the_list_of_its_old_value() {
+        let dir = TempDir::new("inverted-update");
+        let mut engine = engine_in(&dir);
+        categories_table(&mut engine);
+
+        // The row 4 moves from c0 to c1.
+        run(&mut engine, "UPDATE t SET cat = 'c1' WHERE id = 4").unwrap();
+
+        let in_c0 = search_ids(
+            &mut engine,
+            "SELECT id FROM t WHERE cat = 'c0' ORDER BY L2_DISTANCE(v, '[0.0,0.0]') LIMIT 10",
+        );
+        assert!(!in_c0.contains(&4), "the row stayed in the list of its old value");
+        let in_c1 = search_ids(
+            &mut engine,
+            "SELECT id FROM t WHERE cat = 'c1' ORDER BY L2_DISTANCE(v, '[0.0,0.0]') LIMIT 10",
+        );
+        assert!(in_c1.contains(&4), "the row did not join the list of its new value");
+    }
+
+    #[test]
+    fn a_deleted_row_leaves_the_lists() {
+        let dir = TempDir::new("inverted-delete");
+        let mut engine = engine_in(&dir);
+        categories_table(&mut engine);
+
+        run(&mut engine, "DELETE FROM t WHERE id = 4").unwrap();
+
+        let in_c0 = search_ids(
+            &mut engine,
+            "SELECT id FROM t WHERE cat = 'c0' ORDER BY L2_DISTANCE(v, '[0.0,0.0]') LIMIT 10",
+        );
+        assert!(!in_c0.contains(&4), "the deleted row stayed in the list");
+        let in_c1 = search_ids(
+            &mut engine,
+            "SELECT id FROM t WHERE cat = 'c1' ORDER BY L2_DISTANCE(v, '[0.0,0.0]') LIMIT 10",
+        );
+        assert!(!in_c1.contains(&4), "the deleted row stayed in the list");
+    }
+
+    #[test]
+    fn the_inverted_index_survives_a_restart() {
+        let dir = TempDir::new("inverted-restart");
+        let mut engine = engine_in(&dir);
+        categories_table(&mut engine);
+        let before = search_ids(
+            &mut engine,
+            "SELECT id FROM t WHERE cat = 'c2' ORDER BY L2_DISTANCE(v, '[0.0,0.0]') LIMIT 5",
+        );
+        engine.shutdown().unwrap();
+
+        let mut engine = engine_in(&dir);
+        let after = search_ids(
+            &mut engine,
+            "SELECT id FROM t WHERE cat = 'c2' ORDER BY L2_DISTANCE(v, '[0.0,0.0]') LIMIT 5",
+        );
+        assert_eq!(before, after, "the answer changed after the restart");
+    }
+
+    #[test]
+    fn a_rolled_back_change_does_not_move_a_row() {
+        let dir = TempDir::new("inverted-rollback");
+        let mut engine = engine_in(&dir);
+        categories_table(&mut engine);
+
+        run(&mut engine, "BEGIN;").unwrap();
+        run(&mut engine, "UPDATE t SET cat = 'c1' WHERE id = 4").unwrap();
+        run(&mut engine, "ROLLBACK;").unwrap();
+
+        let in_c0 = search_ids(
+            &mut engine,
+            "SELECT id FROM t WHERE cat = 'c0' ORDER BY L2_DISTANCE(v, '[0.0,0.0]') LIMIT 10",
+        );
+        assert!(in_c0.contains(&4), "the rolled back change moved the row");
     }
 }
