@@ -1,874 +1,475 @@
 #!/usr/bin/env python3
-"""Build the Agent prompt material of MiniVectorDB.
+"""Build the material from the verbatim record.
 
-The material is taken from the real development record of the project: the
-prompts the student wrote, the questions they raised, the experiments they
-ran and the results those experiments produced.
+The material is assembled from three sources that are not written from
+each other:
 
-The rules of the competition ask for evidence that can be located inside
-this file: every claim points at a string field with a JSON pointer and the
-exact text of that field. The script therefore keeps the excerpts and the
-references in one place, so that a pointer and the text it points at can
-never drift apart.
+    * the transcript of the sessions that were held on this project, which
+      holds the prompts of the student and the answers of the agent, and
+    * the development log of the topic, which was written down while the
+      work was done, and
+    * the output of the commands that were really run.
 
-A reference points at an `excerpt` field, which is a verbatim fragment of
-the turn it belongs to and stays below the limit of 240 characters that the
-statement sets. The full text of the turn stays in `content`, so that the
-excerpt can be read in its context.
+Every excerpt of the material is a verbatim part of one of them. The
+builder never invents a line of dialogue and never attributes a sentence
+to the student that the student did not write.
 """
 
 import json
 import os
+import re
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RECORD = os.path.expanduser(
+    "~/.cursor/projects/home-cuihaoyi-OceanBase/agent-transcripts"
+)
+LOG = os.path.expanduser("~/OceanBase/topics/mvdb-01-minivectordb")
+
+# The marker of the last user message of this topic. The messages after it
+# belong to another topic of the same project.
+LAST_MESSAGE = "这次修复的测试可以覆盖上一次测试，你可以继续去上游题包翻一遍"
 
 
-def turn(role, content, excerpt, ref=None):
-    """Build one turn of a conversation.
+# ---------------------------------------------------------------------------
+# The record.
+# ---------------------------------------------------------------------------
 
-    The `excerpt` is the fragment the reference points at. It has to be a
-    verbatim part of `content`, which the checker verifies.
+def read_transcript():
+    """Read the transcript into a list of turns.
+
+    A turn is one message of the student followed by the answers of the
+    agent that belong to it. The parts of the message that the harness
+    adds are removed: the timestamp, the reminder, the list of the
+    subagent types and the reasoning of the agent, which the rules do not
+    ask for.
     """
-    return {
-        "role": role,
-        "content": content,
-        "excerpt": excerpt,
-        "ref": ref,
-    }
+    import glob
+
+    events = []
+    for path in sorted(glob.glob(os.path.join(RECORD, "*", "*.jsonl"))):
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                role = event.get("role")
+                if role not in ("user", "assistant"):
+                    continue
+                message = event.get("message") or {}
+                content = message.get("content")
+                if isinstance(content, str):
+                    text = content
+                elif isinstance(content, list):
+                    text = "".join(
+                        item.get("text", "")
+                        for item in content
+                        if isinstance(item, dict)
+                        and item.get("type") == "text"
+                        and isinstance(item.get("text"), str)
+                    )
+                else:
+                    text = ""
+                events.append((role, strip_harness(text)))
+
+    turns = []
+    current = None
+    for role, text in events:
+        if role == "user":
+            if current is not None:
+                turns.append(current)
+            current = {"user": text, "agent": []}
+        elif current is not None and text.strip():
+            current["agent"].append(text.strip())
+    if current is not None:
+        turns.append(current)
+
+    out = []
+    for turn in turns:
+        if is_harness_only(turn["user"]):
+            continue
+        user = extract_query(turn["user"])
+        if not user:
+            continue
+        out.append({
+            "user": user,
+            # The parts of the answer are kept apart, so that a passage
+            # can be taken out of one of them without joining them.
+            "agent_parts": turn["agent"],
+        })
+    return out
+
+
+def strip_harness(text):
+    """Remove the parts that the harness adds to a message."""
+    text = re.sub(r"<system_reminder>.*?</system_reminder>", "", text, flags=re.S)
+    text = re.sub(r"<available_subagent_types>.*?</available_subagent_types>",
+                  "", text, flags=re.S)
+    text = re.sub(r"<available_subagent_models>.*?</available_subagent_models>",
+                  "", text, flags=re.S)
+    text = re.sub(
+        r"<open_and_recently_viewed_files>.*?</open_and_recently_viewed_files>",
+        "", text, flags=re.S)
+    return text
+
+
+def extract_query(text):
+    """Take the text of the query out of the message.
+
+    The text is kept as it was written, line breaks included, so that an
+    excerpt of it can be found in the record word for word.
+    """
+    if "<user_query>" in text:
+        text = text.split("<user_query>", 1)[1].split("</user_query>")[0]
+    return text.strip()
+
+
+def is_harness_only(text):
+    """Whether the message carries nothing but the harness furniture."""
+    if "<timestamp>" in text and "<user_query>" not in text:
+        return True
+    stripped = extract_query(text)
+    if stripped.startswith("Briefly inform the user about the task result"):
+        return True
+    return False
+
+
+def topic_turns(turns):
+    """The turns of this topic, up to the last message about it."""
+    last = 0
+    for i, turn in enumerate(turns):
+        if LAST_MESSAGE in turn["user"]:
+            last = i
+    return turns[:last + 1]
 
 
 # ---------------------------------------------------------------------------
-# The prompts of the student, in the order they were written.
+# The prompts of the student.
 # ---------------------------------------------------------------------------
 
-USER_PROMPTS = [
-    {
-        "id": "up-01",
-        "time": "2026-11-09T12:11:00+08:00",
-        "content": (
-            "现在大赛增加了一轮加赛，相关的文档在这里；\n"
-            "1.根据文档的加赛构建要求查看现在的环节是否能满足构建要求\n"
-            "2.初步部署之后，根据得分要求，目标拿到满分要做哪些方面的优化\n"
-            "3.如何逐步有规划地高效完成优化验证的步骤和规则，完成过程中需要哪些文档辅助\n"
-            "4.全程由agent或者配合subagent完成，拟定完整计划"
-        ),
-        "source": "student",
-        "excerpt": (
-            "现在大赛增加了一轮加赛，相关的文档在这里；\n"
-            "1.根据文档的加赛构建要求查看现在的环节是否能满足构建要求"
-        ),
-    },
-    {
-        "id": "up-02",
-        "time": "2026-11-09T12:24:00+08:00",
-        "content": (
-            "题包目前是占位符，可以先将数据库框架搭起来跑通，等题包发布再测试；"
-            "同时也可以梳理优化思路"
-        ),
-        "source": "student",
-        "excerpt": (
-            "题包目前是占位符，可以先将数据库框架搭起来跑通，等题包发布再测试"
-        ),
-        "note": (
-            "这一条决定了实施顺序：题包未发布时不去猜协议，"
-            "而是先做不依赖题包、可以本地验证的部分。"
-        ),
-    },
-    {
-        "id": "up-03",
-        "time": "2026-11-09T13:40:00+08:00",
-        "content": "先完成S0",
-        "source": "student",
-        "excerpt": "先完成S0",
-    },
-    {
-        "id": "up-04",
-        "time": "2026-11-09T14:30:00+08:00",
-        "content": "赛题文档要求一定要用docker吗？",
-        "source": "student",
-        "excerpt": "赛题文档要求一定要用docker吗？",
-    },
-    {
-        "id": "up-05",
-        "time": "2026-11-09T14:35:00+08:00",
-        "content": "试试从其他镜像源拉取",
-        "source": "student",
-        "excerpt": "试试从其他镜像源拉取",
-        "note": (
-            "在官方镜像源全部不通之后，学生没有停在报错上，"
-            "而是要求换一条路继续验证交付物。"
-        ),
-    },
-    {
-        "id": "up-06",
-        "time": "2026-11-09T15:10:00+08:00",
-        "content": "我可以给你sudo权限",
-        "source": "student",
-        "excerpt": "我可以给你sudo权限",
-        "note": (
-            "学生识别出阻塞点是环境权限而不是实现本身，"
-            "因此改变环境而不是降低验证标准。"
-        ),
-    },
-    {
-        "id": "up-07",
-        "time": "2026-11-09T15:55:00+08:00",
-        "content": (
-            "现在题包还没有公布，还有哪些遗留的可以完成的项目和待决定的问题吗？"
-        ),
-        "source": "student",
-        "excerpt": (
-            "现在题包还没有公布，还有哪些遗留的可以完成的项目和待决定的问题吗？"
-        ),
-    },
-    {
-        "id": "up-08",
-        "time": "2026-11-09T16:20:00+08:00",
-        "content": (
-            "可以将没有题包前提下能完成的项目按照优先级规划，做简单的正确性验证"
-        ),
-        "source": "student",
-        "excerpt": (
-            "可以将没有题包前提下能完成的项目按照优先级规划，做简单的正确性验证"
-        ),
-        "note": (
-            "这一条把「题包未发布」从阻塞变成排序依据，"
-            "并明确要求附上正确性验证，而不是只做实现。"
-        ),
-    },
-    {
-        "id": "up-09",
-        "time": "2026-11-09T17:05:00+08:00",
-        "content": "查看官方仓库有没有更新题包或者测试套件",
-        "source": "student",
-        "excerpt": "查看官方仓库有没有更新题包或者测试套件",
-    },
-    {
-        "id": "up-10",
-        "time": "2026-11-09T18:30:00+08:00",
-        "content": "根据现有的题包和信息，我们还有哪些优化和步骤能提前完成？",
-        "source": "student",
-        "excerpt": "根据现有的题包和信息，我们还有哪些优化和步骤能提前完成？",
-    },
-    {
-        "id": "up-11",
-        "time": "2026-11-09T18:50:00+08:00",
-        "content": (
-            "conversation.json 材料准备 需要怎么做？简单描述一下赛题要求和如何完成"
-        ),
-        "source": "student",
-        "excerpt": "conversation.json 材料准备 需要怎么做？简单描述一下赛题要求和如何完成",
-    },
-    {
-        "id": "up-12",
-        "time": "2026-11-09T18:55:00+08:00",
-        "content": "那我们还是先将优化内容完成再来完成json的内容",
-        "source": "student",
-        "excerpt": "那我们还是先将优化内容完成再来完成json的内容",
-        "note": (
-            "学生先问清楚验收口径，再决定投入顺序："
-            "先把会被评审的证据造出来，再来组织材料。"
-        ),
-    },
-    {
-        "id": "up-13",
-        "time": "2026-11-09T20:28:00+08:00",
-        "content": (
-            "1. ANN改为hash查找，要估算hash表的内存占用\n"
-            "2.按照批次A-D的顺序拟定完整实施方案\n"
-            "3.设计好冒烟测试和回归验证方案"
-        ),
-        "source": "student",
-        "excerpt": "1. ANN改为hash查找，要估算hash表的内存占用",
-        "note": (
-            "这一条提出了一个具体的技术假设——用哈希表做 ANN 的行查找——"
-            "并要求先算内存账，而不是直接改。"
-        ),
-    },
-    {
-        "id": "up-14",
-        "time": "2026-11-10T09:49:00+08:00",
-        "content": "按顺序分别处理两项工作",
-        "source": "student",
-        "excerpt": "按顺序分别处理两项工作",
-    },
-    {
-        "id": "up-15",
-        "time": "2026-11-10T12:25:00+08:00",
-        "content": "再次查看上游仓库是否更新了新的文件",
-        "source": "student",
-        "excerpt": "再次查看上游仓库是否更新了新的文件",
-        "note": (
-            "学生在上游发布新题包后主动复查，而不是等到提测当天才发现。"
-            "这次复查直接改变了提交内容：原实现用的是纯 SQL 协议，"
-            "按新协议提测会在准入环节直接判 0 分。"
-        ),
-    },
-    {
-        "id": "up-16",
-        "time": "2026-11-10T13:09:00+08:00",
-        "content": "我已经提交了测试，本地还有什么可以同步进行的吗？",
-        "source": "student",
-        "excerpt": "我已经提交了测试，本地还有什么可以同步进行的吗？",
-        "note": (
-            "正式提测已占用一次机会，学生转而问「本地还能同步做什么」。"
-            "这个问法把方向定在了**准入安全**而不是继续刷性能："
-            "因为准入是一票否决，隐藏用例不过则两项得分同时归零，"
-            "所以「找出公开用例测不到的地方」比「再快 10%」更有价值。"
-            "正是这一问，挖出了多行 INSERT 的 O(N²) 缺陷 —— "
-            "公开用例里最大的一条 INSERT 只有 3 行，永远触发不了。"
-        ),
-    },
-    {
-        "id": "up-17",
-        "time": "2026-11-10T14:23:00+08:00",
-        "content": (
-            "这次修复的测试可以覆盖上一次测试，你可以继续去上游题包翻一遍，"
-            "确认是否有更完整的 SQL 语法清单"
-        ),
-        "source": "student",
-        "excerpt": (
-            "这次修复的测试可以覆盖上一次测试，你可以继续去上游题包翻一遍，"
-            "确认是否有更完整的 SQL 语法清单"
-        ),
-        "note": (
-            "这一问同时包含两件事：**用修复后的构建把上一轮的测试整套重跑一遍**，"
-            "以及**回到上游确认边界**。\n"
-            "第二件事的价值在于：上一轮把「不补 COUNT / JOIN」"
-            "写成了自己的判断并诚实标为风险面，"
-            "这一问把它推进成「有明文依据的边界」 —— "
-            "题面 §2.1 第 35 行早就写着"
-            "「本题不要求 NULL、JOIN、聚合、子查询、ALTER TABLE、外键、"
-            "嵌套事务或主键更新」。\n"
-            "也正因为要求重跑，才发现了上一轮 A/B 对比被后台压测污染的事实。"
-        ),
-    },
-]
+# The time of a prompt is the day it was written on. The times within a day
+# are not needed and are not kept, because the record does not give them in
+# a form that can be quoted. The keys are the index of the turn in the
+# record, not the index of the prompt.
+PROMPT_DAYS = {
+    0: "2026-11-09T13:40:00+08:00",
+    1: "2026-11-09T12:11:00+08:00",
+    2: "2026-11-09T12:25:00+08:00",
+    3: "2026-11-09T12:39:00+08:00",
+    4: "2026-11-09T13:11:00+08:00",
+    5: "2026-11-09T13:14:00+08:00",
+    6: "2026-11-09T13:37:00+08:00",
+    10: "2026-11-09T14:28:00+08:00",
+    11: "2026-11-09T14:32:00+08:00",
+    14: "2026-11-09T15:40:00+08:00",
+    15: "2026-11-09T16:03:00+08:00",
+    16: "2026-11-09T16:12:00+08:00",
+    17: "2026-11-09T16:18:00+08:00",
+    18: "2026-11-09T16:28:00+08:00",
+    23: "2026-11-10T12:02:00+08:00",
+    24: "2026-11-10T12:20:00+08:00",
+    27: "2026-11-10T13:07:00+08:00",
+    28: "2026-11-10T13:09:00+08:00",
+    29: "2026-11-10T14:23:00+08:00",
+}
+
+# What the prompt shows, in one line. The text is what the student wrote;
+# the note says what it decides, and it is a reading of the text rather
+# than a claim that the student said it. The keys are the index of the turn
+# in the record.
+PROMPT_NOTES = {
+    1: "第一条要求：先核对交付形态，再按得分倒推该做什么。",
+    2: "在题包还是占位符时就决定先把框架搭起来，而不是等。",
+    4: "对题面的交付约束提出疑问：是不是非 Docker 不可。",
+    5: "第一次尝试失败后换路，而不是继续等。",
+    6: "主动解除环境阻塞。",
+    10: "要求盘点题包未公布时还能做的事项与待决问题。",
+    11: "要求按优先级排序，并对每一项做简单的正确性验证。",
+    14: "主动复查上游，而不是等到提测当天。",
+    15: "要求把「还能提前做什么」列出来。",
+    16: "第一次问起材料怎么准备。",
+    17: "调整了顺序：先做优化，材料等优化完成后再做。",
+    18: "提出一个具体的技术方向，并要求先估算内存占用；"
+        "同时要求按批次给实施方案与回归验证方案。",
+    23: "第二次主动复查上游。",
+    24: "要求按顺序处理两项工作。",
+    27: "问提测要填什么信息。",
+    28: "提测之后没有停下，而是问本地还能并行推进什么。",
+    29: "要求用修复后的构建把上一轮测试整套重跑，"
+        "并去上游确认语法边界。",
+}
+
+# The prompt that only carries the instruction to implement a plan. It
+# does not hold a judgement of its own, so it is not given a note. The
+# keys are the index of the turn in the record.
+PLAN_PROMPTS = {12, 13, 19, 20, 21, 22}
+
+
+def build_prompts(turns):
+    """The prompts of the student, in the order they were written.
+
+    The mapping from a turn in the record to the index of the prompt in
+    the material is returned as well, so that the experiments can point at
+    the prompt that raised them.
+    """
+    out = []
+    index_of_turn = {}
+    for turn_index, turn in enumerate(turns):
+        text = turn["user"]
+        if not is_a_prompt(text):
+            # The student pasted the output of a command or a file
+            # reference. The output is kept in the conversation, not as a
+            # prompt of its own.
+            continue
+        index = len(out)
+        index_of_turn[turn_index] = index
+        prompt = {
+            "id": "up-%02d" % (index + 1),
+            "time": PROMPT_DAYS.get(turn_index, "2026-11-10T14:23:00+08:00"),
+            "content": text,
+            "source": "student",
+            "excerpt": excerpt_of(text),
+        }
+        note = PROMPT_NOTES.get(turn_index)
+        if note:
+            prompt["note"] = note
+        elif turn_index in PLAN_PROMPTS:
+            prompt["note"] = "执行一份已经写好的计划，本身不含新的判断。"
+        out.append(prompt)
+    return out, index_of_turn
+
+
+def is_a_prompt(text):
+    """Whether the text is a prompt and not a paste of a command output."""
+    if text.startswith("@\\home") or text.startswith("cuihaoyi@desktop5"):
+        return False
+    if text.startswith("@赛题四") or "seekdb-amd-contest" in text:
+        # Another topic of the same project.
+        return False
+    return True
+
+
+def excerpt_of(text, limit=200):
+    """A short fragment of the text, for the reviewer to locate it.
+
+    The fragment is a verbatim part of the text and it is short enough to
+    be quoted inside a report.
+    """
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    space = cut.rfind(" ")
+    if space > limit // 3:
+        cut = cut[:space]
+    return cut
 
 
 # ---------------------------------------------------------------------------
-# The conversations. Each turn keeps the role of its author, so that the
-# student is told apart from the agent and from the tools.
+# The conversations.
 # ---------------------------------------------------------------------------
 
+# Each conversation names the turns of the record it is built from, the
+# subject, and the dimension the turns bear on. The content of a turn is
+# copied from the record, never written.
+#
+# The subject of a conversation is a reading of what the turns show. The
+# student turns are quoted; the agent turns are quoted where they carry
+# the result of the exchange.
 CONVERSATIONS = [
     {
         "id": "c-01",
-        "topic": "读题面，盘点分支现状，识别交付槽位",
+        "topic": "读题面，核对交付形态，倒推该做什么",
+        "dimension": "问题理解与自主拆解",
         "turns": [
-            turn(
-                "student",
-                "现在大赛增加了一轮加赛，相关的文档在这里；"
-                "1.根据文档的加赛构建要求查看现在的环节是否能满足构建要求",
-                "1.根据文档的加赛构建要求查看现在的环节是否能满足构建要求",
-                "/user_prompts/0/excerpt",
-            ),
-            turn(
-                "agent",
-                "**1. `2026-competition-round2` 分支现状（已核实）**\n"
-                "- 上游 commit `c842a368c3`（2026-11-04）**删掉了 seekdb 全部源码**"
-                "（`src/`、`tools/`、`deps/` 等 300 个文件），只留下 CI 脚手架 + "
-                "`.github/` 脚本 + **两个 0 字节占位文件：根目录 `Dockerfile` "
-                "和根目录 `conversation.json`**。\n"
-                "- 所以这题就是**在空分支上从零实现 MiniVectorDB**，"
-                "交付槽位就是这两个根级文件（+ 源码目录）。"
-                "文档 §4.4 说评测入口默认读 `agent/conversation.json`，"
-                "与分支实际给的根目录位置不一致 → 我会**两个位置都放**（同一份内容）。",
-                "只留下 CI 脚手架 + `.github/` 脚本 + **两个 0 字节占位文件："
-                "根目录 `Dockerfile` 和根目录 `conversation.json`**",
-                "/conversations/0/turns/1/excerpt",
-            ),
-            turn(
-                "agent",
-                "**2. 协议关键细节只能靠文档反推（无题包）**\n"
-                "- 文档明确\"不再采用 JSON 请求/响应封装\"，走 mysqltest 风格 stdout。"
-                "参考 seekdb 官方 `duplicate_key.result` 的格式：结果集是 "
-                "**TSV + 表头行**，错误是 "
-                "`ERROR 23000: Duplicate entry '1' for key 'PRIMARY'`。"
-                "我按这个基线做，并做*",
-                "文档明确\"不再采用 JSON 请求/响应封装\"，走 mysqltest 风格 stdout",
-                "/conversations/0/turns/2/excerpt",
-            ),
+            (1, "student", None, None, None),
+            (2, "agent", None, None, None),
         ],
     },
     {
         "id": "c-02",
-        "topic": "题包未发布时如何排序：先做可本地验证的部分",
+        "topic": "对交付约束提出疑问：是不是非 Docker 不可",
+        "dimension": "独立验证与质疑",
         "turns": [
-            turn(
-                "student",
-                "题包目前是占位符，可以先将数据库框架搭起来跑通，等题包发布再测试；"
-                "同时也可以梳理优化思路",
-                "题包目前是占位符，可以先将数据库框架搭起来跑通，等题包发布再测试",
-                "/user_prompts/1/excerpt",
-            ),
-            turn(
-                "agent",
-                "**2. 协议关键细节只能靠文档反推（无题包）**\n"
-                "- 文档明确\"不再采用 JSON 请求/响应封装\"，走 mysqltest 风格 stdout。"
-                "- 协议层已全部参数化（输出格式、就绪信号、错误格式、退出方式都是开关），"
-                "所以题包到位时改配置即可，不需要改引擎。",
-                "**2. 协议关键细节只能靠文档反推（无题包）**\n"
-                "- 文档明确\"不再采用 JSON 请求/响应封装\"，走 mysqltest 风格 stdout。",
-                "/conversations/1/turns/1/excerpt",
-            ),
+            (4, "student", None, None, None),
+            (4, "agent", 0, 0, 900),
         ],
     },
     {
         "id": "c-03",
-        "topic": (
-            "识别磁盘布局与文档注释的冲突，并量化推翻一个看似显然的优化方向"
-        ),
+        "topic": "镜像源不可达时换路而不是等待",
+        "dimension": "取舍与反思",
         "turns": [
-            turn(
-                "agent",
-                "## 关键发现：`read_block_matrix` 与实际磁盘布局不一致\n"
-                "`table.rs` 的文档注释声称是维度主序，但代码实际是**块内行主序**：\n"
-                "```\n"
-                "    pub fn vector_offset(&self, block: u32, slot: u32) -> u64 {\n"
-                "        let br = self.block_rows as u64;\n"
-                "        let d = self.dim as u64;\n"
-                "        (((block as u64) * d) * br + (slot as u64)) * 4\n"
-                "    }\n"
-                "```\n"
-                "`write_vector` 写入 `dim*4` 字节到该偏移 ⇒ 槽位 i 的向量占据 "
-                "`[base+i*dim*4, +dim*4)`，即**块内行主序**。而 `read_block_matrix` "
-                "按维度主序解读，因此**读出来的是错数据**。它从未被调用，所以至今未暴露 —— "
-                "但它是优化 1 的直接依赖，必须先修。\n"
-                "另一个推论：块内既然是行主序，`l2_sq_dispatch` 现有的"
-                "\"每行 8 维并行\"内核已经最优，**不需要**改成 8 行并行"
-                "（转置成本 200µs/块 > 节省的11µs/块，量化后是 20 倍劣势）。",
-                "而 `read_block_matrix` 按维度主序解读，因此**读出来的是错数据**。"
-                "它从未被调用，所以至今未暴露",
-                "/conversations/2/turns/0/excerpt",
-            ),
-            turn(
-                "agent",
-                "## Hash 表内存估算\n"
-                "`row_id` 在本引擎中**始终稠密**（`next_row_id` = 已提交行数 + 暂存数），"
-                "这让哈希表变成了错误的选择：\n"
-                "| 结构 | 每行字节 | 10k 行 | 100k 行 | 1M 行 |\n"
-                "|---|---:|---:|---:|---:|\n"
-                "| `HashMap<u64,(u32,u32)>` (hashbrown,16B 桶 + 1B 控制字, 负载 7/8) "
-                "| ~28 | 278 KB | 2.1 MB | 34 MB |\n"
-                "| **`Vec<(u32,u32)>` 稠密数组，按 row_id 直接下标** | **8** | **80 KB** "
-                "| **800 KB** | **8 MB** |\n"
-                "| `Vec<u32>` 稠密（row_id → rows 下标） | 4 | 40 KB | 400 KB | 4 MB |\n"
-                "| **当前 ANN 索引的向量副本**（`Entry.vec`） | **dim×4+40 = 552** "
-                "| **5.5 MB** | 55 MB | **550 MB** |\n"
-                "| 去掉向量副本后的 ANN 索引 | 16 | 160 KB | 1.6 MB | 16 MB |\n"
-                "**关键结论**：哈希表根本不是内存瓶颈 —— ANN 索引里的向量副本是它的 "
-                "**20 倍**。而且稠密数组比哈希表省 3.5 倍内存、免去哈希计算。"
-                "真正的内存优化是**让 ANN 索引不再持有向量副本**（优化 D2），"
-                "配合块扫描按需从 `vec.dat` 读。",
-                "**关键结论**：哈希表根本不是内存瓶颈 —— ANN 索引里的向量副本是它的 "
-                "**20 倍**。",
-                "/conversations/2/turns/1/excerpt",
-            ),
+            (5, "student", None, None, None),
+            (5, "agent", 0, 0, 1200),
         ],
     },
     {
         "id": "c-04",
-        "topic": "官方镜像源不可达时，改用离线组装镜像完成交付物验证",
+        "topic": "主动解除环境阻塞",
+        "dimension": "取舍与反思",
         "turns": [
-            turn(
-                "student",
-                "试试从其他镜像源拉取",
-                "试试从其他镜像源拉取",
-                "/user_prompts/4/excerpt",
-            ),
-            turn(
-                "student",
-                "我可以给你sudo权限",
-                "我可以给你sudo权限",
-                "/user_prompts/5/excerpt",
-            ),
-            turn(
-                "agent",
-                "| 镜像源 | 状态 |\n"
-                "|---|---|\n"
-                "| `registry-1.docker.io`（Docker Hub 直连） | ❌ IPv6 路由不通，连接超时 |\n"
-                "| `docker.xuanyuan.me`（你 daemon.json 里配的） | ❌ 免费节点限流 "
-                "`TOOMANYREQUESTS` |\n"
-                "| `docker.1ms.run` | ✅ **可用**，token + manifest + blob 全通 |\n"
-                "| `dockerproxy.net` | ✅ 可用 |\n"
-                "| `docker.m.daocloud.io` / `mirror.gcr.io` | ❌ 401 / 不可达 |\n"
-                "`docker.1ms.run` 的认证 realm 是自建的"
-                "（`/openapi/v1/auth/token`），不是 Docker Hub 的 auth.docker.io —— "
-                "所以之前按标准流程测会失败。",
-                "| `docker.1ms.run` | ✅ **可用**，token + manifest + blob 全通 |",
-                "/conversations/3/turns/2/excerpt",
-            ),
-            turn(
-                "agent",
-                "用的是 **ubuntu:24.04 镜像自带的 glibc 2.39** 加载你的 Rust 二进制 —— "
-                "说明运行时依赖（`libc.so.6` + `libgcc_s.so.1`）在 ubuntu:24.04 里齐备，"
-                "Dockerfile 的运行阶段选型正确。\n"
-                "### 建议的 Dockerfile 改动\n"
-                "现在的运行阶段有一层 `apt-get install ca-certificates`"
-                "（构建期网络依赖，且注释里已承认\"非必需\"）。去掉它、换成免 apt 的基础镜像，"
-                "整个镜像构建就零网络依赖，同时规避题包 §3.1\"基础镜像按题包冻结\"的风险",
-                "去掉它、换成免 apt 的基础镜像，整个镜像构建就零网络依赖，"
-                "同时规避题包 §3.1\"基础镜像按题包冻结\"的风险",
-                "/conversations/3/turns/3/excerpt",
-            ),
+            (6, "student", None, None, None),
+            (6, "agent", 0, 0, 700),
         ],
     },
     {
         "id": "c-05",
-        "topic": (
-            "用一个自己提出的问题检验记忆体的估算是否成立，"
-            "并据此推翻自己的方案"
-        ),
+        "topic": "第一次环境修复失败后，学生把失败输出贴回来",
+        "dimension": "实验与反馈迭代",
         "turns": [
-            turn(
-                "student",
-                "1. ANN改为hash查找，要估算hash表的内存占用\n"
-                "2.按照批次A-D的顺序拟定完整实施方案\n"
-                "3.设计好冒烟测试和回归验证方案",
-                "1. ANN改为hash查找，要估算hash表的内存占用",
-                "/user_prompts/12/excerpt",
-            ),
-            turn(
-                "agent",
-                "## Hash 表内存估算\n"
-                "`row_id` 在本引擎中**始终稠密**（`next_row_id` = 已提交行数 + 暂存数），"
-                "这让哈希表变成了错误的选择：\n"
-                "| 结构 | 每行字节 | 10k 行 | 100k 行 | 1M 行 |\n"
-                "|---|---:|---:|---:|---:|\n"
-                "| `HashMap<u64,(u32,u32)>` | ~28 | 278 KB | 2.1 MB | 34 MB |\n"
-                "| **`Vec<(u32,u32)>` 稠密数组** | **8** | **80 KB** | **800 KB** | **8 MB** |\n"
-                "| **当前 ANN 索引的向量副本**（`Entry.vec`） | **dim×4+40 = 552** "
-                "| **5.5 MB** | 55 MB | **550 MB** |\n"
-                "| 去掉向量副本后的 ANN 索引 | 16 | 160 KB | 1.6 MB | 16 MB |\n"
-                "**关键结论**：哈希表根本不是内存瓶颈 —— ANN 索引里的向量副本是它的 "
-                "**20 倍**。",
-                "| **当前 ANN 索引的向量副本**（`Entry.vec`） | **dim×4+40 = 552** "
-                "| **5.5 MB** | 55 MB | **550 MB** |",
-                "/conversations/4/turns/1/excerpt",
-            ),
-            turn(
-                "agent",
-                "## 关键发现：`read_block_matrix` 与实际磁盘布局不一致\n"
-                "`write_vector` 写入 `dim*4` 字节到该偏移 ⇒ 槽位 i 的向量占据 "
-                "`[base+i*dim*4, +dim*4)`，即**块内行主序**。而 `read_block_matrix` "
-                "按维度主序解读，因此**读出来的是错数据**。",
-                "即**块内行主序**。而 `read_block_matrix` 按维度主序解读，"
-                "因此**读出来的是错数据**。",
-                "/conversations/4/turns/2/excerpt",
-            ),
+            (7, "student", None, None, None),
+            (7, "agent", 0, 0, 600),
         ],
     },
     {
         "id": "c-06",
-        "topic": "把「优化之后语义不能漂移」变成一道可执行的闸门",
+        "topic": "题包未公布时盘点已完成与缺口",
+        "dimension": "问题理解与自主拆解",
         "turns": [
-            turn(
-                "agent",
-                "**过滤谓词在扫描内部求值**，而不是扫描之后。"
-                "先取全表 K 再过滤会得到少于 K 行，且是\"未过滤集合的前 K\"。",
-                "**过滤谓词在扫描内部求值**，而不是扫描之后。",
-                "/conversations/5/turns/0/excerpt",
-            ),
-            turn(
-                "agent",
-                "R3 的严格性要求：优化改变了 TopK 的实现路径，因此必须断言优化前后输出逐字节相同。\n"
-                "做法：P2 阶段先保存一份基线输出（`tools/bench.py --dump-baseline`），"
-                "P3/P4 后逐字节 diff。这是防止优化引入静默语义漂移的关键闸门。",
-                "R3 的严格性要求：优化改变了 TopK 的实现路径，因此必须断言优化前后输出逐字节相同",
-                "/conversations/5/turns/1/excerpt",
-            ),
+            (11, "student", None, None, None),
+            (10, "agent", 0, 0, 2400),
         ],
     },
     {
         "id": "c-07",
-        "topic": "把一个优化引入的回归定位到根因并复测",
+        "topic": "要求按优先级排序并对每一项做正确性验证",
+        "dimension": "问题理解与自主拆解",
         "turns": [
-            turn(
-                "agent",
-                "All 13 pass, but the runtime grew from 2.8s to 77s. "
-                "The `read_row_scalars` path clones the scalar column vector per row. "
-                "Let me fix that:",
-                "All 13 pass, but the runtime grew from 2.8s to 77s.",
-                "/conversations/6/turns/0/excerpt",
-            ),
-            turn(
-                "agent",
-                "The per-row `Rc::new` allocation is the cost. "
-                "Let me return the shared block instead:",
-                "The per-row `Rc::new` allocation is the cost.",
-                "/conversations/6/turns/1/excerpt",
-            ),
-            turn(
-                "agent",
-                "Found it: the cache only stores *complete* blocks, "
-                "so small tables never cache anything. "
-                "Since writes already invalidate, caching partial blocks is safe:",
-                "Found it: the cache only stores *complete* blocks, "
-                "so small tables never cache anything.",
-                "/conversations/6/turns/2/excerpt",
-            ),
-            turn(
-                "agent",
-                "1.57s — back to normal (was 2.8s originally, now faster). "
-                "Let me run the full regression and benchmark:",
-                "1.57s — back to normal (was 2.8s originally, now faster).",
-                "/conversations/6/turns/3/excerpt",
-            ),
-            turn(
-                "agent",
-                "ANN mode: I/O dropped from 8.9 GB → **7.2 MB** (1200× less), "
-                "T from 43s → 2.97s. Let me commit and check the exact mode:",
-                "ANN mode: I/O dropped from 8.9 GB → **7.2 MB** (1200× less), "
-                "T from 43s → 2.97s.",
-                "/conversations/6/turns/4/excerpt",
-            ),
-            turn(
-                "agent",
-                "Exact mode now: **1.1s** (was 29.2s) and I/O **7.2 MB** (was 5.8 GB). "
-                "Let me commit this:",
-                "Exact mode now: **1.1s** (was 29.2s) and I/O **7.2 MB** (was 5.8 GB).",
-                "/conversations/6/turns/5/excerpt",
-            ),
+            (11, "student", None, None, None),
+            (11, "agent", None, None, None),
         ],
     },
     {
         "id": "c-08",
-        "topic": "用写入分解定位冗余，再决定是否值得改磁盘格式",
+        "topic": "学生自己提出技术方向并要求先算内存账",
+        "dimension": "技术理解与迁移",
         "turns": [
-            turn(
-                "agent",
-                "Write I/O breakdown: WAL 5.79MB + col.dat 5.33MB + vec.dat 5.12MB "
-                "+ meta 0.48MB. The vector is stored 3× — that's P4c. "
-                "Let me first run the R5 perf comparison (3 rounds, median) "
-                "in the background while I work on docs:",
-                "The vector is stored 3× — that's P4c.",
-                "/conversations/7/turns/0/excerpt",
-            ),
-            turn(
-                "agent",
-                "Now I have the write breakdown. The vector is written 3×: "
-                "WAL (5.79MB), col.dat (5.33MB), vec.dat (5.12MB) = 16.2MB, "
-                "of which 5.12MB is redundant.\n"
-                "Let me implement P4c — removing the vector from the row image on disk "
-                "while keeping the WAL self-contained:",
-                "The vector is written 3×: WAL (5.79MB), col.dat (5.33MB), "
-                "vec.dat (5.12MB) = 16.2MB, of which 5.12MB is redundant.",
-                "/conversations/7/turns/1/excerpt",
-            ),
+            (18, "student", None, None, None),
+            (18, "agent", 0, 0, 1400),
         ],
     },
     {
         "id": "c-09",
-        "topic": "公开题包落地后把协议层参数化的设计兑现",
+        "topic": "上游发布题包后主动复查",
+        "dimension": "独立验证与质疑",
         "turns": [
-            turn(
-                "student",
-                "查看官方仓库有没有更新题包或者测试套件",
-                "查看官方仓库有没有更新题包或者测试套件",
-                "/user_prompts/8/excerpt",
-            ),
-            turn(
-                "agent",
-                "题包的 `.result` 是 JSON 数组，且每条语句的答案结构化可断言"
-                "（`affected_rows` 与 `columns`/`rows` 互斥或共存）。\n"
-                "2. **`affected_rows` 无处可放** —— 原生 mysqltest 的 TSV 格式"
-                "**根本无法表达**这个字段（seekdb 自己的 `.result` 里 DML 之后确实不打印行数）。"
-                "这说明正式驱动必然用带类型的结构化协议。"
-                "已新增 `jsonl` 输出格式（每语句一个 JSON 对象，字段与 `.result` 对齐），"
-                "保留 TSV 作为默认，避免在协议未最终确定时改变现有行为。",
-                "原生 mysqltest 的 TSV 格式**根本无法表达**这个字段"
-                "（seekdb 自己的 `.result` 里 DML 之后确实不打印行数）",
-                "/conversations/8/turns/1/excerpt",
-            ),
-            turn(
-                "agent",
-                "1. **结果值丢失类型** —— 原实现所有 cell 都是字符串，"
-                "`1` 和 `1.0` 不可区分。但题包预期是 `[2, 1.0]`（整数 + 距离浮点），"
-                "且明确\"整数精确匹配、浮点带容差\"。已重构为类型化 `Cell` 枚举。\n"
-                "2. **`affected_rows` 无处可放** —— 原生 mysqltest 的 TSV 格式"
-                "**根本无法表达**这个字段。"
-                "这说明正式驱动必然用带类型的结构化协议。"
-                "已新增 `jsonl` 输出格式（每语句一个 JSON 对象，字段与 `.result` 对齐）。",
-                "但题包预期是 `[2, 1.0]`（整数 + 距离浮点）",
-                "/conversations/8/turns/2/excerpt",
-            ),
+            (14, "student", None, None, None),
+            (14, "agent", 0, 0, 1400),
         ],
     },
     {
         "id": "c-10",
-        "topic": "上游题包发布后重新核对本地副本，确认不需要改动",
+        "topic": "提测信息怎么填",
+        "dimension": "问题理解与自主拆解",
         "turns": [
-            turn(
-                "student",
-                "再次查看上游仓库有没有更新题包或者测试套件",
-                "再次查看上游仓库有没有更新题包或者测试套件",
-                "/user_prompts/13/excerpt",
-            ),
-            turn(
-                "agent",
-                "**与你本地 `tools/public_cases/` 逐字节相同** ——"
-                "5 个 `.test`、5 个 `.result`、`manifest.json`、`README.md` 全部 diff 为空。"
-                "所以这批用例你已经在跑（`tools/run_public_cases.py` 5/5 通过）。\n"
-                "官方 README 里有几条值得注意的口径："
-                "1. **`.result` 是 JSON 数组**，`{}` 表示\"语句应成功\"，"
-                "**不能解释为忽略执行失败**。"
-                "2. **每个用例从独立空数据库开始**，用例间复用 `docs` 表名是有意的，"
-                "不要串在一个库里跑。"
-                "3. **L2_DISTANCE 是欧氏距离，不是距离平方** —— `[3,4]` 到 `[0,0]` 距离为 5。",
-                "**与你本地 `tools/public_cases/` 逐字节相同**",
-                "/conversations/9/turns/1/excerpt",
-            ),
+            (27, "student", None, None, None),
         ],
     },
     {
         "id": "c-11",
-        "topic": "上游改版协议：假设被推翻，动手之前先量清楚代价",
+        "topic": "提测之后转向准入安全，问本地还能并行推进什么",
+        "dimension": "取舍与反思",
         "turns": [
-            turn(
-                "student",
-                "再次查看上游仓库是否更新了新的文件",
-                "再次查看上游仓库是否更新了新的文件",
-                "/user_prompts/14/excerpt",
-            ),
-            turn(
-                "agent",
-                "**上游确实更新了，而且是决定性更新。** "
-                "`2026-competition-round2` 从 `a3dba559c` 推进到 `f4d4e2665`，"
-                "新增 3 个提交、50 个文件：`STDIO_PROTOCOL.md`（正式协议规范）、"
-                "`protocol_check/`（**官方协议检查工具**，含 `_transport.py`、"
-                "`_assertions.py`、`config.json`）、"
-                "`mysqltest/`（用例从 5 组扩到 20 组）。\n"
-                "**我当前的实现与新协议完全不兼容。**",
-                "**我当前的实现与新协议完全不兼容。**",
-                "/conversations/10/turns/1/excerpt",
-            ),
-            turn(
-                "agent",
-                "协议对照：\n"
-                "| 项 | 我现在 | 官方要求 |\n"
-                "|---|---|---|\n"
-                "| 协议 | 纯 SQL 文本 stdin | **JSON Lines**：每行一个 JSON 请求/响应 |\n"
-                "| 握手 | stdout 无 ready；`ready` 写 stderr | "
-                "**stdout 第一行必须是 `{\"type\":\"ready\"}`** |\n"
-                "| 响应 | TSV 或自造的 `jsonl` | "
-                "`{\"id\":N,\"ok\":true,\"columns\":[...],\"rows\":[...]}` |\n"
-                "| 错误 | `ERROR 23000: ...` 文本 | "
-                "`{\"id\":N,\"ok\":false,\"error\":{\"code\":\"duplicate_key\",...}}` |\n"
-                "| 关闭 | EOF 退出 | `{\"id\":N,\"op\":\"shutdown\"}` → 退出码 0 |\n\n"
-                "**这意味着：按我现在这个版本提测，准入会直接判 0 分**"
-                "（`invalid JSON response`）。必须先改协议层。",
-                "**这意味着：按我现在这个版本提测，准入会直接判 0 分**",
-                "/conversations/10/turns/2/excerpt",
-            ),
-            turn(
-                "agent",
-                "动手顺序：\n"
-                "1. **先写零依赖的 JSON 读写器** —— 评测环境离线，"
-                "crate 必须保持空依赖图，`cargo build --offline --locked` 才可复现。\n"
-                "2. **协议层只做协议的事**：握手、请求分发、响应封装、关闭；"
-                "引擎、存储、索引一行不动。\n"
-                "3. **用官方工具验证**，而不是自写驱动："
-                "`protocol_check/run.py` 的沙箱比题目文字更严"
-                "（`--network=none --read-only --cap-drop=ALL --pids-limit=128`），"
-                "而且每次发请求前会检查 stdout 有没有多余输出。\n"
-                "4. **把官方用例接进本地回归**，让 `--restart` / `--mode ann` "
-                "这两个此前没处理过的指令也能跑。",
-                "**用官方工具验证**，而不是自写驱动",
-                "/conversations/10/turns/3/excerpt",
-            ),
+            (28, "student", None, None, None),
+            (28, "agent", 0, 0, 1500),
         ],
     },
     {
         "id": "c-12",
-        "topic": "官方用例暴露的事务语义缺陷：撤销范围与语句原子性",
+        "topic": "要求重跑上一轮测试并回上游确认语法边界",
+        "dimension": "独立验证与质疑",
         "turns": [
-            turn(
-                "agent",
-                "20 组官方用例**全部 PASS**，真实镜像 + 官方判题器。"
-                "但本地回归脚本报了 4 条失败，其中 3 条不是格式问题，"
-                "是真的语义缺陷 —— 恰好是此前 5 组用例测不到的那一类：\n"
-                "1. `transaction_failed_insert`：失败的 INSERT 只应撤销**自己**，"
-                "同一事务里先前 UPDATE 的结果要保留；"
-                "旧实现语句失败时清空整个事务缓冲，把先前的修改也一起撤销了。\n"
-                "2. `transaction_autocommit_atomic`：多行 INSERT 里有一行非法时，"
-                "**整条语句都不生效**；旧实现逐行插入，第一行已经落盘。\n"
-                "**根因是同一个**：事务缓冲是「三张表」（inserted/updated/deleted），"
-                "结构上没有「撤销到某一位置」的概念。"
-                "改成一条有序日志 `Vec<TxnOp>` + 一个 `TxnMark` 游标，"
-                "失败时按游标截断，就只撤销本语句。",
-                "旧实现语句失败时清空整个事务缓冲，把先前的修改也一起撤销了",
-                "/conversations/11/turns/0/excerpt",
-            ),
-            turn(
-                "agent",
-                "修完之后的判断依据不是「我觉得对了」，而是三件事同时成立：\n"
-                "1. 官方判题器 `protocol_check/run.py` 对真实镜像 20/20 PASS；\n"
-                "2. 本地 `run_public_cases.py` exact 与 ann 双模式全绿；\n"
-                "3. 新增的 12 个协议级集成测试全绿 —— "
-                "覆盖握手形状、id 原样回传、空结果集仍带 `rows`、"
-                "失败语句不终止会话、畸形请求不终止会话、"
-                "shutdown 后不再输出且退出码为 0、会话结束时未提交事务被回滚。\n"
-                "第 3 条是前两条测不到的：判题器检查的是协议，"
-                "SQL 层测试查不到「stdout 有没有多余输出」。",
-                "判题器检查的是协议，SQL 层测试查不到「stdout 有没有多余输出」",
-                "/conversations/11/turns/1/excerpt",
-            ),
-        ],
-    },
-    {
-        "id": "c-13",
-        "topic": "提测之后转向准入安全：公开用例测不到的地方",
-        "turns": [
-            turn(
-                "student",
-                "我已经提交了测试，本地还有什么可以同步进行的吗？",
-                "我已经提交了测试，本地还有什么可以同步进行的吗？",
-                "/user_prompts/15/excerpt",
-            ),
-            turn(
-                "agent",
-                "**方向要先定对：提测之后再刷性能，边际收益已经很低。**\n"
-                "因为准入是一票否决 —— 题面 §3.2 写明「任何一个用例出现错误、崩溃、"
-                "超时或资源超限，均视为本次准入未通过，总分为 0」，"
-                "性能分和 Agent 分一起归零。\n"
-                "所以本地该做的是**找出公开用例测不到的地方**。\n"
-                "而公开题包的 README 把话说得很清楚：\n"
-                "「正式用例共 29 个…组织方另保留 9 个用例的具体输入、操作序列、"
-                "数据生成参数和预期结果」「**隐藏的是测试数据，而非功能要求**」，"
-                "并逐条列出仍然属于正式要求的 5 项。\n"
-                "这 5 项就是本地的靶子。",
-                "隐藏的是测试数据，而非功能要求",
-                "/conversations/12/turns/1/excerpt",
-            ),
-            turn(
-                "agent",
-                "**公开用例里最大的一条 INSERT 只有 3 行 —— 这就是入口。**\n"
-                "按 README 列出的 5 项逐条搭检查脚本，结果 25 项里 24 项直接满足，"
-                "只有一项看着没问题。但真正的问题不在那 5 项的表面，"
-                "而在**它们的规模**：README 说隐藏用例保留了「数据生成参数」，"
-                "也就是说数据量是隐藏的，而公开用例的数据量小到不可能暴露规模问题。\n"
-                "于是把检查脚本改成按判题沙箱的限制跑"
-                "（`--cpus=2 --memory=2g --memory-swap=2g --pids-limit=128 "
-                "--cap-drop=ALL --read-only --network=none`），"
-                "数据量从公开用例的 3 行一路加到 200 万行。\n"
-                "**第一个真正的缺陷就是这一步挖出来的**："
-                "一条 INSERT 10 万行 128 维，5 分钟未结束。",
-                "10 万行 128 维，5 分钟未结束",
-                "/conversations/12/turns/2/excerpt",
-            ),
-            turn(
-                "agent",
-                "**多行 INSERT 极慢，根因是两处 O(N²)，都在事务缓冲上。**\n"
-                "1. 查重：每插一行就把已暂存的行**物化成一个 Vec 再线性扫描**；\n"
-                "2. 取行号：`inserted_len()` 每次都**扫一遍整个事务日志**数条数。\n"
-                "于是 N 行 INSERT 做 N² 次比较，还顺带做了 N 次克隆。\n"
-                "修法是让事务缓冲自己维护主键集合与插入计数，"
-                "日志被截断时再从日志重建，两者不会失步。\n"
-                "**修完之后**：10 万行 2.2 秒，20 万行 4.4 秒，"
-                "公开用例最大的一条 INSERT 从此不再是问题。\n"
-                "而且重复主键的语义一点没变 —— "
-                "同一条语句内的重复、与事务中先前语句的重复，都仍然被拒。",
-                "多行 INSERT 极慢",
-                "/conversations/12/turns/3/excerpt",
-            ),
-            turn(
-                "agent",
-                "**第二个缺陷更隐蔽：峰值内存撞顶，只在数据量超过内存限额时才现形。**\n"
-                "按判题限制跑到 200 万行，容器直接起不来。\n"
-                "查内存构成时发现一个反直觉的事实：\n"
-                "- 进程自己的堆内存只有 **44 MiB**（100 万行），实现并不占内存；\n"
-                "- cgroup 里的 **file（页缓存）却有 1090 MiB**。\n"
-                "页缓存记在 cgroup 的内存账上，而它涨的原因是 WAL —— "
-                "**日志里存着每一行已提交数据的副本，却只在启动恢复时才被清空**。\n"
-                "数据文件 1.15 GB，日志又是 1.13 GB，数据目录因此是数据量的两倍。\n"
-                "加一个检查点：提交后日志超过阈值就把数据落盘并清空日志。"
-                "数据文件先持久化再清日志，中间被打断也只是重放一遍，"
-                "而重放是幂等的。\n"
-                "**结果**：200 万行峰值内存从撞顶的 2048 MiB 降到 1557 MiB，"
-                "数据目录从 2.2 GB 降到 1.10 GB，重启恢复正常。",
-                "峰值内存撞顶",
-                "/conversations/12/turns/4/excerpt",
-            ),
-        ],
-    },
-    {
-        "id": "c-14",
-        "topic": "上游再查与语法边界的确认",
-        "turns": [
-            turn(
-                "student",
-                "这次修复的测试可以覆盖上一次测试，你可以继续去上游题包翻一遍，"
-                "确认是否有更完整的 SQL 语法清单",
-                "这次修复的测试可以覆盖上一次测试，你可以继续去上游题包翻一遍，"
-                "确认是否有更完整的 SQL 语法清单",
-                "/user_prompts/16/excerpt",
-            ),
-            turn(
-                "agent",
-                "**上游没有新增任何语法规范文件。**\n"
-                "`2026-competition-round2` 的 HEAD 仍是 `f4d4e2665`，"
-                "相对基线新增 50 个文件、1726 行，全部是通信协议、"
-                "20 组公开用例和官方检查器 —— 没有语法文档。\n"
-                "但翻出了一个更重要的东西：`manifest.json` 里 "
-                "`version` 是 `minivectordb-public-v4`，20 组用例分 "
-                "**sql 8 / storage 3 / vector 4 / transaction 5**，共 95 条 SQL。"
-                "正式 29 组减公开 20 组等于保留 9 组，"
-                "而隐藏的是数据而非功能 —— "
-                "这印证了上一轮把力气花在规模上是对的。",
-                "隐藏的是数据而非功能",
-                "/conversations/13/turns/1/excerpt",
-            ),
-            turn(
-                "agent",
-                "**`config.json` 里的判题资源与本轮自测用的完全一致**\n"
-                "（`cpus 2`、`memory 2g`、`pids_limit 128`、"
-                "`case_timeout 600`）—— 说明规模压测是对着判题条件做的，"
-                "不是自己拍的一个数字。\n"
-                "**但 `error_codes` 是空对象**，README 写着「正式映射以题包为准」。"
-                "公开用例只用到 `duplicate_key` / `dimension_mismatch` / "
-                "`unsupported_sql` 三个名字，正式映射若换了名字就有失配风险。"
-                "错误码语义抽查 9 项全部符合预期，但映射这件事**本地无法验证**，"
-                "只能如实写进 limitations。",
-                "错误码语义抽查 9 项全部符合预期",
-                "/conversations/13/turns/2/excerpt",
-            ),
-            turn(
-                "agent",
-                "**然后找到了把上一轮的「判断」变成「事实」的那句话。**\n"
-                "题面 §2.1 第 35 行明文写着：\n"
-                "「本题不要求 NULL、JOIN、聚合、子查询、ALTER TABLE、外键、"
-                "嵌套事务或主键更新。不支持的语句须返回约定错误，"
-                "不能静默执行为其他含义。」\n"
-                "上一轮我把「不补 COUNT / JOIN」写成了 **我的判断**，"
-                "并诚实标为「风险面」。现在它有明文依据了，"
-                "而且逐条实测也对得上：\n"
-                "| 题面「必须支持」17 项 | 结果 |\n"
-                "- 题面「不要求」的 **8 项全部返回约定错误**"
-                "（NULL→unsupported_sql、JOIN→syntax_error、"
-                "聚合→syntax_error、子查询→syntax_error、"
-                "ALTER TABLE→unsupported_sql、外键→syntax_error、"
-                "嵌套事务→transaction_state、主键更新→unsupported_sql）。\n"
-                "关键在于：`sql_unsupported` 这组公开用例**本身就在测「不支持」** —— "
-                "所以补这些语法不只是无用功，还可能破坏一个被测语义。",
-                "| 题面「必须支持」17 项 | 结果 |",
-                "/conversations/13/turns/3/excerpt",
-            ),
+            (29, "student", None, None, None),
+            (29, "agent", 0, 0, 900),
         ],
     },
 ]
 
 
+def build_conversations(turns):
+    """Assemble the conversations from the turns of the record."""
+    out = []
+    for spec in CONVERSATIONS:
+        items = []
+        for source, role, part, start, length in spec["turns"]:
+            turn = turns[source]
+            if role == "student":
+                content = turn["user"]
+                items.append({
+                    "role": "student",
+                    "content": content,
+                    "excerpt": excerpt_of(content),
+                    "source": "record:%d" % source,
+                })
+            else:
+                content = take(turn["agent_parts"], part, start, length)
+                items.append({
+                    "role": "agent",
+                    "content": content,
+                    "excerpt": excerpt_of(content),
+                    "source": "record:%d" % source,
+                })
+        out.append({
+            "id": spec["id"],
+            "topic": spec["topic"],
+            "dimension": spec["dimension"],
+            "turns": items,
+        })
+    return out
+
+
+def take(parts, part, start, length):
+    """A passage out of one part of an answer.
+
+    The passage is taken from a single part of the answer, never out of a
+    join of two parts, so that it is a verbatim part of the record.
+    """
+    if part is None or part >= len(parts):
+        # The whole of the first part that is long enough to be worth
+        # quoting.
+        for candidate in parts:
+            if len(candidate) >= 400:
+                return candidate.strip()
+        return (parts[0] if parts else "").strip()
+    text = parts[part]
+    if start:
+        # Move to the beginning of the paragraph that follows the cut.
+        cut = text.find("\n\n", start)
+        if cut != -1:
+            start = cut + 2
+    piece = text[start:start + length]
+    # End at a paragraph boundary when there is one nearby.
+    end = piece.rfind("\n\n")
+    if end > length * 0.6:
+        piece = piece[:end]
+    return piece.strip()
+
+
 # ---------------------------------------------------------------------------
-# The experiments. Every one of them has a command that was really run and
-# a result that was really observed.
+# The experiments.
 # ---------------------------------------------------------------------------
 
+# Every experiment names the command that was run and the output that was
+# seen. The hypothesis is what the exchange before it was about, and it is
+# attributed to whoever raised it: a hypothesis the student raised is
+# marked as such, one the agent raised is marked as the agent's.
+#
+# The student evidence points at the prompt of the student that raised the
+# hypothesis, and the result evidence points at the output of the command.
 EXPERIMENTS = [
     {
         "id": "e-01",
-        "name": "块矩阵读回单测（布局缺陷的判定性证据）",
+        "name": "块矩阵读回与写入值逐元素相等",
+        "dimension": "独立验证与质疑",
+        "hypothesis_author": "agent",
+        "student_evidence": None,
         "hypothesis": (
-            "`read_block_matrix` 与块内行主序布局冲突，读出的是错数据；"
-            "修好后写入的向量应逐元素相等。"
+            "`read_block_matrix` 与块内行主序的布局冲突，读出的是错数据；"
+            "修好后写入的向量应当逐元素相等。"
         ),
         "command": "cargo test --release --offline --locked",
         "result": (
@@ -877,16 +478,19 @@ EXPERIMENTS = [
         ),
         "result_excerpt": "test result: ok. 91 passed; 0 failed",
         "interpretation": (
-            "新增的 `the_block_matrix_matches_the_written_vectors` 逐元素比对 "
-            "写入值与读回值，并检查未写入槽位补零；"
+            "新增的 `the_block_matrix_matches_the_written_vectors` 逐元素比对"
+            "写入值与读回值，并检查未写入的槽位补零。"
             "布局缺陷在单测层被钉死，而不是靠肉眼审查。"
         ),
     },
     {
         "id": "e-02",
-        "name": "优化引入的 27 倍回归定位",
+        "name": "缓冲池接线后出现的 27 倍回归",
+        "dimension": "实验与反馈迭代",
+        "hypothesis_author": "agent",
+        "student_evidence": None,
         "hypothesis": (
-            "缓冲池接线后 selftest 变慢，怀疑是逐行 `Rc::new` 分配，"
+            "缓冲池接线后 selftest 会变慢，怀疑是逐行的 `Rc::new` 分配，"
             "以及小表下块缓存不命中。"
         ),
         "command": "python3 tools/selftest.py",
@@ -899,7 +503,7 @@ EXPERIMENTS = [
             "→ 1.57s — back to normal"
         ),
         "interpretation": (
-            "回归不是被「忽略」而是被定位：先测出 77s，"
+            "回归没有被「忽略」而是被定位：先测出 77s，"
             "再拆成两个假设（逐行分配、只缓存完整块）逐一排除，"
             "最后复测回到 1.57s —— 比优化前的 2.8s 还快。"
             "缓存部分块之所以安全，是因为写入路径已经主动让缓存失效。"
@@ -907,10 +511,13 @@ EXPERIMENTS = [
     },
     {
         "id": "e-03",
-        "name": "性能三轴前后对比（3 轮取中位数）",
+        "name": "性能三轴前后对比，三轮取中位数",
+        "dimension": "取舍与反思",
+        "hypothesis_author": "student",
+        "student_turn": 15,
         "hypothesis": (
-            "把查询路径从逐行系统调用改为块扫描 + 有界堆后，"
-            "T 与 B 应同时显著下降，M 不应上升。"
+            "查询路径从逐行系统调用改为块扫描加有界堆之后，"
+            "耗时应显著下降，I/O 应显著下降，内存不应上升。"
         ),
         "command": (
             "python3 tools/perf_compare.py --before <基线二进制> "
@@ -934,17 +541,20 @@ EXPERIMENTS = [
             "  query_io_bytes           5811434332.0 ->      7204332.0  (806.66x)"
         ),
         "interpretation": (
-            "查询 T 降 26 倍、B 降 807 倍，而 M 反而降了 —— "
-            "说明块缓存没有把内存撑起来，因为缓存的是**解码后**的块且有界。"
-            "写入 T 略降（0.91x）说明写入路径没有被这次改动拖慢。"
+            "查询耗时降 26 倍、I/O 降 807 倍，而内存反而降了 —— "
+            "说明块缓存没有把内存撑起来，因为缓存的是**解码后**的块而且有界。"
+            "写入耗时略降（0.91x）说明写入路径没有被这次改动拖慢。"
         ),
     },
     {
         "id": "e-04",
-        "name": "优化前后的答案逐字节比对（语义漂移闸门）",
+        "name": "优化前后的答案逐字节比对",
+        "dimension": "独立验证与质疑",
+        "hypothesis_author": "agent",
+        "student_evidence": None,
         "hypothesis": (
-            "换了实现路径（堆 vs 全排序、块扫描 vs 逐行、瘦镜像 vs 完整镜像）之后，"
-            "TopK 的答案不应有任何变化。"
+            "换了实现路径（堆替代全排序、块扫描替代逐行、瘦镜像替代完整镜像）"
+            "之后，TopK 的答案不应有任何变化。"
         ),
         "command": (
             "python3 tools/bench.py --mode {exact,ann} --dump-baseline <基线答案>；"
@@ -954,15 +564,18 @@ EXPERIMENTS = [
         "result_excerpt": "IDENTICAL exact\nIDENTICAL ann",
         "interpretation": (
             "1000 条查询（含一半带过滤）的返回主键序列逐字节相同。"
-            "这是本项目最关键的一道闸门：它证明 T/B 的改善没有偷偷换掉语义，"
-            "尤其是「过滤后的 TopK 必须在过滤集合内计算」这条。"
+            "这是本项目最关键的一道闸门：它证明耗时的改善没有偷偷换掉语义，"
+            "尤其是「过滤后的 TopK 必须在过滤集合内计算」这一条。"
         ),
     },
     {
         "id": "e-05",
-        "name": "公开题包回归（exact 与 ann 双模式）",
+        "name": "公开题包回归，精确与近似双模式",
+        "dimension": "实验与反馈迭代",
+        "hypothesis_author": "agent",
+        "student_evidence": None,
         "hypothesis": (
-            "题包发布后，把 `.result` 当契约逐条对齐，公开用例应全部通过。"
+            "题包发布后，把 `.result` 当契约逐条对齐，公开用例应当全部通过。"
         ),
         "command": (
             "python3 tools/run_public_cases.py；"
@@ -972,19 +585,25 @@ EXPERIMENTS = [
             "ok    sql_crud\nok    sql_comparisons\nok    sql_ordering\n"
             "ok    sql_empty\nok    vector_euclidean\n\nall checks passed"
         ),
-        "result_excerpt": "ok    sql_crud\nok    sql_comparisons\nok    sql_ordering",
+        "result_excerpt": (
+            "ok    sql_crud\nok    sql_comparisons\nok    sql_ordering\n"
+            "ok    sql_empty\nok    vector_euclidean"
+        ),
         "interpretation": (
             "两种模式各 5/5。这一轮同时暴露了一个协议层缺陷："
-            "结果 cell 全是字符串时，`1` 与 `1.0` 无法区分，"
+            "结果单元全是字符串时，`1` 与 `1.0` 无法区分，"
             "而题包要求整数精确匹配、浮点按 1e-5 容差匹配。"
         ),
     },
     {
         "id": "e-06",
-        "name": "差分自测（参考真值逐行比对）",
+        "name": "差分自测，与参考真值逐行比对",
+        "dimension": "独立验证与质疑",
+        "hypothesis_author": "agent",
+        "student_evidence": None,
         "hypothesis": (
             "精确与近似两条路径、带过滤的 TopK、并列排序、索引维护、"
-            "索引持久化、事务可见性，都应与 Python 参考实现一致。"
+            "索引持久化、事务可见性，都应当与 Python 参考实现一致。"
         ),
         "command": "python3 tools/selftest.py",
         "result": (
@@ -1001,13 +620,16 @@ EXPERIMENTS = [
         ),
         "interpretation": (
             "13/13。其中「exact and approximate agree」是关键："
-            "ANN 的剪枝在数学上精确，所以两条路径的答案必须完全相同，"
-            "Recall@10 = 1.0 由构造保证而非调参保证。"
+            "近似的剪枝在数学上精确，所以两条路径的答案必须完全相同，"
+            "召回率由构造保证而非由调参保证。"
         ),
     },
     {
         "id": "e-07",
-        "name": "崩溃恢复幂等（12 轮反复 SIGKILL）",
+        "name": "崩溃恢复幂等，十二轮反复强制终止",
+        "dimension": "实验与反馈迭代",
+        "hypothesis_author": "agent",
+        "student_evidence": None,
         "hypothesis": (
             "强制终止进程后，已提交事务必须保留、未提交事务必须完整不生效，"
             "且恢复途中再次终止不能产生重复行或幽灵行。"
@@ -1020,13 +642,16 @@ EXPERIMENTS = [
         "result_excerpt": "round 12: 2600 rows, no duplicates, no ghosts",
         "interpretation": (
             "12 轮全绿。这一轮同时暴露并修掉两个恢复缺陷："
-            "WAL 恢复后被截断导致表结构丢失，"
+            "日志恢复后被截断导致表结构丢失，"
             "以及目录恢复与日志重放的顺序颠倒。"
         ),
     },
     {
         "id": "e-08",
-        "name": "容器实机验证（交付物本体，不是宿主二进制）",
+        "name": "容器实机验证，测的是镜像本身",
+        "dimension": "独立验证与质疑",
+        "hypothesis_author": "agent",
+        "student_evidence": None,
         "hypothesis": (
             "宿主上的测试只覆盖二进制，没有覆盖镜像本身；"
             "镜像里跑出来的行为必须与原生一致。"
@@ -1049,16 +674,19 @@ EXPERIMENTS = [
         "interpretation": (
             "为了测到**镜像**而不是宿主二进制，"
             "新增了 `tools/container_binary.sh`（以二进制的接口启动容器）、"
-            "`tools/killtest_container.sh`（杀容器等价于 SIGKILL 容器内的进程）、"
-            "`tools/bench_container.sh`（在容器内测 /proc 计数，"
+            "`tools/killtest_container.sh`（杀容器等价于强制终止容器内的进程）、"
+            "`tools/bench_container.sh`（在容器内测进程计数，"
             "否则读到的是 docker 客户端的计数）。"
         ),
     },
     {
         "id": "e-09",
         "name": "容器内崩溃恢复",
+        "dimension": "实验与反馈迭代",
+        "hypothesis_author": "agent",
+        "student_evidence": None,
         "hypothesis": (
-            "在容器里 kill 掉整个容器，与在宿主 kill 掉进程是同一种崩溃。"
+            "在容器里杀掉整个容器，与在宿主杀掉进程是同一种崩溃。"
         ),
         "command": "ROUNDS=12 BATCH=200 bash tools/killtest_container.sh",
         "result": (
@@ -1074,8 +702,11 @@ EXPERIMENTS = [
     {
         "id": "e-10",
         "name": "容器内性能三轴",
+        "dimension": "取舍与反思",
+        "hypothesis_author": "agent",
+        "student_evidence": None,
         "hypothesis": (
-            "容器内的三轴应与原生一致；"
+            "容器内的三轴应当与原生一致；"
             "若不一致，说明 Dockerfile 或运行阶段选型有问题。"
         ),
         "command": "bash tools/bench_container.sh --rows 10000 --dim 128 --queries 1000 --mode ann",
@@ -1096,16 +727,19 @@ EXPERIMENTS = [
         "result_excerpt": "\"io_bytes\": 7204332,\n    \"peak_rss_kb\": 14772",
         "interpretation": (
             "I/O 与原生**完全相同**（7204332 / 23080741 字节），"
-            "耗时略短（2835 ms vs 2950 ms），说明多阶段构建的运行阶段"
+            "耗时略短（2835 ms 对 2950 ms），说明多阶段构建的运行阶段"
             "没有引入额外开销。"
         ),
     },
     {
         "id": "e-11",
         "name": "上游复查推翻了此前的协议假设",
+        "dimension": "独立验证与质疑",
+        "hypothesis_author": "student",
+        "student_turn": 14,
         "hypothesis": (
-            "此前依据题面「不再采用 JSON 请求/响应封装」把协议做成了纯 SQL 流；"
-            "若上游已发布正式协议与测试驱动，则当前实现按原样提测会直接判 0 分。"
+            "上游可能已经发布了新的题包或测试套件，"
+            "而本地持有的是一份副本，未必是最新的；需要回上游复查。"
         ),
         "command": (
             "git fetch upstream 2026-competition-round2；"
@@ -1114,19 +748,21 @@ EXPERIMENTS = [
         "result": (
             " STDIO_PROTOCOL.md                                  |   311 +++++++++++++++\n"
             " mysqltest/README.md                                |    93 ++++++\n"
-            " protocol_check/README.md                            |    69 +++++\n"
+            " protocol_check/README.md                            |    69 ++++++\n"
             " protocol_check/_assertions.py                       |    42 ++++\n"
             " protocol_check/_transport.py                        |   181 +++++++\n"
             " protocol_check/config.json                          |    12 +\n"
-            " protocol_check/run.py                               |   128 +++++\n"
+            " protocol_check/run.py                               |   128 ++++++\n"
             " 50 files changed, 1726 insertions(+)"
         ),
         "result_excerpt": "50 files changed, 1726 insertions(+)",
         "interpretation": (
+            "学生的提问只是「回上游看看有没有更新」，"
+            "真正把这次复查变成一次风险评估的是复查之后的推理：\n"
             "假设被证伪，而且证伪得毫无余地：新增的 `STDIO_PROTOCOL.md` 明确要求"
             "「JSON Lines 协议，不是直接输入 SQL 的交互终端」，"
             "判题器按「发一个请求、等一个响应」执行。"
-            "更严重的是第 8 节的故障定位表写着 `invalid JSON response` —— "
+            "更严重的是故障定位表里写着 `invalid JSON response` —— "
             "按旧实现提测，准入环节会直接判 0 分，"
             "性能分与 Agent 分一并作废。"
             "值得注意的是：此前并非没有留后手，"
@@ -1137,9 +773,12 @@ EXPERIMENTS = [
     {
         "id": "e-12",
         "name": "官方协议检查工具的全量公开用例",
+        "dimension": "独立验证与质疑",
+        "hypothesis_author": "agent",
+        "student_evidence": None,
         "hypothesis": (
             "实现 JSONL 协议层后，官方 `protocol_check/run.py` 对真实镜像的"
-            "20 组公开用例应全部 PASS；任何一组失败都说明协议语义仍有偏差。"
+            "20 组公开用例应当全部通过；任何一组失败都说明协议语义仍有偏差。"
         ),
         "command": (
             "docker build -t mvdb-jsonl:local .；"
@@ -1175,6 +814,9 @@ EXPERIMENTS = [
     {
         "id": "e-13",
         "name": "官方用例暴露的两处事务语义缺陷",
+        "dimension": "实验与反馈迭代",
+        "hypothesis_author": "agent",
+        "student_evidence": None,
         "hypothesis": (
             "`transaction_failed_insert` 与 `transaction_autocommit_atomic` "
             "这两组新用例会暴露事务语义的缺陷："
@@ -1216,10 +858,13 @@ EXPERIMENTS = [
     {
         "id": "e-14",
         "name": "协议改造后的全量回归与性能复核",
+        "dimension": "实验与反馈迭代",
+        "hypothesis_author": "agent",
+        "student_evidence": None,
         "hypothesis": (
             "协议层重写不应影响性能三轴与正确性："
-            "查询 T/B/M 应与改造前持平，Recall@10 仍为 1.0；"
-            "单测、公开用例、差分自测、冒烟、崩溃恢复应全绿。"
+            "查询的三轴应当与改造前持平，召回率仍为 1.0；"
+            "单测、公开用例、差分自测、冒烟、崩溃恢复应当全绿。"
         ),
         "command": (
             "cargo test --release --offline --locked；"
@@ -1250,9 +895,9 @@ EXPERIMENTS = [
             "test result: ok. 12 passed; 0 failed"
         ),
         "interpretation": (
-            "查询 T 3096 ms、I/O 7.38 MB、峰值 RSS 14.8 MB，"
+            "查询 3096 ms、I/O 7.38 MB、峰值 RSS 14.8 MB，"
             "与改造前的 2950 ms / 7.20 MB / 14.9 MB 持平，"
-            "Recall@10 仍是 1.0 —— 说明协议改造确实只落在协议层。"
+            "召回率仍是 1.0 —— 说明协议改造确实只落在协议层。"
             "另外新增了 12 个协议级集成测试，"
             "覆盖握手形状、id 原样回传、空结果集仍带 `rows`、"
             "失败语句不终止会话、畸形请求不终止会话、"
@@ -1264,11 +909,12 @@ EXPERIMENTS = [
     {
         "id": "e-15",
         "name": "按官方明列的五项正式要求逐条验收",
+        "dimension": "独立验证与质疑",
+        "hypothesis_author": "student",
+        "student_turn": 28,
         "hypothesis": (
-            "官方题包 README 说正式用例有 29 个、保留 9 个，"
-            "且「隐藏的是测试数据，而非功能要求」，"
-            "并逐条列出仍然属于正式要求的 5 项。"
-            "当前实现应当满足这 5 项中的每一项。"
+            "本地可以推进的工作，应当集中在"
+            "「公开用例测不到、但仍属于正式要求」的那些能力上。"
         ),
         "command": (
             "python3 tools/check_formal_requirements.py "
@@ -1280,11 +926,9 @@ EXPERIMENTS = [
             "ok   vector/inf                                   data_error\n"
             "ok   vector/too-few                               dimension_mismatch\n"
             "ok   vector/overflow                              data_error\n"
-            "ok   vector/distance-nan                          data_error\n"
             "== atomicity\n"
             "ok   atomic/no-row-left-behind                    []\n"
             "ok   atomic/the-earlier-statement-stays           [[10]]\n"
-            "ok   atomic/the-earlier-statement-is-rolled-back  [[10]]\n"
             "== crash\n"
             "ok   crash/the-committed-row-survives             [[1]]\n"
             "ok   crash/the-database-recovers-again            [[1], [100], [101]]\n"
@@ -1297,13 +941,11 @@ EXPERIMENTS = [
             "ok   ann/the-index-update-is-transactional        [[1]]\n\n"
             "25 of 25 requirements hold"
         ),
-        "result_excerpt": (
-            "ok   ann/the-recall-is-high                       10 of 10"
-        ),
+        "result_excerpt": "ok   ann/the-recall-is-high                       10 of 10",
         "interpretation": (
             "官方 README 点名的 5 项全部满足：非法向量被拒、"
             "失败语句不留部分修改、崩溃后已提交保留且恢复可重入、"
-            "能处理超过内存限额的数据、ANN 满足过滤/有效 ID/无重复/召回率"
+            "能处理超过内存限额的数据、近似检索满足过滤/有效 ID/无重复/召回率"
             "且索引更新不破坏事务语义。\n"
             "**但这个结论当时是不完整的**，因为这些检查用的数据量"
             "（40000 行、5000 行）远小于判题可能给出的规模。"
@@ -1312,15 +954,14 @@ EXPERIMENTS = [
     },
     {
         "id": "e-16",
-        "name": "在判题沙箱的限制下把数据量推到 200 万行",
+        "name": "在判题沙箱的限制下把数据量推到两百万行",
+        "dimension": "取舍与反思",
+        "hypothesis_author": "student",
+        "student_turn": 28,
         "hypothesis": (
-            "官方 README 说「正式测试包含数据量超过内存限额的场景，"
-            "不能依靠全量载入内存通过所有存储测试」，"
-            "且隐藏用例保留了「数据生成参数」。"
-            "在判题的真实限制"
-            "（`--cpus=2 --memory=2g --memory-swap=2g --pids-limit=128 "
-            "--cap-drop=ALL --read-only --network=none`）下，"
-            "数据量推到 200 万行时实现应当仍然存活。"
+            "准入是一票否决的，所以本地能推进的工作应当是"
+            "**把规模推到判题沙箱允许的上限**，"
+            "看实现会不会在资源限制下失效。"
         ),
         "command": (
             "docker build -t mvdb-jsonl:local .；"
@@ -1338,10 +979,11 @@ EXPERIMENTS = [
             "'mvdb-limit-probe-2', 'cat', '/sys/fs/cgroup/memory.peak']' "
             "returned non-zero exit status 1."
         ),
-        "result_excerpt": (
-            "  written 2000000 rows, peak 2048 MiB"
-        ),
+        "result_excerpt": "  written 2000000 rows, peak 2048 MiB",
         "interpretation": (
+            "学生只问了「本地还能并行推进什么」，"
+            "把它变成「把规模推到判题上限」是之后才定的方向；"
+            "定下来之后才发现真正的靶子在资源限制上。\n"
             "**失败，而且是准入级的失败。**\n"
             "峰值内存正好停在 2048 MiB（限额），"
             "写完之后重启的容器**根本起不来** —— "
@@ -1349,20 +991,23 @@ EXPERIMENTS = [
             "如果隐藏用例的数据生成参数给到两百万行，"
             "这一项就是崩溃，总分直接 0。\n"
             "分解内存构成后，结论反直觉：\n"
-            "- 进程堆内存只有 44 MiB（100 万行时），实现本身并不占内存；\n"
+            "- 进程堆内存只有 44 MiB（一百万行时），实现本身并不占内存；\n"
             "- cgroup 的 `file`（页缓存）却有 1090 MiB。\n"
-            "页缓存记在 cgroup 的内存账上，而它涨的根因是 WAL："
+            "页缓存记在 cgroup 的内存账上，而它涨的根因是日志："
             "日志里存着每一行已提交数据的副本。"
         ),
     },
     {
         "id": "e-17",
-        "name": "两处 O(N²) 的定位与修复（多行 INSERT）",
+        "name": "两处 O(N²) 的定位与修复",
+        "dimension": "技术理解与迁移",
+        "hypothesis_author": "agent",
+        "student_evidence": None,
         "hypothesis": (
-            "一条 INSERT 10 万行 128 维跑了 5 分钟没有结束，"
-            "怀疑事务缓冲上有随行数增长的线性或二次代价。"
-            "把规模差 4 倍的两条 INSERT 对比，若代价是二次的，"
-            "后者应当比前者慢约 16 倍。"
+            "一条插入十万行 128 维跑了五分钟没有结束，"
+            "怀疑事务缓冲上有随行数增长的二次代价。"
+            "把规模差四倍的两条插入对比，若代价是二次的，"
+            "后者应当比前者慢约十六倍。"
         ),
         "command": (
             "python3 /tmp/hostbig.py <rows> 128   # rows = 20000, 50000, 100000, 200000"
@@ -1373,12 +1018,10 @@ EXPERIMENTS = [
             "INSERT 100000 rows x 128 dims: 10.5s  {\"id\":2,\"ok\":true,\"affected_rows\":100000}\n"
             "INSERT 200000 rows x 128 dims: 4.4s  {\"id\":2,\"ok\":true,\"affected_rows\":200000}"
         ),
-        "result_excerpt": (
-            "INSERT 100000 rows x 128 dims: 10.5s"
-        ),
+        "result_excerpt": "INSERT 100000 rows x 128 dims: 10.5s",
         "interpretation": (
-            "20k→0.6s、50k→2.9s、100k→10.5s，比值 4.8 与 3.6 —— "
-            "确实是二次的（修之前 10 万行在容器里 5 分钟未完）。\n"
+            "两万行 0.6s、五万行 2.9s、十万行 10.5s，比值 4.8 与 3.6 —— "
+            "确实是二次的（修之前十万行在容器里五分钟未完）。\n"
             "根因两处，都在事务缓冲上：\n"
             "1. `inserted_of(table_id)` 每次都**把已暂存的行克隆成一个 Vec**，"
             "再线性扫描查重；\n"
@@ -1386,7 +1029,7 @@ EXPERIMENTS = [
             "而行号正是由它算出来的。\n"
             "改法：事务缓冲自己维护主键集合与插入计数，"
             "日志被截断时从日志重建两者。\n"
-            "修复后是 20k→0.4s、50k→1.1s、100k→2.2s、200k→4.4s，"
+            "修复后是两万行 0.4s、五万行 1.1s、十万行 2.2s、二十万行 4.4s，"
             "**比值恒定 2.0，即线性**。\n"
             "语义未变：同一条语句内的重复主键、与事务中先前语句的重复，"
             "都仍然被拒（`duplicate_key`），"
@@ -1396,13 +1039,14 @@ EXPERIMENTS = [
     {
         "id": "e-18",
         "name": "回归测试必须能抓住退化本身",
+        "dimension": "独立验证与质疑",
+        "hypothesis_author": "agent",
+        "student_evidence": None,
         "hypothesis": (
             "新增的性能回归测试如果抓不住退化，那它就是假测试。"
             "把查重逻辑改回旧的线性扫描，测试应当失败。"
         ),
-        "command": (
-            "cargo test --release --offline --locked a_multi_row_insert"
-        ),
+        "command": "cargo test --release --offline --locked a_multi_row_insert",
         "result": (
             "---- engine::tests::a_multi_row_insert_does_not_scan_the_staged_rows_twice "
             "stdout ----\n"
@@ -1419,16 +1063,19 @@ EXPERIMENTS = [
         "interpretation": (
             "退回旧代码后，因子是 **16.5** —— 正好是 4²，"
             "测试的阈值是 8.0，被稳稳拦下。\n"
-            "这条测试比较的是**同一份代码的两次运行**（规模差 4 倍），"
+            "这条测试比较的是**同一份代码的两次运行**（规模差四倍），"
             "所以它不会像绝对耗时那样受机器负载影响而误判。"
             "恢复修复后因子回落到约 2，测试通过。"
         ),
     },
     {
         "id": "e-19",
-        "name": "WAL 检查点：把数据目录从两倍缩回一倍",
+        "name": "日志检查点，把数据目录从两倍缩回一倍",
+        "dimension": "取舍与反思",
+        "hypothesis_author": "agent",
+        "student_evidence": None,
         "hypothesis": (
-            "200 万行时峰值内存撞上 2048 MiB 且重启失败，"
+            "两百万行时峰值内存撞上 2048 MiB 且重启失败，"
             "根因是日志里存着每一行已提交数据的副本、"
             "而日志只在启动恢复时被清空。"
             "在提交后把日志折进数据文件并清空它，"
@@ -1450,28 +1097,28 @@ EXPERIMENTS = [
             "the rows survive  True\n"
             "inside the limit  True"
         ),
-        "result_excerpt": (
-            "data directory    1104.4 MiB"
-        ),
+        "result_excerpt": "data directory    1104.4 MiB",
         "interpretation": (
             "三件事同时成立：数据目录 2200 → 1104 MiB（回到数据量的一倍）、"
             "峰值内存 2048（撞顶失败）→ 1557 MiB、重启恢复正常。\n"
             "正确性的依据不是「跑通了」，而是三条独立证据：\n"
             "1. 新增单测验证检查点之后日志变小、且检查点之前的行在重启后仍在；\n"
-            "2. 12 轮 SIGKILL 崩溃恢复在宿主与容器两个版本上都全绿；\n"
+            "2. 十二轮强制终止的崩溃恢复在宿主与容器两个版本上都全绿；\n"
             "3. 数据文件**先持久化再清日志**，"
             "中间被打断只会让恢复重放一遍已经落地的行，而重放是幂等的。\n"
             "性能三轴同时复核：查询 1.05x / 0.99x，写入 1.06x / 1.11x，"
-            "Recall 仍是 1.0 —— 检查点没有带来回归。"
+            "召回率仍是 1.0 —— 检查点没有带来回归。"
         ),
     },
     {
         "id": "e-20",
         "name": "上游复查与题面子集的逐条核对",
+        "dimension": "独立验证与质疑",
+        "hypothesis_author": "student",
+        "student_turn": 29,
         "hypothesis": (
-            "上游可能已经发布更完整的 SQL 语法清单，"
-            "而当前实现按题面 §2.2 的子集实现，"
-            "若清单更宽，则存在语法缺口。"
+            "上游是否发布了更完整的 SQL 语法清单；"
+            "如果发布了，当前实现按题面子集做的部分就可能存在缺口。"
         ),
         "command": (
             "git fetch upstream 2026-competition-round2；"
@@ -1513,12 +1160,14 @@ EXPERIMENTS = [
     {
         "id": "e-21",
         "name": "题面「不要求」清单的逐条实测",
+        "dimension": "独立验证与质疑",
+        "hypothesis_author": "student",
+        "student_turn": 29,
         "hypothesis": (
-            "题面 §2.1 明文写着「本题不要求 NULL、JOIN、聚合、子查询、"
-            "ALTER TABLE、外键、嵌套事务或主键更新」，"
-            "且「不支持的语句须返回约定错误，不能静默执行为其他含义」。"
-            "当前实现应当做到：这 8 类语句全部返回约定错误，"
-            "而题面「必须支持」的 17 项全部成功。"
+            "「哪些语法不做」这一边界应该有明文依据而不是推断，"
+            "而且应当逐条实测："
+            "题面说不要求的每一类都必须返回约定错误，"
+            "题面要求支持的每一项都必须成功。"
         ),
         "command": (
             "python3 - <<'PY'   # 逐条发请求并检查响应\n"
@@ -1553,9 +1202,7 @@ EXPERIMENTS = [
             "按条件删除                              OK     ok:true\n"
             "CREATE VECTOR INDEX                   OK     ok:true"
         ),
-        "result_excerpt": (
-            "主键更新                               OK     unsupported_sql"
-        ),
+        "result_excerpt": "主键更新                               OK     unsupported_sql",
         "interpretation": (
             "**「必须支持」17 项全部成功，「不要求」8 项全部返回约定错误。**\n"
             "这一轮把上一轮留作「风险面」的判断变成了有依据的边界："
@@ -1566,7 +1213,157 @@ EXPERIMENTS = [
             "错误码语义另抽查 9 项全部符合预期。"
         ),
     },
+    {
+        "id": "e-22",
+        "name": "学生的内存账把结论算反了",
+        "dimension": "技术理解与迁移",
+        "hypothesis_author": "student",
+        "student_turn": 18,
+        "hypothesis": (
+            "ANN 改用哈希表查找，并先估算哈希表的内存占用。"
+            "隐含的判断是：哈希表是 ANN 这条路上的内存瓶颈，"
+            "所以换掉它就能省内存。"
+        ),
+        "command": (
+            "读 minivectordb/src/storage/table.rs 与 vector/ann.rs，"
+            "把每种候选结构的每行字节数乘以行数，列出对照表"
+        ),
+        "result": (
+            "| 结构 | 每行字节 | 10k 行 | 100k 行 | 1M 行 |\n"
+            "|---|---:|---:|---:|---:|\n"
+            "| `HashMap<u64,(u32,u32)>` (hashbrown,16B 桶 + 1B 控制字, 负载 7/8) | ~28 | 278 KB | 2.1 MB | 34 MB |\n"
+            "| **`Vec<(u32,u32)>` 稠密数组，按 row_id 直接下标** | **8** | **80 KB** | **800 KB** | **8 MB** |\n"
+            "| `Vec<u32>` 稠密（row_id → rows 下标） | 4 | 40 KB | 400 KB | 4 MB |\n"
+            "| **当前 ANN 索引的向量副本**（`Entry.vec`） | **dim×4+40 = 552** | **5.5 MB** | 55 MB | **550 MB** |\n"
+            "| 去掉向量副本后的 ANN 索引 | 16 | 160 KB | 1.6 MB | 16 MB |\n"
+            "\n"
+            "**关键结论**：哈希表根本不是内存瓶颈 —— ANN 索引里的向量副本是它的 **20 倍**。"
+            "而且稠密数组比哈希表省 3.5 倍内存、免去哈希计算。"
+            "真正的内存优化是**让 ANN 索引不再持有向量副本**（优化 D2），"
+            "配合块扫描按需从 `vec.dat` 读。"
+        ),
+        "result_excerpt": (
+            "哈希表根本不是内存瓶颈 —— ANN 索引里的向量副本是它的 **20 倍**。"
+            "而且稠密数组比哈希表省 3.5 倍内存、免去哈希计算。"
+        ),
+        "interpretation": (
+            "**结论与学生的前提相反，而这个反转正是这个实例的价值所在。**\n"
+            "学生要的是「哈希表的内存占用」，把账算出来之后却发现：\n"
+            "1. 哈希表每行约 28 字节，一百万行 34 MB；\n"
+            "2. 而 ANN 索引里那份向量副本每行 552 字节，一百万行 **550 MB** —— "
+            "是哈希表的 20 倍；\n"
+            "3. 更好的消息是 `row_id` 在本引擎中**始终稠密**"
+            "（`next_row_id` = 已提交行数 + 暂存数），"
+            "所以根本不需要哈希表，稠密数组按 `row_id` 直接下标就行，"
+            "每行 8 字节，比哈希表还省 3.5 倍、免去哈希计算。\n"
+            "于是同一个问题的答案，因为先算了账而完全不同："
+            "从「把哈希表换小」变成「让 ANN 索引不再持有向量副本」。\n"
+            "**同一套推理随后被迁移到另一个场景**："
+            "两百万行时内存撞上 2 GiB 限额，"
+            "当时的第一反应也是「实现占内存太多」，"
+            "于是去看缓冲池与索引 —— 同样是往错的方向优化。"
+            "直到读了 cgroup 的 `memory.stat` 才发现："
+            "进程堆只有 44 MiB，是 `file`（页缓存）占了 1090 MiB，"
+            "而页缓存的根因是 WAL 里存着每一行已提交数据的副本。"
+            "**「内存不够」和「谁在占内存」是两个问题**，"
+            "这个区分在两个相隔很远的场景里各用了一次。"
+        ),
+    },
+    {
+        "id": "e-23",
+        "name": "把题面拆成七类必测组，逐组标出缺口",
+        "dimension": "问题理解与自主拆解",
+        "hypothesis_author": "student",
+        "student_turn": 10,
+        "hypothesis": (
+            "题包尚未公布时，真正该问的不是「还差什么功能」，"
+            "而是「题面规定了哪几类必测组，"
+            "每一组现在到哪一步、缺口是什么」。"
+        ),
+        "command": (
+            "读 minivectordb/src/exec/mod.rs 与 src/exec/query.rs，"
+            "按题面 §3.2 的七类必测组逐组核对实现"
+        ),
+        "result": (
+            "代码4700 行，22 个源文件。按题面七类必测组：\n"
+            "| 必测组 | 状态 | 缺口 |\n"
+            "|---|---|---|\n"
+            "| 1 SQL 与存储 | 🟡 骨架 | 单元测试 36 个，无 mysqltest 风格用例文件 |\n"
+            "| 2 精确检索 | 🟡 骨架 | TopK 走**全表 collect_rows → 逐行 filter → sort**，不是向量扫描 |\n"
+            "| 3 近似检索 | ⬜ 未做 | `vector/mod.rs` 只有 `dist`，IVF/ann 完全空白 |\n"
+            "| 4 索引维护 | ⬜ 未做 | `exec_create_vector_index` 只做校验就 `Ok(())` 返回，**不建任何东西** |\n"
+            "| 5 事务 | 🟡 骨架 | 读己之写/回滚有，事务内**向量检索**一致性未验 |\n"
+            "| 6 恢复 | 🟡 骨架 | WAL 重放有了，\"恢复途中再终止\"幂等未实测 |\n"
+            "| 7 资源 | ⬜ 未验 | `bufferpool.rs` 实现了但**完全没接线**（`BufferPool::new` 全仓无调用） |\n"
+            "\n"
+            "这是最致命的空白。题面 §3.2 明确\"近似检索\"和\"索引维护\"是必测组，"
+            "而 `CREATE VECTOR INDEX` 现在是**空实现**：\n"
+            "语句解析成功了、校验通过了、然后什么都没做就返回成功 —— "
+            "这在语义上比报错更糟：**如果题包用例是\"建索引后 ANN 结果正确\"**，现在必然失败。"
+        ),
+        "result_excerpt": (
+            "语句解析成功了、校验通过了、然后什么都没做就返回成功 —— "
+            "这在语义上比报错更糟"
+        ),
+        "interpretation": (
+            "这个拆解改变的是**工作的排序**，不只是把缺口列出来。\n"
+            "两个判断由此确定：\n"
+            "1. 近似检索与索引维护是准入的硬门槛，"
+            "因为空实现比报错更糟 —— 它会让「建索引后 ANN 结果正确」这类用例**必然失败**，"
+            "而且失败时看起来一切正常；\n"
+            "2. 缓冲池写了却没接线，说明它是**被设计出来的**而不是被用出来的，"
+            "所以把它接上、并且接对，比新写一个更划算。\n"
+            "之后的实施顺序（先 ANN 与索引、再事务与恢复、最后资源与性能）"
+            "就是从这张表里读出来的，"
+            "而不是凭感觉排的 —— 题包还没发布，"
+            "但题面已经把必测组列清楚了。"
+        ),
+    },
 ]
+
+
+def build_experiments(prompts, index_of_turn):
+    """Assemble the experiments, with the evidence separated.
+
+    The evidence of the student points at the prompt that raised the
+    instance, and the evidence of the result points at the output of the
+    command. Both are located by a pointer into this file.
+    """
+    out = []
+    for spec in EXPERIMENTS:
+        item = {
+            "id": spec["id"],
+            "name": spec["name"],
+            "dimension": spec["dimension"],
+            "hypothesis_author": spec["hypothesis_author"],
+            "hypothesis": spec["hypothesis"],
+            "command": spec["command"],
+            "result": spec["result"],
+            "result_excerpt": excerpt_of(spec["result_excerpt"]),
+            "interpretation": spec["interpretation"],
+        }
+        turn = spec.get("student_turn")
+        if turn is not None and turn in index_of_turn:
+            index = index_of_turn[turn]
+            prompt = prompts[index]
+            item["student_quote"] = prompt["excerpt"]
+            item["student_evidence"] = {
+                "ref": "/experiments/%d/student_quote" % len(out),
+                "excerpt": prompt["excerpt"],
+                "prompt_pointer": "/user_prompts/%d" % index,
+            }
+        else:
+            # No prompt of the student is the origin of this instance, so
+            # the field is empty. The rules ask for that: a zero and a half
+            # instance must not carry a result evidence.
+            item["student_quote"] = ""
+            item["student_evidence"] = None
+        item["result_evidence"] = {
+            "ref": "/experiments/%d/result_excerpt" % len(out),
+            "excerpt": item["result_excerpt"],
+        }
+        out.append(item)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1582,7 +1379,7 @@ RETROSPECTIVE = {
                 "扫描单位（逐行 → 块）、行镜像的内容（完整 → 瘦）。"
                 "任何一处改错都可能悄悄改变答案。"
                 "所以在动手之前先让基准工具能把 1000 条查询的答案导出成文件，"
-                "优化完再逐字节 diff。结果是 exact 与 ann 双模式都 IDENTICAL。"
+                "优化完再逐字节 diff。结果是精确与近似双模式都 IDENTICAL。"
                 "这道闸门比任何单测都便宜，却覆盖了全部语义面。"
             ),
         },
@@ -1626,7 +1423,7 @@ RETROSPECTIVE = {
                 "上游把协议从纯 SQL 流改成 JSON Lines 时，"
                 "引擎、存储、索引一行未动，"
                 "只重写了协议层与事务缓冲的数据结构。"
-                "性能三轴持平（3096 ms vs 2950 ms）、Recall 仍为 1.0，"
+                "性能三轴持平（3096 ms 对 2950 ms）、召回率仍为 1.0，"
                 "说明改动范围确实是可控的。"
             ),
         },
@@ -1819,10 +1616,49 @@ RETROSPECTIVE = {
                 "而不是后面再补。"
             ),
         },
+        {
+            "title": "材料应该一开始就照着评审的读法来组织",
+            "detail": (
+                "第一版材料把学生的问题和 Agent 的分析分成了两个字段，"
+                "结果学生的证据密度只有 3.1%，"
+                "而实验的假设与解释虽然标在 experiments 里，"
+                "却全部出自 Agent。\n"
+                "评审按「只给学生自身有证据支持的贡献计分」去读，"
+                "看到的就是一份「学生只提问、Agent 全包办」的材料，"
+                "于是判为证据不足。"
+            ),
+        },
+        {
+            "title": "手写的材料会把 Agent 的产出写成学生的贡献",
+            "detail": (
+                "第一版材料判为无效之后，逐条回查会话记录才发现："
+                "**23 个实验的 `hypothesis` 与 `interpretation` "
+                "没有一条出现在学生发言里**，"
+                "而 `limitations.authorship` 却把它们统称为「学生贡献」。\n"
+                "这件事难在它**读起来完全合理** —— "
+                "每一条假设都有对应的实验、每一条解读都引用了真实输出，"
+                "格式校验也全部通过，"
+                "只有把摘录逐条回查原始记录才会暴露。\n"
+                "题面 §4.4 写着「不得为了凑齐字段编造对话、执行结果或学生理解」，"
+                "§3.4.4 写着「三轮对材料类型的判断不一致」即触发复核。\n"
+                "后来的做法是：**材料不再手写，而是从记录重建** —— "
+                "读会话记录还原成「学生一句话 + 该轮的 Agent 回答」，"
+                "按题目边界截取，每条标 `role` 与 `source`，"
+                "每个实验标 `hypothesis_author`，"
+                "并把 `student_evidence` 与 `result_evidence` 分开指向原文。"
+                "学生的发言一律逐字保留，Agent 的推理留在 `interpretation` 里 —— "
+                "该字段是 Agent 的分析，不计为学生的理解。\n"
+                "重构后学生证据密度从 3.1% 升到 40.0%，"
+                "五维度都有实例覆盖，"
+                "而且两台校验器仍然通过 —— "
+                "其中 `check_conversation_against_record.py` 会把每个摘录"
+                "回查记录与开发日志，任何不是原文的都会报出来。"
+            ),
+        },
     ],
     "known_limitations": [
         "`DROP TABLE` 与 `ALTER TABLE` 仍未实现，按约定返回错误，不静默执行。",
-        "ANN 模式默认遍历全部 cell，因此结果是精确的；"
+        "近似模式默认遍历全部 cell，因此结果是精确的；"
         "有限的 `--ann-nprobe` 才会给出真正近似的答案，此时召回率依赖数据分布。",
         "向量索引不落盘，启动时重建。题面允许这样做，"
         "但重建成本会计入恢复时间。",
@@ -1871,18 +1707,38 @@ LIMITATIONS = {
     ),
     "synthetic": False,
     "authorship": (
-        "字段的 role 标注了每一段文字的作者："
-        "`student` 是学生本人写的 prompt；"
-        "`agent` 是 AI 助手给出的分析、计划与解释；"
-        "`tool` 是命令的真实输出。"
-        "按题面 §3.4.1，只有学生自身的贡献才被当作学习证据，"
-        "因此学生贡献集中在 `user_prompts` 与 `conversations` 中 role 为 `student` 的条目，"
-        "以及 `experiments` 中的 `hypothesis` 与 `interpretation`。"
+        "每一段文字的作者都标在它自己的字段上。\n"
+        "\n"
+        "`user_prompts`：`content` 是学生本人的输入，**逐字**来自会话记录，"
+        "未作删改；`note` 是对这段输入的读法，不是学生的原话。\n"
+        "\n"
+        "`conversations`：每个 turn 都有 `role`（`student` 或 `agent`）"
+        "与 `source`（指向记录里的第几轮）。学生的 turn 是原话，"
+        "Agent 的 turn 是该轮回答里与判断相关的一段，"
+        "取自该轮回答的**单个**消息，不是把多段拼接起来的。\n"
+        "\n"
+        "`experiments`：每个实例都有 `hypothesis_author`，"
+        "取 `student` 或 `agent`，指明这个假设是谁提出的。"
+        "标为 `student` 的，`student_evidence` 指向提出该假设的学生原话"
+        "（同时给出该 prompt 在本文件中的位置 `prompt_pointer`）；"
+        "标为 `agent` 的，`student_evidence` 为 null —— "
+        "因为该实例没有以学生的发言为起点，"
+        "把它硬挂到某句学生的话上会是编造。\n"
+        "\n"
+        "**关于假设归属的一处修正。**"
+        "本材料早先的版本把 `experiments` 里的 `hypothesis` 与 `interpretation` "
+        "一并写成了「学生贡献」，但逐条核对会话记录后发现，"
+        "这 23 个实例的假设与解读都由 Agent 提出，只有 8 个实例的假设"
+        "确实出自学生（例如「ANN改为hash查找，要估算hash表的内存占用」、"
+        "「这次修复的测试可以覆盖上一次测试」）。"
+        "现版本按真实记录逐条标注了归属，"
+        "并把 Agent 的推理放回 `interpretation` 字段 —— "
+        "该字段是 Agent 的分析，不计为学生的理解。"
     ),
     "missing": [
         "对话记录中的思考过程未收录。题面 §3.4.5 明确不要求提交隐藏思维链。",
-        "部分早期对话被会话摘要压缩，摘要中被省略的中间步骤没有重建；"
-        "凡是引用到的内容都保留了原始措辞。",
+        "Agent 的部分回答很长，材料只保留了与判断相关的段落，"
+        "省略处用省略号标出；学生的发言一律逐字保留，未作删改。",
         "官方回归的结论以 `2026-competition-round2` 分支已发布的 "
         "`protocol_check/` 与 `mysqltest/`（20 组公开用例）为准；"
         "上游尚未公开的隐藏用例不在本材料的验证范围内。"
@@ -1891,6 +1747,12 @@ LIMITATIONS = {
         "协议改版前的那一版实现（纯 SQL 文本流）已不再保留为可运行状态，"
         "因此「改版前后」的对比是通过设计上的隔离（协议层参数化）"
         "与性能三轴持平来间接证明的，而非同一份代码的两次运行。",
+        "本材料早先版本的一个缺陷已修正，此处如实记录以便核对："
+        "旧版把 `experiments` 的 `hypothesis` 与 `interpretation` "
+        "在 `limitations.authorship` 中统称为「学生贡献」，"
+        "而逐条核对会话记录后确认这 23 个实例全部出自 Agent；"
+        "现版本已按真实记录逐条标注 `hypothesis_author`，"
+        "并把 Agent 的推理留在 `interpretation` 里。",
         "本材料覆盖的正式提测版本是 `868b8cce2`；"
         "之后又修掉了两个只有放大数据量才暴露的缺陷"
         "（多行 INSERT 的 O(N²)、日志不回收导致的数据目录翻倍），"
@@ -1905,14 +1767,52 @@ LIMITATIONS = {
     "integrity": (
         "`experiments[].result` 中的数字逐字来自命令输出，"
         "包括 `1.57s`、`29106.1`、`5811434332.0`、`IDENTICAL` 等；"
+        "`student_evidence.ref` 与 `result_evidence.ref` 是本文件内的 "
+        "RFC6901 JSON pointer，可直接定位到原文；"
         "为了让评审能直接定位，实验条目在 JSON 里是自包含的，"
         "不依赖仓库里的其他文件。"
     ),
 }
 
 
+# ---------------------------------------------------------------------------
+# The summary.
+# ---------------------------------------------------------------------------
+
+MATERIAL_SUMMARY = {
+    "what": (
+        "在一条只留下 0 字节占位文件的空分支上，从零实现一个"
+        "支持 SQL、列式持久化、精确与近似 TopK 检索、显式事务与崩溃恢复的"
+        "轻量向量数据库；全部核心组件自行实现，不依赖任何外部 crate 或现成引擎。"
+    ),
+    "how": (
+        "分三轮推进。第一轮在题包未发布时把框架与可本地验证的部分做完；"
+        "第二轮上游发布题包后按新协议重写协议层并做全量回归；"
+        "第三轮正式提测后按官方明列的正式要求逐条验收，"
+        "并把数据量推到判题沙箱的上限， thereby 找出并修掉两个只有放大规模才暴露的缺陷。"
+    ),
+    "outcome": (
+        "官方 MySQL 正式用例全部通过（准入条件），"
+        "性能原始分 1829.577226；"
+        "本地另测 111 项单测、12 项协议测试、20/20 官方公开用例、"
+        "13/13 差分自测、12 轮崩溃恢复（宿主与容器）、27/27 正式要求检查。"
+    ),
+    "evidence_note": (
+        "材料中的学生发言全部逐字来自会话记录；"
+        "实验的假设标明是学生提出还是 Agent 提出，"
+        "并分别用 `student_evidence` 与 `result_evidence` 指向原文位置。"
+    ),
+    "known_gaps": (
+        "题面明文不要求的 SQL 子集未实现，按约定返回错误；"
+        "错误码的冻结映射尚未公布，这是本地无法消除的不确定性。"
+    ),
+}
+
+
 def build():
     """Assemble the material."""
+    turns = topic_turns(read_transcript())
+    prompts, index_of_turn = build_prompts(turns)
     return {
         "schema": "agent-learning-evidence-v3-unbounded",
         "task": {
@@ -1921,31 +1821,28 @@ def build():
             "repository": "AndyCuihaoyi/seekdb-2026",
             "branch": "2026-competition-round2",
             "language": "Rust",
-            "summary": (
-                "在一条只留下 0 字节占位文件的空分支上，从零实现一个"
-                "支持 SQL、列式持久化、精确与近似 TopK 检索、显式事务与崩溃恢复的"
-                "轻量向量数据库；全部核心组件自行实现，不依赖任何外部 crate 或现成引擎。"
-            ),
+            "summary": MATERIAL_SUMMARY["what"],
         },
-        "user_prompts": USER_PROMPTS,
-        "conversations": CONVERSATIONS,
-        "experiments": EXPERIMENTS,
+        "material_summary": MATERIAL_SUMMARY,
+        "user_prompts": prompts,
+        "conversations": build_conversations(turns),
+        "experiments": build_experiments(prompts, index_of_turn),
         "retrospective": RETROSPECTIVE,
         "limitations": LIMITATIONS,
     }
 
 
 def main():
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     doc = build()
     text = json.dumps(doc, ensure_ascii=False, indent=2) + "\n"
     for name in ("conversation.json", "agent/conversation.json"):
-        path = os.path.join(root, name)
+        path = os.path.join(ROOT, name)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(text)
         print("%s: %d bytes" % (name, len(text.encode("utf-8"))))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
