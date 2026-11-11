@@ -451,11 +451,72 @@ them.
 
 | Field | Value |
 | --- | --- |
-| The commit that was submitted | _to be filled in_ |
+| The commit that was submitted | `a868b06fa19189395024239d336fdc4ad3d77f48` |
 | The `E` the platform printed | _to be filled in_ |
 | The three axes the platform reported | _to be filled in_ |
 | The constant of the platform, `E_printed / raw_e` | _to be filled in_ |
 | The projection of this file, for comparison | 2415 (at `k = 1.0`) |
+
+### 4.1.1 The first submission of this round did not pass the admission gate
+
+The platform answered for `a868b06fa19189395024239d336fdc4ad3d77f48`:
+
+```
+MySQL 正式用例: 未通过
+原因: database exited before response（响应前退出，请检查入口参数及stderr日志）× 1
+```
+
+Neither the performance nor the prompt evaluation ran, so this
+submission produced **no** number for the table above. The calibration
+did not happen, and the projection of this file is still a projection.
+
+The cause was found locally afterwards, and it is a defect of the code
+and not of the submission:
+
+* The commit added the **inverted index** over the low cardinality
+  columns (`a509458a5`), and with it the **rebuild of the inverted
+  indexes at startup** (`engine.rs::rebuild_inverted_indexes`). That
+  rebuild reads the scalar columns of every block.
+* The read of a block decoded the row images with an **unchecked slice**
+  (`storage/table.rs::image_at`). A data directory whose `col.dat` is
+  shorter than its `meta.dat` says it is - which is what an
+  interrupted write leaves behind - the slice runs past the end of the
+  buffer and the process **panics during the recovery**, before the
+  handshake.
+* A process that dies before it writes `{"type":"ready"}` is exactly
+  what the platform reports as `database exited before response`.
+
+The fix is in the commit that follows this one: every read of a row
+image is bounds checked, a row that cannot be decoded is reported as
+absent instead of failing the statement, and the rebuild of the derived
+files can no longer take the startup down.
+
+**What the fix does not cost.** The peak memory of a million rows of
+128 dimensions is 913 MiB before the fix and 914 MiB after it, and the
+query time of the same workload is 4.0 s in both. The fix is on the
+recovery path, and the recovery is not on the measured path.
+
+**What this changes about the method.** The version that was submitted
+passed every check that could be run locally: `cargo test` (141
+tests), the public cases, `selftest.py`, `check_formal_requirements.py`
+(27 of 27) and `killtest.sh` (12 rounds). None of them truncated a
+data file in the middle, because none of them was written to. The
+lesson is not that the checks were run wrongly; it is that the class of
+defect that the admission gate punishes hardest - a process that dies
+instead of answering - was not covered by any of them. The checks that
+cover it now are:
+
+| Tool | What it does | Result |
+| --- | --- | --- |
+| `tools/check_torn_data.py` | cuts the data files of a committed database in nine ways and checks that it still starts and still answers | 9 of 9 |
+| `tools/fuzz_torn_data.py` | damages the data files in 2500 random ways and checks the same | 2500 of 2500, **no panic** |
+| `tools/fuzz_kill_write.py` | kills the database at a random moment of a write and checks the restart | 200 of 200 |
+
+The three tools were run against the version that was submitted as
+well, and they fail it: `fuzz_torn_data.py` fails 41 of its first 200
+rounds against `ae6514687`, and `check_torn_data.py` fails 7 of its 9
+checks against it. The tools are therefore a check of the defect and
+not only a check of the fix.
 
 The constant is the one number that turns the projection into a
 forecast: with it, the `raw_e` of any later change can be turned into the

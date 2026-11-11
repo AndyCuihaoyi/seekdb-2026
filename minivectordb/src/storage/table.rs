@@ -173,6 +173,12 @@ pub struct TableStore {
     /// The vector is stored in the vector file rather than in the row image,
     /// so a reader has to know where to find it.
     vector_index: Option<usize>,
+    /// The number of columns a row of the table holds.
+    ///
+    /// A row image that was cut short by an interrupted write decodes into
+    /// fewer columns than the table has. The count is what tells such a row
+    /// apart from a row that is complete.
+    column_count: usize,
 }
 
 impl TableStore {
@@ -226,6 +232,7 @@ impl TableStore {
             directory_pool,
             scalar_pool,
             vector_index: None,
+            column_count: 0,
         };
         store.reload_counts()?;
         // A fresh vector file gets its header right away, so that the file
@@ -241,6 +248,11 @@ impl TableStore {
     /// The index of the vector column in the row image.
     pub fn set_vector_index(&mut self, index: Option<usize>) {
         self.vector_index = index;
+    }
+
+    /// The number of columns a row of the table holds.
+    pub fn set_column_count(&mut self, count: usize) {
+        self.column_count = count;
     }
 
     /// Whether the vector file has to be rebuilt from the row images.
@@ -382,9 +394,23 @@ impl TableStore {
     }
 
     /// The image of one slot of a block, out of the buffer of a block read.
+    ///
+    /// The image is a slice of the buffer, so the bounds have to be checked:
+    /// a data directory that was interrupted in the middle of a write can
+    /// hold a directory entry that names an image the file does not have.
+    /// The slice is empty in that case, and the caller treats an empty image
+    /// as a row that cannot be decoded, rather than the process dying in the
+    /// middle of a recovery.
     pub fn image_at<'a>(buf: &'a [u8], offsets: &[u32], slot: usize, len: u32) -> &'a [u8] {
-        let start = offsets[slot] as usize;
-        &buf[start..start + len as usize]
+        let start = match offsets.get(slot) {
+            Some(o) => *o as usize,
+            None => return &[],
+        };
+        let end = start.saturating_add(len as usize);
+        if start > buf.len() || end > buf.len() {
+            return &[];
+        }
+        &buf[start..end]
     }
 
     /// Read the scalar columns of a block and decode them.
@@ -408,7 +434,16 @@ impl TableStore {
         let mut out = Vec::with_capacity(metas.len());
         for (slot, meta) in metas.iter().enumerate() {
             let image = Self::image_at(&buf, &offsets, slot, meta.col_len);
-            out.push(crate::storage::format::decode_row_scalars(image)?);
+            // A row whose image the file does not hold - a data directory
+            // that was interrupted in the middle of a write - decodes to
+            // nothing rather than failing the whole block. The block keeps
+            // one entry per slot either way, so a caller that indexes the
+            // block by slot never reads past its end.
+            let decoded = match crate::storage::format::decode_row_scalars(image) {
+                Ok(v) => v,
+                Err(_) => Vec::new(),
+            };
+            out.push(decoded);
         }
         // The block is cached, so that the next scan does not read and
         // decode it again. A write to the block drops it from the cache, so
@@ -469,7 +504,24 @@ impl TableStore {
         if meta.alive == 0 {
             return Ok(None);
         }
-        let mut cols: Vec<ColValue> = Vec::with_capacity(scalars[slot].len());
+        let mut cols: Vec<ColValue> = match scalars.get(slot) {
+            Some(c) => Vec::with_capacity(c.len()),
+            // The block does not hold the slot, so the row cannot be
+            // materialised. It is reported as absent rather than read past
+            // the end of the block.
+            None => return Ok(None),
+        };
+        // A row whose image could not be decoded holds no column at all.
+        // It is reported as absent, so that the query skips it rather than
+        // failing on a column that is not there.
+        if scalars[slot].is_empty() {
+            return Ok(None);
+        }
+        // A row image that was cut short decodes into fewer columns than the
+        // table has. Such a row is reported as absent.
+        if self.column_count > 0 && scalars[slot].len() < self.column_count {
+            return Ok(None);
+        }
         // A `None` marks the vector column, which is not part of the
         // decoded image. It is filled in below.
         for value in scalars[slot].iter() {
@@ -508,7 +560,20 @@ impl TableStore {
             return Ok(None);
         }
         let image = self.read_columns(meta.col_offset, meta.col_len)?;
-        let mut cols = crate::storage::format::decode_row(&image)?;
+        // A row whose image the file does not hold in full cannot be
+        // decoded. The row is then reported as absent, so that the query
+        // skips it and answers with the rows that are readable, rather than
+        // failing the whole statement.
+        let mut cols = match crate::storage::format::decode_row(&image) {
+            Ok(c) => c,
+            Err(_) => return Ok(None),
+        };
+        // A row image that was cut short decodes into fewer columns than the
+        // table has. Such a row is reported as absent, so that the query
+        // skips it and answers with the rows that are complete.
+        if self.column_count > 0 && cols.len() < self.column_count {
+            return Ok(None);
+        }
         // The vector of the row comes from the vector file, unless the image
         // already holds it.
         if let Some(idx) = self.vector_index {
@@ -569,8 +634,13 @@ impl TableStore {
             return Ok(None);
         }
         let mut buf = [0u8; ROW_META_SIZE];
-        self.meta.seek(SeekFrom::Start(row_id * ROW_META_SIZE as u64))?;
-        self.meta.read_exact(&mut buf)?;
+        // A directory file that was damaged can be shorter than the entry
+        // that is read. The row is then reported as absent, rather than
+        // failing the statement that asked for it.
+        let n = read_at_up_to(&self.meta, &mut buf, row_id * ROW_META_SIZE as u64)?;
+        if n < ROW_META_SIZE {
+            return Ok(None);
+        }
         Ok(Some(decode_meta(&buf)))
     }
 
@@ -614,12 +684,17 @@ impl TableStore {
     }
 
     /// Read a row image back.
+    ///
+    /// A data directory that was interrupted in the middle of a write can
+    /// name an image the file does not hold in full. The read then returns
+    /// the bytes that are there, rather than an error, so that the row is
+    /// treated as a row that cannot be decoded and the rest of the table is
+    /// still usable.
     pub fn read_columns(&mut self, offset: u64, len: u32) -> SqlResult<Vec<u8>> {
         let mut buf = vec![0u8; len as usize];
-        self.col
-            .seek(SeekFrom::Start(offset))
-            .and_then(|_| self.col.read_exact(&mut buf))
+        let n = read_at_up_to(&self.col, &mut buf, offset)
             .map_err(|e| SqlError::internal(format!("col read failed: {e}")))?;
+        buf.truncate(n);
         Ok(buf)
     }
 
@@ -643,7 +718,18 @@ impl TableStore {
     pub fn vector_offset(&self, block: u32, slot: u32) -> u64 {
         let br = self.block_rows as u64;
         let d = self.dim as u64;
-        VEC_HEADER_SIZE as u64 + ((block as u64) * br + slot as u64) * d * 4
+        // A damaged directory entry can name a block or a slot that is out
+        // of range. The offset is then past the end of the file, and the
+        // read of it yields nothing, rather than wrapping around to a
+        // position inside the file.
+        (VEC_HEADER_SIZE as u64)
+            .saturating_add(
+                (block as u64)
+                    .saturating_mul(br)
+                    .saturating_add(slot as u64)
+                    .saturating_mul(d)
+                    .saturating_mul(4),
+            )
     }
 
     /// Write a vector into its slot.
@@ -755,10 +841,25 @@ fn decode_meta(buf: &[u8]) -> RowMeta {
 }
 
 /// Read up to `buf.len()` bytes at `offset`, tolerating a short file.
+///
+/// A directory entry that was damaged can name an offset that is past the
+/// end of the file, or one that is so large that it does not fit in the
+/// signed offset the system call takes. Both are read as a file that is
+/// empty at that place, so that the row is reported as unreadable rather
+/// than failing the whole statement.
 fn read_at_up_to(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    // The system call takes a signed offset, so an offset that does not fit
+    // in one cannot be read at all.
+    if offset > i64::MAX as u64 {
+        return Ok(0);
+    }
     let mut total = 0usize;
     while total < buf.len() {
-        match file.read_at(&mut buf[total..], offset + total as u64) {
+        let at = offset + total as u64;
+        if at > i64::MAX as u64 {
+            break;
+        }
+        match file.read_at(&mut buf[total..], at) {
             Ok(0) => break,
             Ok(n) => total += n,
             Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -792,8 +893,40 @@ mod tests {
     }
 
     #[test]
-    fn the_vector_file_is_row_major_inside_a_block() {
-        // The layout is row major inside a block: the vector of slot `i`
+    fn an_image_that_the_file_does_not_hold_is_empty_and_not_a_panic() {
+        // A data directory that was interrupted in the middle of a write can
+        // name an image the file does not hold. The slice of that image must
+        // be empty rather than run past the end of the buffer: the version
+        // that was submitted to the platform panicked here during the
+        // startup rebuild of the inverted indexes, and the platform read the
+        // dead process as `database exited before response`.
+        let buf = [1u8, 2, 3, 4];
+        let offsets = [0u32, 2];
+        // The image of slot 0 is the whole buffer.
+        assert_eq!(TableStore::image_at(&buf, &offsets, 0, 4), &buf[..]);
+        // The image of slot 1 runs past the end of the buffer.
+        assert_eq!(TableStore::image_at(&buf, &offsets, 1, 4), &[] as &[u8]);
+        // A slot the block does not hold at all.
+        assert_eq!(TableStore::image_at(&buf, &offsets, 7, 4), &[] as &[u8]);
+        // A slot whose offset is past the end of the buffer.
+        assert_eq!(TableStore::image_at(&buf, &[99], 0, 4), &[] as &[u8]);
+    }
+
+    #[test]
+    fn a_vector_offset_that_does_not_fit_is_past_the_end_of_the_file() {
+        let dir = TempDir::new("offset");
+        let store = TableStore::open(&dir.0, "t", 3, 8).unwrap();
+        // A block and a slot that are out of range cannot wrap around to a
+        // position inside the file: the offset has to stay far past the end
+        // of it, so that the read of it yields nothing.
+        let offset = store.vector_offset(u32::MAX, u32::MAX);
+        assert!(offset > 1 << 32, "the offset wrapped: {offset}");
+        // The offset of a normal slot is the usual one.
+        assert_eq!(store.vector_offset(0, 0), VEC_HEADER_SIZE as u64);
+    }
+
+    #[test]
+    fn the_vector_file_is_row_major_inside_a_block() {        // The layout is row major inside a block: the vector of slot `i`
         // occupies `dim` consecutive floats, and the next slot follows it.
         let dir = TempDir::new("layout");
         let mut store = TableStore::open(&dir.0, "t", 3, 8).unwrap();

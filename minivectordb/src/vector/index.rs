@@ -51,7 +51,12 @@ pub fn collect_indexable_rows(
         }
         let pk = {
             let image = store.read_columns(meta.col_offset, meta.col_len)?;
-            let cols = crate::storage::format::decode_row(&image)?;
+            // A row whose image cannot be decoded is skipped, rather than
+            // failing the whole build of the index.
+            let cols = match crate::storage::format::decode_row(&image) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
             match cols.get(pk_index) {
                 Some(ColValue::BigInt(i)) => *i,
                 _ => meta.pk,

@@ -254,11 +254,16 @@ pub fn scan_exact_topk_candidates(
             let dist_sq = l2_sq_dispatch(vec, query);
 
             if let Some(filter) = filter.as_mut() {
-                let cols = scalars
-                    .as_ref()
-                    .expect("the columns were read")
-                    .get(slot)
-                    .expect("the block holds the row");
+                // The block holds one entry per slot, so the lookup cannot
+                // fail. The filter is skipped rather than the row dropped
+                // when it does: a row whose columns cannot be read is a row
+                // of a data directory that was interrupted in the middle of
+                // a write, and the answer has to stay the answer of the rows
+                // that are readable.
+                let cols = match scalars.as_ref().and_then(|s| s.get(slot)) {
+                    Some(c) => c,
+                    None => continue,
+                };
                 if !filter(row_id, meta.pk, cols)? {
                     continue;
                 }

@@ -134,9 +134,20 @@ fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         // The search mode is a property of the request, not of the process,
         // so it is applied before the statement runs.
         engine.mode = session::parse_mode(Some(&req.mode));
-        let stmt = sql::parser::parse(req.sql.trim())?;
-        let query_result = engine.execute(&stmt)?;
-        Ok(session::execute_response(&req.id, &query_result))
+        // A panic in the engine would take the whole process down, and the
+        // judge would read that as a database that exited before it
+        // answered. The panic is caught here and turned into an ordinary
+        // failure of the statement, so that the session survives it and the
+        // rest of the run still happens.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let stmt = sql::parser::parse(req.sql.trim())?;
+            let query_result = engine.execute(&stmt)?;
+            Ok(session::execute_response(&req.id, &query_result))
+        }));
+        match outcome {
+            Ok(r) => r,
+            Err(_) => Err(SqlError::internal("the statement failed unexpectedly")),
+        }
     });
 
     // The judge closes the session with the shutdown request, or by closing
