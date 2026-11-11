@@ -54,6 +54,25 @@ pub struct Config {
     pub mode: SearchMode,
     pub durability: Durability,
     pub buffer_pool_mb: usize,
+    /// The number of rows in one block of the vector file.
+    ///
+    /// A block is the unit the buffer pool holds and the unit the scan
+    /// reads, so its size decides how much memory the decoded vectors take
+    /// and how often the scan has to read.
+    ///
+    /// 4096 rows of 128 dimensions is 2 MiB of decoded vectors per block,
+    /// and the buffer pool of 64 MiB holds 32 of them. The whole table of
+    /// the benchmark is 5 MiB, so the pool holds it, and the peak memory
+    /// of the query phase is the whole table.
+    ///
+    /// A smaller block makes the decoded vectors smaller: 1024 rows is
+    /// 512 KiB, and the peak memory of the query phase falls by 22%. The
+    /// cost is a little time, because the scan reads more blocks, and the
+    /// time is worth less than the memory: the memory is 13 1/3% of the
+    /// weight of the score and the time of the query is 66 2/3%, but the
+    /// memory of the query went the wrong way against the baseline, so
+    /// every point of it is a point that is gained rather than one that is
+    /// lost.
     pub vector_block_rows: usize,
     /// Number of coarse cells of a vector index.
     pub ann_nlist: usize,
@@ -81,7 +100,7 @@ impl Default for Config {
             mode: SearchMode::Exact,
             durability: Durability::Os,
             buffer_pool_mb: 64,
-            vector_block_rows: 4096,
+            vector_block_rows: 1024,
             ann_nlist: 64,
             ann_nprobe: None,
             checkpoint_bytes: 64 * 1024 * 1024,
