@@ -50,25 +50,27 @@ impl Vector {
         // elements is at most the number of commas plus one, and a vector
         // literal holds a fixed number of them.
         let mut data = Vec::with_capacity(inner.len() / 8 + 1);
-        for part in split_top_level(inner) {
-            let p = trim_ascii(part);
-            if p.is_empty() {
-                return Err(SqlError::data_error(
-                    "invalid vector literal: empty element",
-                ));
+        // The text is walked by bytes, because every byte that matters
+        // here is an ASCII character. The parts are taken one at a time,
+        // so that no list of them has to be held.
+        let bytes = inner.as_bytes();
+        let mut depth = 0i32;
+        let mut start = 0usize;
+        for i in 0..bytes.len() {
+            match bytes[i] {
+                b'[' | b'(' => depth += 1,
+                b']' | b')' => depth -= 1,
+                b',' if depth == 0 => {
+                    data.push(parse_element(&inner[start..i])?);
+                    start = i + 1;
+                }
+                _ => {}
             }
-            let v = parse_f32(p)?;
-            if !v.is_finite() {
-                return Err(SqlError::data_error(format!(
-                    "invalid vector element '{p}': value must be finite"
-                )));
-            }
-            data.push(v);
         }
+        data.push(parse_element(&inner[start..])?);
         let dim = data.len();
         Ok(Vector { dim, data })
     }
-
     /// Check the dimension against the column declaration.
     pub fn check_dim(&self, expected: usize) -> SqlResult<()> {
         if self.dim != expected {
@@ -81,19 +83,38 @@ impl Vector {
     }
 }
 
+/// Parse one element of a vector literal.
+fn parse_element(part: &str) -> SqlResult<f32> {
+    let p = trim_ascii(part);
+    if p.is_empty() {
+        return Err(SqlError::data_error(
+            "invalid vector literal: empty element",
+        ));
+    }
+    let v = parse_f32(p)?;
+    if !v.is_finite() {
+        return Err(SqlError::data_error(format!(
+            "invalid vector element '{p}': value must be finite"
+        )));
+    }
+    Ok(v)
+}
+
 /// Split on commas that are not nested inside brackets.
 ///
 /// The parts are handed out one at a time, so that the parse of a vector
-/// literal does not have to hold a list of them.
+/// literal does not have to hold a list of them. The text is walked by
+/// bytes, because every byte that matters here is an ASCII character.
 fn split_top_level(s: &str) -> impl Iterator<Item = &str> {
+    let bytes = s.as_bytes();
     let mut parts = Vec::new();
     let mut depth = 0i32;
     let mut start = 0usize;
-    for (i, c) in s.char_indices() {
-        match c {
-            '[' | '(' => depth += 1,
-            ']' | ')' => depth -= 1,
-            ',' if depth == 0 => {
+    for i in 0..bytes.len() {
+        match bytes[i] {
+            b'[' | b'(' => depth += 1,
+            b']' | b')' => depth -= 1,
+            b',' if depth == 0 => {
                 parts.push(&s[start..i]);
                 start = i + 1;
             }
