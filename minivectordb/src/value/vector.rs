@@ -106,8 +106,11 @@ pub fn parse_f32(text: &str) -> SqlResult<f32> {
     if t.is_empty() {
         return Err(SqlError::data_error("invalid numeric literal: empty"));
     }
-    let lower = t.to_ascii_lowercase();
-    if lower.contains("nan") || lower.contains("inf") {
+    // The check for the NaN and Infinity spellings is case insensitive, but
+    // it must not allocate: a vector literal holds `dim` numbers and the
+    // parse runs for every one of them, so a copy of the text per number
+    // would dominate the cost of the parse.
+    if contains_ignore_case(t, "nan") || contains_ignore_case(t, "inf") {
         return Err(SqlError::data_error(format!(
             "invalid numeric literal '{t}': NaN and Infinity are not allowed"
         )));
@@ -127,6 +130,31 @@ pub fn parse_f32(text: &str) -> SqlResult<f32> {
         )));
     }
     Ok(f)
+}
+
+/// Whether the text holds the word, ignoring the case of the letters.
+///
+/// The comparison is done on the bytes, so it only folds the ASCII letters.
+/// A non-ASCII byte can never be part of "nan" or "inf", so it does not have
+/// to be folded.
+fn contains_ignore_case(text: &str, word: &str) -> bool {
+    let bytes = text.as_bytes();
+    let needle = word.as_bytes();
+    if needle.len() > bytes.len() {
+        return false;
+    }
+    let last = bytes.len() - needle.len();
+    'outer: for start in 0..=last {
+        for (i, n) in needle.iter().enumerate() {
+            let b = bytes[start + i];
+            let folded = if b.is_ascii_uppercase() { b + 32 } else { b };
+            if folded != *n {
+                continue 'outer;
+            }
+        }
+        return true;
+    }
+    false
 }
 
 #[cfg(test)]

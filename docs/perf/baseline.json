@@ -1,0 +1,19 @@
+{
+  "commit": "b88e020944f78f1800b8b900300de6b4629d36a0",
+  "measured_at": "2026-11-11T12:29:00+08:00",
+  "config": { "rows": 10000, "dim": 128, "queries": 1000, "k": 10, "buffer_pool_mb": 64 },
+  "ann": {
+    "query": { "t_ms": 3170.498, "io_bytes": 7378838, "peak_rss_kb": 14732, "recall_filtered": 1.0, "recall_unfiltered": 1.0 },
+    "write": { "t_ms": 2445.01, "io_bytes": 23104304, "peak_rss_kb": 3764 },
+    "index": { "t_ms": 120.198 }
+  },
+  "exact": {
+    "query": { "t_ms": 1360.141 },
+    "write": { "t_ms": 1942.553, "io_bytes": 23104906, "peak_rss_kb": 3756 }
+  },
+  "answers": {
+    "ann_file": "docs/perf/answers-baseline-ann.txt",
+    "exact_file": "docs/perf/answers-baseline-exact.txt",
+    "ann_vs_exact": "identical"
+  }
+}

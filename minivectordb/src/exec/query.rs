@@ -47,6 +47,32 @@ pub enum EvalValue {
     Null,
 }
 
+/// A vector literal that was parsed once for a whole statement.
+///
+/// The literal of an `L2_DISTANCE` call is the same for every row of a scan.
+/// Parsing it once and handing it to the evaluation removes the per-row
+/// parse, which is the single most expensive part of the fixed cost of a
+/// query: the literal holds `dim` numbers and the parse of every one of them
+/// goes through the generic float parser.
+///
+/// The literal is kept as the parsed vector, so the evaluation compares the
+/// stored vector against the *same* values the literal names. That keeps the
+/// distance bit for bit the one the per-row parse produced.
+pub type LiteralCache = HashMap<String, Vector>;
+
+/// Parse a vector literal, using the cache of the statement.
+///
+/// The cache is keyed by the text of the literal, so two calls with the same
+/// text share one parse.
+pub fn parse_literal_cached(text: &str, cache: &mut LiteralCache) -> SqlResult<Vector> {
+    if let Some(v) = cache.get(text) {
+        return Ok(v.clone());
+    }
+    let v = Vector::parse_literal(text)?;
+    cache.insert(text.to_string(), v.clone());
+    Ok(v)
+}
+
 impl EvalValue {
     pub fn as_bigint(&self) -> Option<i64> {
         match self {
@@ -182,6 +208,45 @@ impl RowValues<'_> {
             },
         }
     }
+
+    /// The text of a column, borrowed from the row.
+    ///
+    /// The borrowed form is what a predicate uses: a filter compares the
+    /// text of a column with the text of a literal, and the comparison does
+    /// not need an owned copy of either side. Borrowing avoids one heap
+    /// allocation per row and per predicate, which is the difference
+    /// between a filter that costs a few nanoseconds per row and one that
+    /// costs hundreds.
+    pub fn text_at(&self, idx: usize) -> SqlResult<Option<&str>> {
+        match self {
+            RowValues::Decoded(cols) => match cols.get(idx) {
+                Some(ColValue::Text(s)) => Ok(Some(s.as_str())),
+                _ => Ok(None),
+            },
+            RowValues::Scalars(cols) => match cols.get(idx) {
+                Some(Some(ColValue::Text(s))) => Ok(Some(s.as_str())),
+                _ => Ok(None),
+            },
+            // The image form has to be decoded to be read, so it cannot be
+            // borrowed. The scan uses the decoded forms.
+            RowValues::Image(_) => Ok(None),
+        }
+    }
+
+    /// The integer of a column, borrowed from the row.
+    pub fn bigint_at(&self, idx: usize) -> SqlResult<Option<i64>> {
+        match self {
+            RowValues::Decoded(cols) => match cols.get(idx) {
+                Some(ColValue::BigInt(i)) => Ok(Some(*i)),
+                _ => Ok(None),
+            },
+            RowValues::Scalars(cols) => match cols.get(idx) {
+                Some(Some(ColValue::BigInt(i))) => Ok(Some(*i)),
+                _ => Ok(None),
+            },
+            RowValues::Image(_) => Ok(None),
+        }
+    }
 }
 
 /// A mapping from a row identifier to the position of the row in a list.
@@ -249,15 +314,18 @@ impl Engine {
         if let Some(topk) = self.detect_distance_topk(sel, &def)? {
             return self.exec_distance_topk(sel, &def, topk);
         }
-
         let rows = self.collect_rows(&def)?;
+
+        // The vector literals of the statement are parsed once and then
+        // reused for every row, instead of being parsed once per row.
+        let mut cache: LiteralCache = LiteralCache::new();
 
         // Apply the filter first: a filtered TopK must be computed over the
         // filtered set, not over the whole table.
         let mut selected: Vec<LiveRow> = Vec::with_capacity(rows.len());
         for row in rows {
             if let Some(filter) = &sel.filter {
-                if !self.eval_predicate(filter, &row, &def)? {
+                if !self.eval_predicate(filter, &row, &def, &mut cache)? {
                     continue;
                 }
             }
@@ -307,7 +375,7 @@ impl Engine {
             for proj in &projections {
                 let v = match proj {
                     Projection::Column(idx) => self.column_at(row, &def, *idx)?,
-                    Projection::Expr(e) => self.eval_expr(e, row, &def)?,
+                    Projection::Expr(e) => self.eval_expr(e, row, &def, &mut cache)?,
                 };
                 values.push(v.to_cell());
             }
@@ -316,7 +384,7 @@ impl Engine {
             // Compute the sort keys.
             let mut keys = Vec::with_capacity(order_terms.len());
             for (expr, _) in &order_terms {
-                keys.push(self.eval_expr(expr, row, &def)?);
+                keys.push(self.eval_expr(expr, row, &def, &mut cache)?);
             }
             sort_keys.push(keys);
         }
@@ -411,7 +479,7 @@ impl Engine {
             Expr::Str(s) => s.as_str(),
             _ => return Ok(None),
         };
-        let query = Vector::parse_literal(literal)?;
+        let query = crate::prof::measure("q.parse_literal", || Vector::parse_literal(literal))?;
         // The query vector must have the dimension of the column. Checking it
         // here keeps a mismatch from reaching the distance kernel, which
         // assumes two vectors of equal length.
@@ -435,17 +503,19 @@ impl Engine {
             .get(&def.name.to_ascii_lowercase())
             .map(|t| t.id)
             .unwrap_or(0);
-        let updated: HashSet<u64> = self
-            .txn_buffer
-            .updated_of(table_id)
-            .into_iter()
-            .map(|(row_id, _)| row_id)
-            .collect();
-        let deleted: HashSet<u64> = self
-            .txn_buffer
-            .deleted_of(table_id)
-            .into_iter()
-            .collect();
+        let updated: HashSet<u64> = crate::prof::measure("q.txn_updated", || {
+            self.txn_buffer
+                .updated_of(table_id)
+                .into_iter()
+                .map(|(row_id, _)| row_id)
+                .collect()
+        });
+        let deleted: HashSet<u64> = crate::prof::measure("q.txn_deleted", || {
+            self.txn_buffer
+                .deleted_of(table_id)
+                .into_iter()
+                .collect()
+        });
         // The number of committed rows. A row whose identifier is below it
         // exists in the index; the staged rows have identifiers at or above
         // it.
@@ -457,6 +527,13 @@ impl Engine {
 
         // The candidates, with their distance and primary key.
         let mut candidates: Vec<(i64, f32, u64)> = Vec::new();
+
+        // The vector literals of the statement are parsed once and then
+        // reused for every row, instead of being parsed once per row.
+        //
+        // The cache is shared with the scan closures, which need it through
+        // a shared reference, so it lives in a cell.
+        let cache: std::cell::RefCell<LiteralCache> = std::cell::RefCell::new(LiteralCache::new());
 
         let use_index = self.mode == SearchMode::Ann && self.has_vector_index(table_id);
         if use_index {
@@ -505,8 +582,12 @@ impl Engine {
                 }
                 // The filter is applied before the row enters the answer.
                 match &filter {
-                    Some(f) => match eval_predicate(f, &RowValues::Scalars(&cols[slot]), def) {
-                        Ok(true) => {}
+                    Some(f) => match eval_predicate_borrowed(
+                        f,
+                        &RowValues::Scalars(&cols[slot]),
+                        def,
+                        &mut cache.borrow_mut(),
+                    ) {                        Ok(true) => {}
                         Ok(false) => return Ok(None),
                         Err(e) => {
                             if scan_error.is_none() {
@@ -520,9 +601,10 @@ impl Engine {
                 // The vector of the row comes from the vector file, through
                 // the block cache.
                 let vec = state.store.read_vector_cached(&meta)?;
-                Ok(Some(crate::vector::dist::l2_dispatch(&vec, query)))
-            };
-            let scan = index.scan_ordered(query, nprobe, topk.k, &mut fetch, &mut hits);
+                Ok(Some(crate::vector::dist::l2_dispatch(&vec, query)))            };
+            let scan = crate::prof::measure("q.ann_scan", || {
+                index.scan_ordered(query, nprobe, topk.k, &mut fetch, &mut hits)
+            });
             // The index goes back into the table.
             if let Some(state) = self.tables.get_mut(&key) {
                 state.index = Some(index);
@@ -553,16 +635,23 @@ impl Engine {
                     return Ok(false);
                 }
                 match &filter_expr {
-                    Some(f) => eval_predicate(f, &RowValues::Scalars(cols), def),
+                    Some(f) => eval_predicate_borrowed(
+                        f,
+                        &RowValues::Scalars(cols),
+                        def,
+                        &mut cache.borrow_mut(),
+                    ),
                     None => Ok(true),
                 }
             };
-            let hits = crate::vector::exact::scan_exact_topk(
-                store,
-                topk.query.as_slice(),
-                topk.k,
-                Some(&mut filter),
-            )?;
+            let hits = crate::prof::measure("q.exact_scan", || {
+                crate::vector::exact::scan_exact_topk(
+                    store,
+                    topk.query.as_slice(),
+                    topk.k,
+                    Some(&mut filter),
+                )
+            })?;
             for hit in hits {
                 candidates.push((hit.pk, hit.dist, hit.row_id));
             }
@@ -594,7 +683,12 @@ impl Engine {
                 };
                 let row = LiveRow { row_id, pk, cols };
                 if let Some(filter) = &sel.filter {
-                    if !eval_predicate(filter, &RowValues::Decoded(&row.cols), def)? {
+                    if !eval_predicate(
+                        filter,
+                        &RowValues::Decoded(&row.cols),
+                        def,
+                        &mut cache.borrow_mut(),
+                    )? {
                         continue;
                     }
                 }
@@ -638,8 +732,8 @@ impl Engine {
         // Only the rows of the answer are materialised, so the rendering
         // costs one read per row of the answer, not per row of the table.
         let wanted: Vec<u64> = candidates.iter().map(|(_, _, row_id)| *row_id).collect();
-        let rows = self.materialize_rows(def, &wanted)?;
-        let row_index = RowIndex::build(&rows);
+        let rows = crate::prof::measure("q.materialize", || self.materialize_rows(def, &wanted))?;
+        let row_index = crate::prof::measure("q.rowindex", || RowIndex::build(&rows));
         let mut out: Vec<Vec<Cell>> = Vec::with_capacity(candidates.len());
         for (pk, _d, row_id) in &candidates {
             let row = match row_index.row(&rows, *row_id) {
@@ -650,7 +744,9 @@ impl Engine {
             for proj in &projections {
                 let v = match proj {
                     Projection::Column(idx) => self.column_at(row, def, *idx)?,
-                    Projection::Expr(e) => self.eval_expr(e, row, def)?,
+                    Projection::Expr(e) => {
+                        self.eval_expr(e, row, def, &mut cache.borrow_mut())?
+                    }
                 };
                 values.push(v.to_cell());
             }
@@ -799,8 +895,9 @@ impl Engine {
         expr: &Expr,
         row: &LiveRow,
         def: &TableDef,
+        cache: &mut LiteralCache,
     ) -> SqlResult<EvalValue> {
-        eval_expr(expr, &RowValues::Decoded(&row.cols), def)
+        eval_expr(expr, &RowValues::Decoded(&row.cols), def, cache)
     }
 
     /// Read one column value of a row.
@@ -819,8 +916,9 @@ impl Engine {
         expr: &Expr,
         row: &LiveRow,
         def: &TableDef,
+        cache: &mut LiteralCache,
     ) -> SqlResult<bool> {
-        eval_predicate(expr, &RowValues::Decoded(&row.cols), def)
+        eval_predicate(expr, &RowValues::Decoded(&row.cols), def, cache)
     }
 }
 
@@ -828,7 +926,16 @@ impl Engine {
 ///
 /// The evaluation does not need the engine, so it is a free function: a
 /// scan can call it while it holds a mutable borrow of the storage.
-pub fn eval_expr(expr: &Expr, row: &RowValues<'_>, def: &TableDef) -> SqlResult<EvalValue> {
+///
+/// The cache holds the vector literals that were already parsed for this
+/// statement. It is threaded through the evaluation so that a literal is
+/// parsed once for the whole statement instead of once per row.
+pub fn eval_expr(
+    expr: &Expr,
+    row: &RowValues<'_>,
+    def: &TableDef,
+    cache: &mut LiteralCache,
+) -> SqlResult<EvalValue> {
     match expr {
         Expr::Int(i) => Ok(EvalValue::BigInt(*i)),
         Expr::Str(s) => Ok(EvalValue::Text(s.clone())),
@@ -843,8 +950,8 @@ pub fn eval_expr(expr: &Expr, row: &RowValues<'_>, def: &TableDef) -> SqlResult<
             row.at(idx)
         }
         Expr::Compare(l, op, r) => {
-            let lv = eval_expr(l, row, def)?;
-            let rv = eval_expr(r, row, def)?;
+            let lv = eval_expr(l, row, def, cache)?;
+            let rv = eval_expr(r, row, def, cache)?;
             let ord = compare_values(&lv, &rv);
             let res = match op {
                 CmpOp::Eq => ord == std::cmp::Ordering::Equal,
@@ -857,8 +964,8 @@ pub fn eval_expr(expr: &Expr, row: &RowValues<'_>, def: &TableDef) -> SqlResult<
             Ok(EvalValue::Boolean(res))
         }
         Expr::BoolOp(l, op, r) => {
-            let lv = eval_expr(l, row, def)?;
-            let rv = eval_expr(r, row, def)?;
+            let lv = eval_expr(l, row, def, cache)?;
+            let rv = eval_expr(r, row, def, cache)?;
             let lb = truthy(&lv);
             let rb = truthy(&rv);
             let res = match op {
@@ -894,7 +1001,7 @@ pub fn eval_expr(expr: &Expr, row: &RowValues<'_>, def: &TableDef) -> SqlResult<
                 }
             };
             let query = match lit {
-                Expr::Str(s) => Vector::parse_literal(s)?,
+                Expr::Str(s) => parse_literal_cached(s, cache)?,
                 _ => {
                     return Err(SqlError::not_supported(
                         "L2_DISTANCE requires a vector literal",
@@ -913,9 +1020,97 @@ pub fn eval_predicate(
     expr: &Expr,
     row: &RowValues<'_>,
     def: &TableDef,
+    cache: &mut LiteralCache,
 ) -> SqlResult<bool> {
-    let v = eval_expr(expr, row, def)?;
+    let v = eval_expr(expr, row, def, cache)?;
     Ok(truthy(&v))
+}
+
+/// Evaluate a boolean predicate against a row, without allocating.
+///
+/// This is the predicate of the scan, and it runs once per row of the
+/// table. The general evaluation allocates for every text value it reads,
+/// because it produces an owned `EvalValue`. A scan that filters on a text
+/// column therefore allocated a copy of the column for every row, and the
+/// allocation - not the comparison - dominated the cost of the filter.
+///
+/// The borrowed evaluation compares the text of the column with the text of
+/// the literal in place. It handles the shapes a filter of the evaluation
+/// has - an equality or an inequality on a text or an integer column, and
+/// the conjunction or the disjunction of two such comparisons - and falls
+/// back to the general evaluation for anything else, so the answer of a
+/// filter never depends on this function.
+pub fn eval_predicate_borrowed(
+    expr: &Expr,
+    row: &RowValues<'_>,
+    def: &TableDef,
+    cache: &mut LiteralCache,
+) -> SqlResult<bool> {
+    match expr {
+        Expr::Compare(l, op, r) => {
+            // The shape that is handled without allocating: a column on one
+            // side and a literal on the other.
+            let (col, lit) = match (l.as_ref(), r.as_ref()) {
+                (Expr::Column(name), other) => (name.as_str(), other),
+                (other, Expr::Column(name)) => (name.as_str(), other),
+                _ => {
+                    return eval_predicate(expr, row, def, cache);
+                }
+            };
+            let idx = match def.column_index(col) {
+                Some(i) => i,
+                None => return eval_predicate(expr, row, def, cache),
+            };
+            match lit {
+                Expr::Str(text) => {
+                    let value = match row.text_at(idx)? {
+                        Some(v) => v,
+                        // The column does not hold text. The general
+                        // evaluation decides what that means.
+                        None => return eval_predicate(expr, row, def, cache),
+                    };
+                    Ok(match op {
+                        CmpOp::Eq => value == text.as_str(),
+                        CmpOp::Ne => value != text.as_str(),
+                        CmpOp::Lt => value < text.as_str(),
+                        CmpOp::LtEq => value <= text.as_str(),
+                        CmpOp::Gt => value > text.as_str(),
+                        CmpOp::GtEq => value >= text.as_str(),
+                    })
+                }
+                Expr::Int(value) => {
+                    let stored = match row.bigint_at(idx)? {
+                        Some(v) => v,
+                        None => return eval_predicate(expr, row, def, cache),
+                    };
+                    Ok(match op {
+                        CmpOp::Eq => stored == *value,
+                        CmpOp::Ne => stored != *value,
+                        CmpOp::Lt => stored < *value,
+                        CmpOp::LtEq => stored <= *value,
+                        CmpOp::Gt => stored > *value,
+                        CmpOp::GtEq => stored >= *value,
+                    })
+                }
+                _ => eval_predicate(expr, row, def, cache),
+            }
+        }
+        Expr::BoolOp(l, op, r) => {
+            // A conjunction short circuits: the right side is only
+            // evaluated when the left side does not decide the answer.
+            if let BoolOp::And = op {
+                if !eval_predicate_borrowed(l, row, def, cache)? {
+                    return Ok(false);
+                }
+                return eval_predicate_borrowed(r, row, def, cache);
+            }
+            if eval_predicate_borrowed(l, row, def, cache)? {
+                return Ok(true);
+            }
+            eval_predicate_borrowed(r, row, def, cache)
+        }
+        _ => eval_predicate(expr, row, def, cache),
+    }
 }
 
 /// Interpret a value as a boolean.

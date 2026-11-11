@@ -206,9 +206,10 @@ impl Engine {
         let rows = self.collect_rows(&def)?;
         let mut affected = 0u64;
         let mut updates: Vec<(u64, Vec<ColValue>)> = Vec::new();
+        let mut cache = crate::exec::query::LiteralCache::new();
         for row in rows {
             if let Some(filter) = &upd.filter {
-                if !self.eval_predicate(filter, &row, &def)? {
+                if !self.eval_predicate(filter, &row, &def, &mut cache)? {
                     continue;
                 }
             }
@@ -251,9 +252,10 @@ impl Engine {
         let rows = self.collect_rows(&def)?;
         let mut affected = 0u64;
         let mut victims = Vec::new();
+        let mut cache = crate::exec::query::LiteralCache::new();
         for row in rows {
             if let Some(filter) = &del.filter {
-                if !self.eval_predicate(filter, &row, &def)? {
+                if !self.eval_predicate(filter, &row, &def, &mut cache)? {
                     continue;
                 }
             }

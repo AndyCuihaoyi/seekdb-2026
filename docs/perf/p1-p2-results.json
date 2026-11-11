@@ -1,0 +1,27 @@
+{
+  "commit": "P-A + P-B1 working tree",
+  "config": { "rows": 10000, "dim": 128, "queries": 1000, "k": 10, "mode": "exact" },
+  "baseline": {
+    "query": { "t_ms": 1360.1, "io_bytes": 7380838, "peak_rss_kb": 14820 },
+    "write": { "t_ms": 1942.6, "io_bytes": 23104906, "peak_rss_kb": 3756 }
+  },
+  "after": {
+    "query": { "t_ms": 717.4, "io_bytes": 7380838, "peak_rss_kb": 14816 },
+    "write": { "t_ms": 2353.0, "io_bytes": 23104906, "peak_rss_kb": 3984 },
+    "recall_filtered": 1.0, "recall_unfiltered": 1.0
+  },
+  "phase_profile": {
+    "before": { "q.exact_scan": 655.7, "q.materialize": 45.7, "parse_sql": 14.6, "q.parse_literal": 8.8 },
+    "after":  { "q.exact_scan": 398.3, "q.materialize": 45.7, "parse_sql": 14.2, "q.parse_literal": 8.7 }
+  },
+  "gates": {
+    "answers_byte_identical": true,
+    "exact_equals_ann": true,
+    "unit_tests": "117 + 12 protocol",
+    "public_cases": "all passed (both modes)",
+    "selftest": "passed",
+    "formal_requirements": "27 of 27",
+    "smoke": "passed",
+    "killtest_host": "12 rounds passed"
+  }
+}

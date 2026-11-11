@@ -280,6 +280,11 @@ pub struct TableState {
     /// The index is not persisted; it is rebuilt from the table data at
     /// startup, which happens before the server reports readiness.
     pub index: Option<crate::vector::ann::IvfIndex>,
+    /// The inverted indexes of the low cardinality columns of the table.
+    ///
+    /// They are not persisted either: they are rebuilt from the table data
+    /// at startup, in one pass over the blocks of the table.
+    pub inverted: crate::vector::inverted::ColumnIndexes,
 }
 
 impl Engine {
@@ -1007,7 +1012,13 @@ impl Engine {
         self.catalog.insert(def.clone());
         self.tables.insert(
             name.to_ascii_lowercase(),
-            TableState { def, store, id: table_id, index: None },
+            TableState {
+                def,
+                store,
+                id: table_id,
+                index: None,
+                inverted: crate::vector::inverted::ColumnIndexes::new(),
+            },
         );
         Ok(())
     }
