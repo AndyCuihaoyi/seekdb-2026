@@ -351,7 +351,54 @@ impl Engine {
         if let Some(topk) = self.detect_distance_topk(sel, &def)? {
             return self.exec_distance_topk(sel, &def, topk);
         }
-        let rows = self.collect_rows(&def)?;
+
+        // A statement that looks up one row by its primary key is answered
+        // through the primary key index, without reading the table.
+        //
+        // Without this the statement would read and decode every row of the
+        // table, vectors included, and then throw all of them away but one.
+        // The index already holds the row identifier of every primary key,
+        // so the row that answers the statement is found in one lookup.
+        //
+        // The outer answer says whether the statement was recognised; the
+        // inner one says whether the row exists. A statement about a key
+        // that is not in the table answers nothing, and it must not fall
+        // back to the scan: the scan would find nothing either, but it
+        // would read the whole table to find it out.
+        if let Some(found) = self.detect_primary_key_lookup(sel, &def) {
+            return self.exec_primary_key_lookup(sel, &def, found);
+        }
+
+        // The rows the inverted index of the filter column names.
+        //
+        // When the filter is an equality on an indexed column, the index
+        // names the rows that can satisfy it, and only those rows are read.
+        // The filter is still applied to them, so the answer does not depend
+        // on the index being up to date.
+        let candidate_rows: Option<Vec<u64>> = match sel.filter.as_ref() {
+            Some(f) => match detect_index_filter(f, &def) {
+                Some(plan) => {
+                    let table_id = self
+                        .tables
+                        .values()
+                        .find(|t| t.def.name == def.name)
+                        .map(|t| t.id);
+                    table_id
+                        .and_then(|id| self.tables.values().find(|t| t.id == id))
+                        .and_then(|state| state.inverted.get(plan.column))
+                        .and_then(|index| index.lookup(&plan.value))
+                        .map(|rows| rows.to_vec())
+                }
+                None => None,
+            },
+            None => None,
+        };
+
+        // Only the rows the index names are read.
+        let rows = match candidate_rows.as_ref() {
+            Some(ids) => self.materialize_rows(&def, ids)?,
+            None => self.collect_rows(&def)?,
+        };
 
         // The vector literals of the statement are parsed once and then
         // reused for every row, instead of being parsed once per row.
@@ -462,6 +509,204 @@ impl Engine {
     }
 
     // ------------------------------------------------------------ vector TopK
+
+    /// Recognise a statement that looks up one row by its primary key.
+    ///
+    /// The statement must filter on an equality of the primary key with a
+    /// constant, and it must not order the answer by anything but the
+    /// primary key itself, so that at most one row can answer it.
+    ///
+    /// The outer answer says whether the statement was recognised; the
+    /// inner one says whether the row exists. A statement about a key that
+    /// is not in the table still answers nothing, so it is recognised too
+    /// and does not fall back to the scan.
+    ///
+    /// The recognition is deliberately narrow. A statement that does not
+    /// match it takes the general path, which produces the same answer.
+    fn detect_primary_key_lookup(
+        &self,
+        sel: &Select,
+        def: &TableDef,
+    ) -> Option<Option<u64>> {
+        // An ordering by something else could put a different row first.
+        for (expr, _) in &sel.order_by {
+            let resolved = match expr {
+                Expr::Column(name) => sel
+                    .items
+                    .iter()
+                    .find(|i| i.alias.as_deref() == Some(name.as_str()))
+                    .and_then(|i| i.expr.clone())
+                    .unwrap_or_else(|| expr.clone()),
+                other => other.clone(),
+            };
+            match resolved {
+                Expr::Column(name) if def.column_index(&name) == Some(def.pk_index) => {}
+                _ => return None,
+            }
+        }
+        // A limit of zero answers nothing, so there is no row to look up.
+        if sel.limit == Some(0) {
+            return None;
+        }
+        let filter = sel.filter.as_ref()?;
+        let (left, right) = match filter {
+            Expr::Compare(l, CmpOp::Eq, r) => (l.as_ref(), r.as_ref()),
+            _ => return None,
+        };
+        let (name, value) = match (left, right) {
+            (Expr::Column(name), Expr::Int(value)) => (name.as_str(), *value),
+            (Expr::Int(value), Expr::Column(name)) => (name.as_str(), *value),
+            _ => return None,
+        };
+        if def.column_index(name) != Some(def.pk_index) {
+            return None;
+        }
+        let table_id = self.tables.values().find(|t| t.def.name == def.name)?.id;
+
+        // A row the transaction staged is not in the index yet: the index
+        // holds the committed rows. The transaction is asked first, so a
+        // row that is not committed yet is still found.
+        //
+        // The staged rows are searched by their primary key. The search is
+        // over the log of the transaction, which is short, and it happens
+        // only for a key that the index does not hold.
+        if !self
+            .pk_index
+            .get(&table_id)
+            .map(|m| m.contains_key(&value))
+            .unwrap_or(false)
+        {
+            let staged = self
+                .txn_buffer
+                .inserted_of(table_id)
+                .into_iter()
+                .chain(self.txn_buffer.updated_of(table_id))
+                .find_map(|(row_id, cols)| {
+                    let pk = match cols.get(def.pk_index) {
+                        Some(ColValue::BigInt(i)) => *i,
+                        _ => return None,
+                    };
+                    if pk == value {
+                        Some(row_id)
+                    } else {
+                        None
+                    }
+                });
+            if let Some(row_id) = staged {
+                return Some(Some(row_id));
+            }
+        }
+
+        // The row identifier of the primary key, from the index.
+        let index = self.pk_index.get(&table_id)?;
+        Some(index.get(&value).copied())
+    }
+
+    /// Answer a statement that looks up one row by its primary key.
+    ///
+    /// Only the row that answers the statement is read. The row that the
+    /// transaction holds is preferred over the committed one, because the
+    /// transaction may have changed it.
+    fn exec_primary_key_lookup(
+        &mut self,
+        sel: &Select,
+        def: &TableDef,
+        found: Option<u64>,
+    ) -> SqlResult<QueryResult> {
+        let columns = self.output_columns(sel, def);
+        let row_id = match found {
+            Some(id) => id,
+            None => {
+                return Ok(QueryResult { columns, rows: Vec::new(), affected: None });
+            }
+        };
+        let table_id = self
+            .tables
+            .values()
+            .find(|t| t.def.name == def.name)
+            .map(|t| t.id)
+            .ok_or_else(|| SqlError::no_such_table(&def.name))?;
+
+        // The row may be one the transaction changed.
+        let staged = self
+            .txn_buffer
+            .inserted_of(table_id)
+            .into_iter()
+            .chain(self.txn_buffer.updated_of(table_id))
+            .find(|(id, _)| *id == row_id);
+        let row = match staged {
+            Some((_, cols)) => {
+                let pk = match cols.get(def.pk_index) {
+                    Some(ColValue::BigInt(i)) => *i,
+                    _ => 0,
+                };
+                LiveRow { row_id, pk, cols }
+            }
+            None => {
+                // A row the transaction deleted is not visible.
+                if self.txn_buffer.deleted_of(table_id).contains(&row_id) {
+                    return Ok(QueryResult { columns, rows: Vec::new(), affected: None });
+                }
+                let rows = self.materialize_rows(def, &[row_id])?;
+                match rows.into_iter().next() {
+                    Some(r) => r,
+                    None => {
+                        return Ok(QueryResult { columns, rows: Vec::new(), affected: None });
+                    }
+                }
+            }
+        };
+
+        // Determine the output columns.
+        let mut columns: Vec<String> = Vec::new();
+        let mut projections: Vec<Projection> = Vec::new();
+        for item in &sel.items {
+            match &item.expr {
+                None => {
+                    for (i, c) in def.columns.iter().enumerate() {
+                        columns.push(c.name.clone());
+                        projections.push(Projection::Column(i));
+                    }
+                }
+                Some(expr) => {
+                    let name = item.alias.clone().unwrap_or_else(|| describe_expr(expr));
+                    columns.push(name.clone());
+                    projections.push(Projection::Expr(expr.clone()));
+                }
+            }
+        }
+        debug_assert_eq!(columns, self.output_columns(sel, def));
+
+        let mut cache: LiteralCache = LiteralCache::new();
+        let mut values = Vec::with_capacity(projections.len());
+        for proj in &projections {
+            let v = match proj {
+                Projection::Column(idx) => self.column_at(&row, def, *idx)?,
+                Projection::Expr(e) => self.eval_expr(e, &row, def, &mut cache)?,
+            };
+            values.push(v.to_cell());
+        }
+        Ok(QueryResult { columns, rows: vec![values], affected: None })
+    }
+
+    /// The names of the output columns of a statement.
+    fn output_columns(&self, sel: &Select, def: &TableDef) -> Vec<String> {
+        let mut columns: Vec<String> = Vec::new();
+        for item in &sel.items {
+            match &item.expr {
+                None => {
+                    for c in def.columns.iter() {
+                        columns.push(c.name.clone());
+                    }
+                }
+                Some(expr) => {
+                    let name = item.alias.clone().unwrap_or_else(|| describe_expr(expr));
+                    columns.push(name);
+                }
+            }
+        }
+        columns
+    }
 
     /// Recognise a vector TopK request.
     ///

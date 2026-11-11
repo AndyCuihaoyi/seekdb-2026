@@ -1717,4 +1717,83 @@ mod tests {
         );
         assert!(in_c0.contains(&4), "the rolled back change moved the row");
     }
+
+    // ------------------------------------------------------- primary key path
+
+    /// The rows of a lookup, as the primary keys the answer holds.
+    fn lookup_ids(engine: &mut Engine, sql: &str) -> Vec<i64> {
+        let out = run(engine, sql).unwrap();
+        out.rows
+            .iter()
+            .map(|row| match &row[0] {
+                Cell::Int(i) => *i,
+                other => panic!("the answer holds a {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_row_is_found_by_its_primary_key() {
+        let dir = TempDir::new("pk-lookup");
+        let mut engine = engine_in(&dir);
+        categories_table(&mut engine);
+
+        assert_eq!(lookup_ids(&mut engine, "SELECT id FROM t WHERE id = 4"), vec![4]);
+        assert_eq!(lookup_ids(&mut engine, "SELECT id FROM t WHERE id = 999"), Vec::<i64>::new());
+    }
+
+    #[test]
+    fn a_staged_row_is_found_by_its_primary_key() {
+        let dir = TempDir::new("pk-lookup-staged");
+        let mut engine = engine_in(&dir);
+        categories_table(&mut engine);
+
+        run(&mut engine, "BEGIN;").unwrap();
+        run(&mut engine, "INSERT INTO t VALUES (900, 'new', '[900.0,0.0]')").unwrap();
+        // The row is not committed yet, so it is not in the primary key
+        // index. The lookup still has to find it.
+        assert_eq!(
+            lookup_ids(&mut engine, "SELECT id FROM t WHERE id = 900"),
+            vec![900]
+        );
+        run(&mut engine, "COMMIT;").unwrap();
+        assert_eq!(
+            lookup_ids(&mut engine, "SELECT id FROM t WHERE id = 900"),
+            vec![900]
+        );
+    }
+
+    #[test]
+    fn a_deleted_row_is_not_found_by_its_primary_key() {
+        let dir = TempDir::new("pk-lookup-deleted");
+        let mut engine = engine_in(&dir);
+        categories_table(&mut engine);
+
+        run(&mut engine, "DELETE FROM t WHERE id = 4").unwrap();
+        assert_eq!(lookup_ids(&mut engine, "SELECT id FROM t WHERE id = 4"), Vec::<i64>::new());
+
+        // A row the transaction deleted is not visible either.
+        run(&mut engine, "BEGIN;").unwrap();
+        run(&mut engine, "DELETE FROM t WHERE id = 8").unwrap();
+        assert_eq!(lookup_ids(&mut engine, "SELECT id FROM t WHERE id = 8"), Vec::<i64>::new());
+        run(&mut engine, "ROLLBACK;").unwrap();
+        assert_eq!(lookup_ids(&mut engine, "SELECT id FROM t WHERE id = 8"), vec![8]);
+    }
+
+    #[test]
+    fn the_primary_key_path_agrees_with_the_scan() {
+        let dir = TempDir::new("pk-lookup-agree");
+        let mut engine = engine_in(&dir);
+        categories_table(&mut engine);
+
+        for id in [1i64, 4, 8, 12, 20] {
+            // The fast path, and the general path that the scan takes.
+            let fast = lookup_ids(&mut engine, &format!("SELECT id FROM t WHERE id = {id}"));
+            let general = lookup_ids(
+                &mut engine,
+                &format!("SELECT id FROM t WHERE id = {id} ORDER BY cat"),
+            );
+            assert_eq!(fast, general, "the two paths disagree on the row {id}");
+        }
+    }
 }
