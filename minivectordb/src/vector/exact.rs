@@ -31,8 +31,6 @@ use crate::vector::dist::l2_sq_dispatch;
 pub struct Candidate {
     /// The primary key of the row.
     pub pk: i64,
-    /// The distance to the query.
-    pub dist: f32,
     /// The squared distance to the query.
     ///
     /// The square root is monotonic, so the squared distance orders the
@@ -137,9 +135,6 @@ impl TopK {
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then(a.pk.cmp(&b.pk))
         });
-        for candidate in out.iter_mut() {
-            candidate.dist = candidate.dist_sq.sqrt();
-        }
         out
     }
 }
@@ -251,7 +246,7 @@ pub fn scan_exact_topk_candidates(
                     continue;
                 }
             }
-            top.push(Candidate { pk: meta.pk, dist: dist_sq.sqrt(), dist_sq, row_id });
+            top.push(Candidate { pk: meta.pk, dist_sq, row_id });
         }
     }
 
@@ -266,7 +261,7 @@ mod tests {
     fn the_heap_keeps_the_best_candidates() {
         let mut top = TopK::new(3);
         for (pk, dist) in [(1, 5.0), (2, 1.0), (3, 3.0), (4, 2.0)] {
-            top.push(Candidate { pk, dist, dist_sq: dist * dist, row_id: pk as u64 });
+            top.push(Candidate { pk, dist_sq: dist * dist, row_id: pk as u64 });
         }
         let out = top.into_sorted();
         assert_eq!(out.len(), 3);
@@ -277,7 +272,7 @@ mod tests {
     fn the_heap_breaks_the_ties_by_primary_key() {
         let mut top = TopK::new(2);
         for pk in [7, 3, 5] {
-            top.push(Candidate { pk, dist: 1.0, dist_sq: 1.0, row_id: pk as u64 });
+            top.push(Candidate { pk, dist_sq: 1.0, row_id: pk as u64 });
         }
         let out = top.into_sorted();
         assert_eq!(out.iter().map(|c| c.pk).collect::<Vec<_>>(), vec![3, 5]);
@@ -286,18 +281,18 @@ mod tests {
     #[test]
     fn a_heap_of_zero_keeps_nothing() {
         let mut top = TopK::new(0);
-        top.push(Candidate { pk: 1, dist: 0.0, dist_sq: 0.0, row_id: 1 });
+        top.push(Candidate { pk: 1, dist_sq: 0.0, row_id: 1 });
         assert!(top.is_empty());
     }
 
     #[test]
     fn the_heap_reports_its_size() {
         let mut top = TopK::new(2);
-        top.push(Candidate { pk: 1, dist: 0.0, dist_sq: 0.0, row_id: 1 });
+        top.push(Candidate { pk: 1, dist_sq: 0.0, row_id: 1 });
         assert_eq!(top.len(), 1);
-        top.push(Candidate { pk: 2, dist: 1.0, dist_sq: 1.0, row_id: 2 });
+        top.push(Candidate { pk: 2, dist_sq: 1.0, row_id: 2 });
         assert_eq!(top.len(), 2);
-        top.push(Candidate { pk: 3, dist: 2.0, dist_sq: 4.0, row_id: 3 });
+        top.push(Candidate { pk: 3, dist_sq: 2.0, row_id: 3 });
         assert_eq!(top.len(), 2);
     }
 }

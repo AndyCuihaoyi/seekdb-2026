@@ -454,6 +454,46 @@ impl TableStore {
         Ok(matrix[start..end].to_vec())
     }
 
+    /// Read a whole row out of the block caches.
+    ///
+    /// The directory entry, the scalar columns and the vector of the row all
+    /// come from the caches of the block the row belongs to, so a row of a
+    /// block that is already cached costs no system call at all. The plain
+    /// [`TableStore::read_row`] costs three of them, which is a large part of
+    /// the cost of materialising the answer of a query.
+    pub fn read_row_cached(&mut self, row_id: u64) -> SqlResult<Option<(RowMeta, Vec<ColValue>)>> {
+        let (meta, scalars, slot) = match self.read_row_scalars(row_id)? {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        if meta.alive == 0 {
+            return Ok(None);
+        }
+        let mut cols: Vec<ColValue> = Vec::with_capacity(scalars[slot].len());
+        // A `None` marks the vector column, which is not part of the
+        // decoded image. It is filled in below.
+        for value in scalars[slot].iter() {
+            match value {
+                Some(v) => cols.push(v.clone()),
+                None => cols.push(ColValue::BigInt(0)),
+            }
+        }
+        // The vector of the row is not part of the image, so it is taken
+        // from the matrix of the block.
+        if let Some(idx) = self.vector_index {
+            let matrix = self.block_matrix(meta.vec_block)?;
+            let start = meta.vec_slot as usize * self.dim;
+            let end = start + self.dim;
+            if end <= matrix.len() && idx < cols.len() {
+                cols[idx] = ColValue::Vector(crate::value::vector::Vector::new(
+                    self.dim,
+                    matrix[start..end].to_vec(),
+                ));
+            }
+        }
+        Ok(Some((meta, cols)))
+    }
+
     /// Read a whole row: the scalar columns of the image and the vector of
     /// the vector file.
     ///
@@ -461,8 +501,7 @@ impl TableStore {
     /// file. A row whose image still holds the vector - an image written
     /// before the two were separated - keeps the vector of its image.
     pub fn read_row(&mut self, row_id: u64) -> SqlResult<Option<(RowMeta, Vec<ColValue>)>> {
-        let meta = match self.read_meta(row_id)? {
-            Some(m) => m,
+        let meta = match self.read_meta(row_id)? {            Some(m) => m,
             None => return Ok(None),
         };
         if meta.alive == 0 {

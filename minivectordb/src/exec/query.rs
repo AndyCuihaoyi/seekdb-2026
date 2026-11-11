@@ -938,6 +938,13 @@ impl Engine {
                 .get_mut(&key)
                 .ok_or_else(|| SqlError::no_such_table(&def.name))?;
             let store = &mut state.store;
+            // The filter is only needed when the statement carries one, or
+            // when the transaction changed a row. A query without a filter
+            // over a table that the transaction did not touch measures every
+            // row, so the scan is given no filter at all: the callback would
+            // be called once per row of the table and would decide nothing.
+            let needs_filter =
+                filter_expr.is_some() || !updated.is_empty() || !deleted.is_empty();
             let mut filter = |row_id: u64, _pk: i64, cols: &[Option<ColValue>]| -> SqlResult<bool> {
                 // The rows the transaction changed are measured separately,
                 // so the scan skips them.
@@ -959,12 +966,12 @@ impl Engine {
                     store,
                     topk.query.as_slice(),
                     topk.k,
-                    Some(&mut filter),
+                    if needs_filter { Some(&mut filter) } else { None },
                     candidate_rows.as_deref(),
                 )
             })?;
             for hit in hits {
-                candidates.push((hit.pk, hit.dist, hit.row_id));
+                candidates.push((hit.pk, hit.dist_sq.sqrt(), hit.row_id));
             }
         }
 
@@ -1113,8 +1120,9 @@ impl Engine {
                 None => continue,
             };
             // The row is read whole: the scalar columns of the image and
-            // the vector of the vector file.
-            let (meta, cols) = match state.store.read_row(*row_id)? {
+            // the vector of the vector file. Both come from the caches of
+            // the block, so an answer row costs no system call.
+            let (meta, cols) = match state.store.read_row_cached(*row_id)? {
                 Some(r) => r,
                 None => continue,
             };
