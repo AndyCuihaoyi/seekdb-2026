@@ -42,14 +42,14 @@ python3 tools/bench_median.py --mode exact --rounds 5 --cpu 7
 
 | Measurement | Baseline `b88e0209` | Now `0e5c69985` | Ratio |
 | --- | ---: | ---: | ---: |
-| Query `T` | 969.7 ms | 320.7 ms | **3.02x faster** |
-| Query `B` | 7,380,838 B | 1,610,808 B | **4.58x fewer** |
+| Query `T` | 967.0 ms | 320.6 ms | **3.02x faster** |
+| Query `B` (device) | 0 B | 0 B | both are served by the page cache |
 | Query `M` (RSS) | 14,732 KB | 14,980 KB | 1.02x more |
-| Write `T` | 745.1 ms | 556.9 ms | 1.34x faster |
-| Write `B` | 23,104,906 B | 23,104,906 B | 1.00x |
+| Write `T` | 750.1 ms | 571.5 ms | 1.31x faster |
+| Write `B` (device) | 11,407,360 B | 11,407,360 B | 1.00x |
 | Write `M` (RSS) | 3,756 KB | 3,872 KB | 1.03x more |
 
-The spread of the five rounds of each row is under 8%, and under 2% for
+The spread of the five rounds of each row is under 8%, and under 3% for
 the query phase of the current version. The measurements are in
 `docs/perf/baseline-pinned-exact.json` and
 `docs/perf/p5-current-exact.json`.
@@ -63,9 +63,57 @@ the comparison landed in the middle of it.
 The answers of the two versions are byte for byte identical, in both the
 exact and the approximate mode (`docs/perf/answers-baseline-*.txt`).
 
-The query `B` is the number that moved the most. The scan of the table
-reads the vectors of a block with one call instead of one call per row,
-so the number of read bytes fell by a factor of four and a half.
+### 1.1 The measurement of `B` was measuring the wrong thing
+
+The `B` of the table above is the number of bytes that reached the block
+device. It is **not** what this repository used to report, and the
+difference is not a rounding.
+
+The old measurement used `rchar` and `wchar` of `/proc/<pid>/io`. Those
+two count every byte the process read or wrote, **including the bytes
+that came in and went out through the pipes of the protocol**. The SQL
+text of the benchmark is 11.7 MB for the load and 1.17 MB for the
+queries, so a large part of the number that was reported as the I/O of a
+phase was the traffic of the pipe.
+
+The platform reads `rbytes` and `wbytes` from `io.stat` of the cgroup of
+the container. Those count the block device. So the old number and the
+number of the platform were not the same quantity, and the old number was
+the larger one.
+
+`tools/measure_io.py` reports both side by side:
+
+```
+write phase:
+  rchar           11.159 MB   (includes the traffic of the pipe)
+  wchar           10.875 MB   (includes the traffic of the pipe)
+  read_bytes       0.000 MB   (reached the block device)
+  write_bytes     10.879 MB   (reached the block device)
+query phase:
+  rchar            6.742 MB   (includes the traffic of the pipe)
+  wchar            0.297 MB   (includes the traffic of the pipe)
+  read_bytes       0.000 MB   (reached the block device)
+  write_bytes      0.000 MB   (reached the block device)
+```
+
+Two things follow, and they are both about the score:
+
+1. **The query phase reads nothing from the disk.** Every byte of the
+   query phase is served by the page cache, so `R_B` of the query phase is
+   not a number that a change of the code can move: it is the same for
+   everybody, and it is the same for the baseline. The "4.58 times fewer
+   bytes" that this file reported before was the pipe getting smaller,
+   which the platform does not count. The improvement is real, and it is
+   in the time, where it shows up as 3.02 times.
+2. **The write phase writes the same bytes as before**, 11,407,360 B, and
+   that is a number the platform does count. It is the sum of the data
+   files (5.50 MB) and the log (5.36 MB), so the log is a second copy of
+   everything that is written. This is the axis where the room is, and
+   section 4 says how much.
+
+The measurement was corrected in `tools/bench.py`: it now counts
+`read_bytes` and `write_bytes`. The numbers that this file reports from
+now on are the ones of the platform.
 
 ---
 
@@ -222,19 +270,20 @@ The order of the levers, with the numbers of this machine:
    the next factor of two buys less than the last one did: the ratio is
    already in the part of `f` where it flattens.
 2. **The bytes of the write.** They are 6 2/3% of the weight of the score,
-   and they have **not moved at all**: 23,104,906 B in both versions, so
+   and they have **not moved at all**: 11,407,360 B in both versions, so
    `R_B` of the write phase is exactly 1. This is the one axis that is
    still at the baseline, and the only one where a big factor is still
    available. It is the axis that was left for last, and the axis that
-   should be next.
+   should be next. Section 4.2 says what it would take.
 3. **The bytes of the query.** They are 13 1/3% of the weight, and they are
-   already 4.58 times smaller than the baseline. `R_B` is 3.21, so there is
-   not much left here.
+   **zero in both versions**: every byte of the query phase is served by
+   the page cache, so `R_B` is exactly 1 and there is nothing to win here.
+   This axis is closed.
 4. **The peak memory of the query.** It is 13 1/3% of the weight, and it grew
    by 1.7% against the baseline, so `R_M` is 0.98 and it goes the wrong way.
    The buffer pool is the part that grows, so a smaller pool would take it
    back, at the price of more read calls.
-5. **The time of the write.** It is 20% of the weight, and it is 1.34 times
+5. **The time of the write.** It is 20% of the weight, and it is 1.31 times
    faster than the baseline already.
 
 ### 4.1 The number the platform printed
@@ -254,22 +303,25 @@ E_printed(current) = 1829.577226 * raw_e_current / raw_e_baseline
 and both raw values come out of the formula directly. Running it over the
 range of `k`:
 
-| The platform baseline is | raw `e` of the baseline | raw `e` of the current | Projected `E` | Against the baseline |
+| The platform baseline is | `R_T` of the current | raw `e` of the current | Projected `E` | Against the baseline |
 | --- | ---: | ---: | ---: | ---: |
-| 0.3x ours (fast) | 0.2451 | 0.4464 | **3331** | +82% |
-| 0.5x ours | 0.3412 | 0.5583 | 2994 | +64% |
-| 1.0x ours | 0.5000 | 0.7026 | 2571 | +41% |
-| 2.0x ours | 0.6625 | 0.8176 | 2258 | +23% |
-| 3.0x ours | 0.7452 | 0.8679 | 2131 | +16% |
-| 5.0x ours (slow) | 0.8290 | 0.9146 | 2019 | +10% |
+| 0.3x ours (fast) | 0.905 | 0.4357 | **2751** | +50% |
+| 0.5x ours | 1.508 | 0.5295 | 2622 | +43% |
+| 1.0x ours | 3.016 | 0.6498 | 2378 | +30% |
+| 2.0x ours | 6.032 | 0.7459 | 2160 | +18% |
+| 3.0x ours | 9.049 | 0.7880 | 2065 | +13% |
+| 5.0x ours (slow) | 15.081 | 0.8274 | 1978 | +8% |
 
-So the current code projects to roughly **2020 to 3330**, against the
-1829.58 of the baseline: a gain of 10% to 82%, depending on how the
+So the current code projects to roughly **1980 to 2750**, against the
+1829.58 of the baseline: a gain of 8% to 50%, depending on how the
 platform's baseline compares to ours, which is not known.
 
-The reason the gain is so much larger than the gain in the raw time is the
-shape of `f`. `f(R) = R/(1+R)` is concave, so a large `R` buys less than a
-small one, and the ratios here are large: `R_T = 3.02` and `R_B = 3.21`.
+The reason the gain is smaller than the gain in the raw time is the shape
+of `f`. `f(R) = R/(1+R)` is concave, so a large `R` buys less than a
+small one, and the ratio here is already large: `R_T = 3.02`. And the
+gain is smaller than it could be because **two of the three axes of the
+query phase are closed**: the bytes of the query are zero, and the memory
+of the query went the wrong way.
 
 **This projection is not calibrated.** It says what the formula gives for
 a baseline that is *assumed* to be in a certain relation to ours. It has
@@ -295,6 +347,46 @@ between the competitors, not by this factor alone, and that the work
 that is worth doing is the work that is safe: a faster kernel that
 returns the same answers, a write path that does less I/O, and a smaller
 memory footprint.
+
+### 4.2 The write axis, and what it would take
+
+The write phase writes 11,407,360 B to the disk. The data files are
+5.50 MB and the log is 5.36 MB, so **the log is a second copy of
+everything that is written**: the write amplification is 1.98x.
+
+There are two ways to make the log smaller, and they are not the same
+decision:
+
+1. **Checkpoint more often.** The log is emptied when it grows past
+   `checkpoint_bytes`, which is 64 MB by default. The log of the
+   benchmark reaches 5.36 MB and is never emptied, because it never gets
+   near 64 MB. A threshold of 1 MB would empty it four times during the
+   load, and the checkpoint writes the rows into the data files, which
+   they are written into anyway, so the total number of bytes that reach
+   the disk falls by roughly the size of the log.
+   **The risk**: the checkpoint has to be correct. It syncs the data
+   files and then empties the log, and an interruption in between means
+   that the recovery replays a log that is already applied. The recovery
+   has to be idempotent about that, and the twelve rounds of the crash
+   recovery test are the gate.
+2. **Write less into the log.** The log holds the row image of every
+   inserted row, so it holds the vector of every row in full. This is
+   what makes the recovery possible without reading the data files, and
+   it is what the rules require: a transaction that returned COMMIT must
+   survive. A log that held only a pointer to the row would not be a
+   log.
+
+The first one is the cheaper change, and it is the one that the rules
+allow. The threshold is a configuration value, so it can be changed
+without touching the format of anything.
+
+How much it would be worth: if the log were emptied often enough that it
+never held more than a batch, the write amplification would fall from
+1.98x to about 1.1x, and `R_B` of the write phase would rise to about
+1.8. `f(1.8)` is 0.64 against `f(1)` = 0.5, and the write phase carries
+6 2/3% of the I/O weight, so the raw `e` would rise by about 0.09 and the
+printed `E` by about 8%. It is worth less than the query time was, but it
+is the only axis that is still open.
 
 ---
 

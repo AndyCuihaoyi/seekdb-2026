@@ -171,13 +171,31 @@ class Db:
 
 
 def read_io_bytes(pid):
-    """The number of bytes the process has read and written so far."""
+    """The number of bytes the process read from and wrote to the disk.
+
+    The counters that count the bytes that reached the block device are
+    `read_bytes` and `write_bytes`. The counters `rchar` and `wchar` count
+    every byte the process read or wrote, **including the bytes that came
+    in and went out through the pipes of the protocol**, and the SQL text of
+    the benchmark is 11.7 MB for the load and 1.17 MB for the queries. So
+    `rchar` and `wchar` are a measure of the traffic of the pipe, not of
+    the disk.
+
+    The platform reads `rbytes` and `wbytes` from `io.stat` of the cgroup,
+    which counts the block device as well, so the block device counters are
+    the ones that are comparable.
+
+    A read that the page cache served does not reach the device either, so
+    these counters are the lower bound of what the platform sees. That is
+    the right direction to be wrong in: the number that is reported here is
+    never larger than the number of the platform.
+    """
     total = 0
     try:
         with open("/proc/%d/io" % pid, "r") as f:
             for line in f:
                 key, _, value = line.partition(":")
-                if key.strip() in ("rchar", "wchar"):
+                if key.strip() in ("read_bytes", "write_bytes"):
                     total += int(value.strip())
     except OSError:
         return None
