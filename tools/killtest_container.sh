@@ -8,6 +8,13 @@
 #
 # The data directory is a host directory that is mounted at /data, so that
 # it survives the death of the container.
+#
+# The database speaks the JSON Lines protocol of the competition, so the
+# statements are converted into protocol requests before they are fed to the
+# container, and the answers are read back as protocol messages. The
+# assertions are the ones of `tools/killtest.sh`, unchanged.
+#
+#   MINIVECDB_CONTAINER_IMAGE=mvdb-jsonl:local bash tools/killtest_container.sh
 
 set -u
 
@@ -54,11 +61,20 @@ HOST_GID="$(id -g)"
 
 # ---------------------------------------------------------------- the helpers
 
+# The statements of a file, turned into the requests of the protocol.
+to_jsonl() {
+    local sql_file="$1"
+    local jsonl="$2"
+    python3 "$ROOT/tools/sql2jsonl.py" "$sql_file" "$jsonl" || return 1
+}
+
 # Run one SQL statement in a container and write the answer to the file of
 # the second argument. The container is given a name, so that it can be
 # killed.
 run_sql() {
     local sql_file="$1" out_file="$2"
+    local jsonl="$WORK/feed.jsonl"
+    to_jsonl "$sql_file" "$jsonl" || return 1
     local name
     container_seq=$((container_seq + 1))
     name="mvdb-killtest-$$-$container_seq"
@@ -66,16 +82,17 @@ run_sql() {
         --name "$name" \
         -v "$DATA":/data \
         -u "$HOST_UID:$HOST_GID" \
-        -e MINIVECDB_OUTPUT_FORMAT=tsv \
-        -e MINIVECDB_READY_SINK=stderr \
+        -e MINIVECDB_MODE=exact \
         "$IMAGE" --data-dir /data \
-        <"$sql_file" >"$out_file" 2>/dev/null
+        <"$jsonl" >"$out_file" 2>/dev/null
 }
 
 # Start a database in a container and kill it after a moment. The rows of
 # the transaction are committed or not, depending on how far it got.
 kill_during() {
     local sql_file="$1"
+    local jsonl="$WORK/feed.jsonl"
+    to_jsonl "$sql_file" "$jsonl" || return 1
     local name
     container_seq=$((container_seq + 1))
     name="mvdb-killtest-$$-$container_seq"
@@ -83,10 +100,9 @@ kill_during() {
         --name "$name" \
         -v "$DATA":/data \
         -u "$HOST_UID:$HOST_GID" \
-        -e MINIVECDB_OUTPUT_FORMAT=tsv \
-        -e MINIVECDB_READY_SINK=stderr \
+        -e MINIVECDB_MODE=exact \
         "$IMAGE" --data-dir /data \
-        <"$sql_file" >/dev/null 2>/dev/null &
+        <"$jsonl" >/dev/null 2>/dev/null &
     local pid=$!
     # Let the process work for a moment, then kill it.
     sleep 0.05
@@ -101,8 +117,22 @@ count_rows() {
     local out_file="$WORK/count.out"
     printf 'SELECT id FROM %s;\n' "$table" >"$sql_file"
     run_sql "$sql_file" "$out_file" || { echo "-1"; return; }
-    # The first line is the header.
-    tail -n +2 "$out_file" | wc -l | tr -d ' '
+    # The answer is one JSON object; the rows are in its `rows` field.
+    python3 - "$out_file" <<'PY'
+import json, sys
+text = open(sys.argv[1], encoding="utf-8").read()
+count = 0
+for line in text.splitlines():
+    line = line.strip()
+    if not line:
+        continue
+    message = json.loads(line)
+    if message.get("type") == "ready":
+        continue
+    if message.get("ok") is True:
+        count += len(message.get("rows") or [])
+print(count)
+PY
 }
 
 # The identifiers of the rows of a table, sorted.
@@ -112,7 +142,22 @@ list_rows() {
     local out_file="$WORK/list.out"
     printf 'SELECT id FROM %s;\n' "$table" >"$sql_file"
     run_sql "$sql_file" "$out_file" || return
-    tail -n +2 "$out_file" | sort -n
+    python3 - "$out_file" <<'PY'
+import json, sys
+text = open(sys.argv[1], encoding="utf-8").read()
+ids = []
+for line in text.splitlines():
+    line = line.strip()
+    if not line:
+        continue
+    message = json.loads(line)
+    if message.get("type") == "ready":
+        continue
+    for row in message.get("rows") or []:
+        ids.append(str(row[0]))
+for value in sorted(ids, key=int):
+    print(value)
+PY
 }
 
 say "MiniVectorDB crash recovery test (container)"
@@ -182,15 +227,18 @@ for round in $(seq 1 "$ROUNDS"); do
         continue
     fi
 
+    # Collect the identifiers of the rows that are visible.
+    list_rows t >"$WORK/ids.txt"
+
     # No row may appear twice.
-    duplicates="$(tail -n +2 "$WORK/check.out" | sort -n | uniq -d | wc -l | tr -d ' ')"
+    duplicates="$(sort -n "$WORK/ids.txt" | uniq -d | wc -l | tr -d ' ')"
     if [ "$duplicates" != "0" ]; then
         fail "round $round: $duplicates duplicated rows after the recovery"
     fi
 
     # The rows of the uncommitted transaction must be absent.
-    ghosts="$(tail -n +2 "$WORK/check.out" | awk -v base="$base" \
-        '$1 > base + 100000 && $1 <= base + 100020' | wc -l | tr -d ' ')"
+    ghosts="$(awk -v base="$base" \
+        '$1 > base + 100000 && $1 <= base + 100020' "$WORK/ids.txt" | wc -l | tr -d ' ')"
     if [ "$ghosts" != "0" ]; then
         fail "round $round: $ghosts rows of the uncommitted transaction are visible"
     fi
@@ -198,7 +246,7 @@ for round in $(seq 1 "$ROUNDS"); do
     # The rows that were committed before the crash must still be there.
     missing=0
     for id in $(seq 1 "$BATCH"); do
-        if ! tail -n +2 "$WORK/check.out" | grep -qx "$id"; then
+        if ! grep -qx "$id" "$WORK/ids.txt"; then
             missing=$((missing + 1))
         fi
     done
@@ -221,14 +269,16 @@ if [ "$final_count" -lt "$initial_count" ]; then
     fail "the final state has $final_count rows, fewer than the initial $initial_count"
 fi
 
-duplicates="$(list_rows t | uniq -d | wc -l | tr -d ' ')"
+list_rows t >"$WORK/final_ids.txt"
+
+duplicates="$(sort -n "$WORK/final_ids.txt" | uniq -d | wc -l | tr -d ' ')"
 if [ "$duplicates" != "0" ]; then
     fail "the final state has $duplicates duplicated rows"
 fi
 
 missing=0
 for id in $(seq 1 "$BATCH"); do
-    if ! list_rows t | grep -qx "$id"; then
+    if ! grep -qx "$id" "$WORK/final_ids.txt"; then
         missing=$((missing + 1))
     fi
 done
@@ -241,7 +291,7 @@ for round in $(seq 1 "$ROUNDS"); do
     base=$((round * BATCH))
     for i in $(seq 1 20); do
         id=$((base + 100000 + i))
-        if list_rows t | grep -qx "$id"; then
+        if grep -qx "$id" "$WORK/final_ids.txt"; then
             ghosts=$((ghosts + 1))
         fi
     done
