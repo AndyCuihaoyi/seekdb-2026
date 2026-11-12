@@ -241,6 +241,17 @@ impl ColumnIndexes {
         self.indexes.iter().filter(|i| i.is_some()).count()
     }
 
+    /// The number of columns the set of indexes covers.
+    ///
+    /// This is not the number of indexed columns: the set holds one entry
+    /// per column of the table, and the entry of a column that is not
+    /// indexed is empty. A caller that walks the columns has to walk all
+    /// of them, not only the indexed ones, because the index of a column is
+    /// not necessarily at the position of the column.
+    pub fn columns(&self) -> usize {
+        self.indexes.len()
+    }
+
     /// Whether no column is indexed.
     pub fn is_empty(&self) -> bool {
         self.len() == 0

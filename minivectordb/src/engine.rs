@@ -301,6 +301,32 @@ impl Engine {
 
         let buffer_pool_mb = config.buffer_pool_mb;
         let checkpoint_threshold = config.checkpoint_bytes;
+
+        // The three block caches share one budget.
+        //
+        // The budget of the configuration is the memory the caches of the
+        // database may hold *in total*. Handing the whole budget to each of
+        // the three caches would let them hold three times as much, which is
+        // not what the budget says: a table of 200000 rows of 128 dimensions
+        // holds 100 MiB of decoded vectors, and a cache that may hold that
+        // much on its own would push the database past the memory limit of
+        // the container long before the data set itself does.
+        //
+        // The budget is therefore divided between the caches, in the ratio
+        // of what each of them holds:
+        //
+        // * the *vector* cache holds the decoded vectors, which are the
+        //   largest part of a row: at a dimension of 128 a block of 1024
+        //   rows is half a megabyte;
+        // * the *directory* cache holds the row directory entries, which
+        //   are 48 bytes per row;
+        // * the *scalar* cache holds the decoded columns, which are small
+        //   but numerous.
+        //
+        // The vector cache takes half of the budget, because the vectors
+        // dominate it, and the other two share the rest.
+        let (vector_mb, directory_mb, scalar_mb) = split_pool_budget(buffer_pool_mb);
+
         let mut engine = Engine {
             mode: config.mode,
             config,
@@ -317,13 +343,13 @@ impl Engine {
             // they use is bounded by one budget rather than by the number of
             // tables.
             vector_pool: std::rc::Rc::new(std::cell::RefCell::new(
-                crate::storage::bufferpool::BufferPool::new(buffer_pool_mb),
+                crate::storage::bufferpool::BufferPool::new(vector_mb),
             )),
             directory_pool: std::rc::Rc::new(std::cell::RefCell::new(
-                crate::storage::bufferpool::BufferPool::new(buffer_pool_mb),
+                crate::storage::bufferpool::BufferPool::new(directory_mb),
             )),
             scalar_pool: std::rc::Rc::new(std::cell::RefCell::new(
-                crate::storage::bufferpool::BufferPool::new(buffer_pool_mb),
+                crate::storage::bufferpool::BufferPool::new(scalar_mb),
             )),
         };
         // The tables are restored from the catalog file first, so that the
@@ -936,7 +962,10 @@ impl Engine {
             Some(s) => s,
             None => return,
         };
-        let count = state.inverted.len();
+        // Every column of the table has to be walked, not only the indexed
+        // ones: the index of a column is not necessarily at the position
+        // of the column, because the vector column is not indexed.
+        let count = state.inverted.columns();
         for column in 0..count {
             state.inverted.remove(column, row_id);
         }
@@ -974,7 +1003,8 @@ impl Engine {
                     if metas.is_empty() {
                         break;
                     }
-                    let scalars = match state.store.read_scalar_block(block as u32, &metas) {
+                    let scalars = match state.store.read_scalar_block_uncached(block as u32, &metas)
+                    {
                         Ok(s) => s,
                         Err(_) => continue,
                     };
@@ -1143,11 +1173,34 @@ impl Engine {
             let mut index = HashMap::new();
             if let Some(state) = self.tables.values_mut().find(|t| t.id == table_id) {
                 let count = state.store.row_count;
-                for row_id in 0..count {
-                    if let Ok(Some(meta)) = state.store.read_meta(row_id) {
-                        if meta.alive == 1 {
-                            index.insert(meta.pk, row_id);
+                // The map is sized before it is filled, so that it does not
+                // grow while it is filled.
+                //
+                // A map that grows rehashes itself, and the rehash holds the
+                // old table and the new one at the same time: the peak of
+                // the build was twice the size of the index, and the index
+                // is one of the few structures of the database whose size
+                // grows with the number of rows.
+                index.reserve(count as usize);
+                // The rows are read block by block. Reading the directory
+                // entry of every row on its own would cost one system call
+                // per row, and a table of a million rows would spend
+                // seconds in the system call alone.
+                let blocks = state.store.blocks;
+                for block in 0..blocks {
+                    let metas = match state.store.read_meta_block(block as u32) {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+                    if metas.is_empty() {
+                        break;
+                    }
+                    let base = block * state.store.block_rows as u64;
+                    for (slot, meta) in metas.iter().enumerate() {
+                        if meta.alive != 1 {
+                            continue;
                         }
+                        index.insert(meta.pk, base + slot as u64);
                     }
                 }
             }
@@ -1243,6 +1296,43 @@ impl Engine {
         }
         Ok(())
     }
+}
+
+/// Divide the budget of the block caches between the three caches.
+///
+/// The budget of the configuration is the memory the caches may hold *in
+/// total*, so it is divided here rather than handed to each cache in full.
+///
+/// The vector cache takes half of it: the decoded vectors are the largest
+/// part of a row, and they are the part a scan reads over and over. The
+/// other half is shared by the directory cache, which holds the fixed size
+/// row directory entries, and the scalar cache, which holds the decoded
+/// columns.
+///
+/// The share of a cache is never zero, so that a cache always holds at
+/// least one block: a cache that may hold nothing would read every block
+/// from the file again, which costs a system call per block per scan.
+fn split_pool_budget(total_mb: usize) -> (usize, usize, usize) {
+    if total_mb < 3 {
+        // The budget is too small to be divided between three caches that
+        // each hold at least one megabyte. Each of them gets one megabyte
+        // anyway: a cache that may hold nothing reads every block from the
+        // file again, which costs a system call per block per scan.
+        return (1, 1, 1);
+    }
+    // The vector cache takes half of the budget: the decoded vectors are
+    // the largest part of a row, and they are the part a scan reads over
+    // and over. The other half is shared by the directory cache, which
+    // holds the fixed size row directory entries, and the scalar cache,
+    // which holds the decoded columns.
+    //
+    // The other two caches get at least one megabyte each, so the vector
+    // cache never takes the last two megabytes of a small budget.
+    let vector = total_mb.div_ceil(2).min(total_mb - 2);
+    let rest = total_mb - vector;
+    let directory = rest.div_ceil(2);
+    let scalar = rest - directory;
+    (vector, directory, scalar)
 }
 
 /// Decode a table name from log bytes.
@@ -1361,6 +1451,51 @@ mod tests {
     fn run(engine: &mut Engine, sql: &str) -> SqlResult<QueryResult> {
         let stmt = parse(sql).unwrap();
         engine.execute(&stmt)
+    }
+
+    /// The three block caches share one budget.
+    ///
+    /// Handing the whole budget to each of them would let the caches hold
+    /// three times as much as the budget says, and the memory of the
+    /// database would then be three times the budget before the data set
+    /// itself was read at all.
+    #[test]
+    fn the_block_caches_share_one_budget() {
+        for total in [1usize, 2, 3, 8, 64, 256] {
+            let (vector, directory, scalar) = split_pool_budget(total);
+            assert!(
+                vector >= 1 && directory >= 1 && scalar >= 1,
+                "a cache of a budget of {total} may hold nothing: {vector}, {directory}, {scalar}"
+            );
+            // A budget of a megabyte or more is used as a whole. A smaller
+            // one cannot be divided between three caches that each hold at
+            // least one megabyte.
+            if total >= 3 {
+                assert!(
+                    vector + directory + scalar == total,
+                    "the caches of a budget of {total} do not use it as a whole: {vector}, {directory}, {scalar}"
+                );
+            }
+        }
+    }
+
+    /// The budget of the configuration is the budget of the caches in total.
+    #[test]
+    fn the_caches_of_the_engine_hold_the_budget_in_total() {
+        let dir = TempDir::new("pool-budget");
+        let mut cfg = Config::default();
+        cfg.data_dir = dir.0.clone();
+        cfg.ready_sink = crate::config::ReadySink::None;
+        cfg.buffer_pool_mb = 64;
+        let engine = Engine::open(cfg).unwrap();
+        let total = engine.vector_pool.borrow().max_bytes()
+            + engine.directory_pool.borrow().max_bytes()
+            + engine.scalar_pool.borrow().max_bytes();
+        let budget = 64 * 1024 * 1024;
+        assert!(
+            total <= budget,
+            "the caches hold {total} bytes, which is more than the budget of {budget}"
+        );
     }
 
     #[test]

@@ -203,16 +203,21 @@ impl Engine {
             targets.push((idx, expr.clone()));
         }
 
-        let rows = self.collect_rows(&def)?;
+        // The rows that the filter keeps are the only ones that are read
+        // whole, so the memory of the statement is proportional to the
+        // number of rows it changes and not to the size of the table.
+        //
+        // The vector of a row is read as well: the statement may change it,
+        // and a row whose vector is missing would be written back without
+        // it.
+        //
+        // The rows are already filtered, so the filter is not applied a
+        // second time below.
+        let (rows, _already_filtered) =
+            self.collect_rows_filtered(&def, upd.filter.as_ref(), true)?;
         let mut affected = 0u64;
         let mut updates: Vec<(u64, Vec<ColValue>)> = Vec::new();
-        let mut cache = crate::exec::query::LiteralCache::new();
         for row in rows {
-            if let Some(filter) = &upd.filter {
-                if !self.eval_predicate(filter, &row, &def, &mut cache)? {
-                    continue;
-                }
-            }
             let mut cols = row.cols.clone();
             for (idx, expr) in &targets {
                 let v = self.eval_literal(expr, &def.columns[*idx])?;
@@ -249,16 +254,20 @@ impl Engine {
             .map(|t| t.id)
             .ok_or_else(|| SqlError::no_such_table(&del.table))?;
 
-        let rows = self.collect_rows(&def)?;
+        // The rows that the filter keeps are the only ones that are read, so
+        // the memory of the statement is proportional to the number of rows
+        // it deletes and not to the size of the table.
+        //
+        // The vector of a row is not read: a delete does not change it, and
+        // the statement only needs the identity of the row.
+        //
+        // The rows are already filtered, so the filter is not applied a
+        // second time below.
+        let (rows, _already_filtered) =
+            self.collect_rows_filtered(&def, del.filter.as_ref(), false)?;
         let mut affected = 0u64;
         let mut victims = Vec::new();
-        let mut cache = crate::exec::query::LiteralCache::new();
         for row in rows {
-            if let Some(filter) = &del.filter {
-                if !self.eval_predicate(filter, &row, &def, &mut cache)? {
-                    continue;
-                }
-            }
             victims.push(row.row_id);
             affected += 1;
         }

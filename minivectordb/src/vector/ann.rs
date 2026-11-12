@@ -139,6 +139,27 @@ impl IvfIndex {
         self.lists.iter().map(|l| l.len()).sum()
     }
 
+    /// An index over the given centroids, with no row in it yet.
+    ///
+    /// The rows are added with [`IvfIndex::insert`]. This is the path the
+    /// build of a large table takes: the centroids are chosen from a bounded
+    /// sample of the table, and the rows are then added one block at a
+    /// time, so that the build never holds the whole table in memory.
+    pub fn with_centroids(dim: usize, nlist: usize, centroids: Vec<Vec<f32>>) -> IvfIndex {
+        let nlist = nlist.max(1);
+        let mut centroids = centroids;
+        centroids.resize(nlist, vec![0.0f32; dim]);
+        IvfIndex {
+            dim,
+            nlist,
+            lists: vec![Vec::new(); nlist],
+            radii: vec![0.0f32; nlist],
+            centroids,
+            cell_of: Vec::new(),
+            pos_of: Vec::new(),
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -347,7 +368,14 @@ impl IvfIndex {
 /// The first centroid is the first row; every following centroid is the row
 /// that is farthest away from all centroids chosen so far. The pass is
 /// deterministic, so an index rebuilt from the same data is identical.
-fn select_centroids(dim: usize, nlist: usize, rows: &[(u64, i64, Vec<f32>)]) -> Vec<Vec<f32>> {
+///
+/// The rows are a *sample* of the table, not the whole table: the caller
+/// decides how many rows it hands over. The build of a large table samples
+/// the table, so that the memory of the build does not depend on the size
+/// of the table. The sample only decides where the cells are; the pruning
+/// of the index is exact whatever the sample was, because the radius of a
+/// cell is measured over every row of that cell.
+pub fn select_centroids(dim: usize, nlist: usize, rows: &[(u64, i64, Vec<f32>)]) -> Vec<Vec<f32>> {
     let n = rows.len();
     let mut centroids: Vec<Vec<f32>> = Vec::with_capacity(nlist.min(n));
     centroids.push(rows[0].2.clone());
