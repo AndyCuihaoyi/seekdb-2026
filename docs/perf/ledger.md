@@ -346,6 +346,209 @@ buffer together cost 116 KB more than they did.
 
 ---
 
+## 3.2 The memory that grew with the number of rows
+
+The measurements of section 3 are of a table of 10000 rows, which is the
+data set of the benchmark. The statement requires the database to cope
+with a data set that is *larger* than the memory budget, so the memory
+of a table of 800000 rows matters more than the memory of a table of
+10000 rows, and it was measured separately.
+
+The first measurement of this round showed that the peak of every phase
+that walks the table grew linearly with the number of rows:
+
+| Phase | 50000 rows | 200000 rows | 800000 rows |
+| --- | ---: | ---: | ---: |
+| write | 6 MiB | 12 MiB | 34 MiB |
+| index build | 37 MiB | 94 MiB | 161 MiB |
+| select filtered | 40 MiB | 119 MiB | 307 MiB |
+| select all | 50 MiB | 179 MiB | 482 MiB |
+| update one | 53 MiB | 179 MiB | 391 MiB |
+| delete one | 0 MiB | 124 MiB | 391 MiB |
+| topk | 0 MiB | 127 MiB | 391 MiB |
+| **restart** | **53 MiB** | **176 MiB** | **493 MiB** |
+
+The number of the restart was the worst of them, and it was the one that
+was believed to be the recovery. It was not. `tools/check_recovery_steps.py`
+measures the process at three moments, and it says this:
+
+```json
+{
+  "peak_after_handshake_mib": 94,
+  "peak_after_limit1_mib": 410,
+  "rows": 800000
+}
+```
+
+The recovery itself peaks at 94 MiB. The jump to 410 MiB happens between
+the handshake and the answer of the first statement, and the first
+statement of the tool is `SELECT id FROM t LIMIT 1;`. The memory of the
+restart was the memory of a query that read every row of the table to
+answer with one of them.
+
+That is where the three changes of this round come from.
+
+**The rows are projected as they are read.** `for_each_visible_row` walks
+the table block by block and hands each row to the caller as it is
+read. The projection happens inside that walk, so the intermediate
+`Vec<LiveRow>` - a `Vec<ColValue>` of its own for every row of the
+table, with a copy of every string of every row - is gone.
+
+**A statement with a limit stops reading.** A statement without an
+ordering keeps the rows in the order of the table, so the scan can stop
+as soon as it has enough rows. This is what turns the restart of the
+table above from 493 MiB into 122 MiB.
+
+**The response is written without a tree.** The response of a query was
+built as a `Json` tree and then written out, so the answer was held
+three times: as the rows, as the tree, and as the string.
+
+**The three block caches share one budget.** Each of them was given the
+whole `buffer_pool_mb`, so the caches could hold 192 MiB where the
+budget says 64 MiB. The budget is now divided between them.
+
+**The size of a scalar block was a guess.** It was `len() * 64`, which
+says almost nothing about a table whose text column holds a kilobyte a
+row. It is now the real size of the block.
+
+The same measurement after the changes:
+
+| Phase | 50000 rows | 200000 rows | 800000 rows |
+| --- | ---: | ---: | ---: |
+| write | 6 MiB | 11 MiB | 36 MiB |
+| index build | 37 MiB | 62 MiB | 108 MiB |
+| select filtered | 0 MiB | 83 MiB | 134 MiB |
+| select all | 44 MiB | 98 MiB | 198 MiB |
+| update one | 44 MiB | 98 MiB | 198 MiB |
+| delete one | 0 MiB | 91 MiB | 165 MiB |
+| topk | 0 MiB | 91 MiB | 165 MiB |
+| **restart** | **37 MiB** | **80 MiB** | **122 MiB** |
+
+The phases that return every row of the table still grow with it: the
+answer of `SELECT id FROM t` over 800000 rows is 800000 rows, and the
+answer cannot be smaller than the answer. What is gone is the part that
+was *not* the answer - the copy of the table that the query held while
+it worked out the answer.
+
+The restart is the phase that matters the most, because it is the one
+that has to happen before the database answers at all. Its memory barely
+moves with the size of the table now: 37 MiB at 50000 rows, 80 MiB at
+200000 and 122 MiB at 800000, against 53, 176 and 493 MiB before.
+
+### 3.3 The text of the table does not make the memory grow any more
+
+The text of a row is the part that a size estimate gets wrong the most:
+a row of a `VARCHAR(1024)` column holds a kilobyte, and the number of
+the rows of the table says nothing about it.
+
+`tools/check_restart_breakdown.py` writes a table with a text column of a
+given size and reports the memory of a restart, split into the anonymous
+memory of the process and the page cache of the files:
+
+| Text of a row | Anonymous memory | Resident set |
+| --- | ---: | ---: |
+| 0 bytes | 68 MiB | 71 MiB |
+| 100 bytes | 75 MiB | 78 MiB |
+| 1000 bytes | 74 MiB | 76 MiB |
+
+Before the changes the same measurement gave 407 MiB, 484 MiB and 1148
+MiB of anonymous memory. The 1148 MiB was the text of every row of the
+table, copied into the answer of a query that asked for one row.
+
+### 3.4 The structures that still grow with the number of rows
+
+`tools/check_growing_structures.py` measures the process at every moment
+of the life of a table, so that the structures that grow are visible and
+can be told apart from the ones that do not. At 800000 rows of 128
+dimensions:
+
+| Point | Peak |
+| --- | ---: |
+| after the write | 36 MiB |
+| after the build of the index | 107 MiB |
+| after `SELECT id FROM t LIMIT 1` | 122 MiB |
+| after a filtered query | 151 MiB |
+| after a query that reads the whole table | 197 MiB |
+| after a search through the index | 197 MiB |
+| after the restart | 121 MiB |
+
+The structures that grow with the number of rows, and what they cost at
+800000 rows:
+
+| Structure | Size | Note |
+| --- | ---: | --- |
+| the primary key index | ~19 MiB | 800000 entries of 24 bytes, plus the map |
+| the vector index | ~19 MiB | 800000 entries of 16 bytes, plus two arrays of 4 |
+| the inverted index | ~10 MiB | the list of every distinct value of every column |
+| the answer of a query | the size of the answer | this one is the answer |
+
+The primary key index and the vector index are the identity of the rows
+and cannot be smaller without a different data structure. The inverted
+index is a filter over the data and not a copy of it: a column with more
+than 1024 distinct values drops out of it on its own, and a query that
+would have used it falls back to the full scan.
+
+The last row of the table is the honest one: a query that answers with
+every row of the table holds every row of the table, and the statement
+does not ask for anything else.
+
+### 3.5 The data set that is larger than the budget
+
+`tools/check_memory_limit.py` runs the database under the memory limit
+the judge uses - `RLIMIT_AS` of 2 GiB, the same number of bytes as the
+`--memory=2g` of the container - with a data set that is much larger
+than the budget:
+
+```json
+{
+  "data_directory_mib": 6638.3,
+  "data_larger_than_the_budget": true,
+  "dim": 128,
+  "limit_mb": 2048,
+  "phases": {"restart": "answered", "write_and_query": "answered"},
+  "rows": 4400000,
+  "text": 1000
+}
+```
+
+6.6 GiB of data, with a kilobyte of text in every row, under a limit of
+2 GiB. Both the write with the query and the restart answered.
+
+### 3.6 The answers did not change
+
+The changes of this round are meant to change the memory and not the
+answers, so the gate of them is a comparison of two builds.
+`tools/check_answer_equivalence.py` drives two builds through 51
+statements in both search modes, with a transaction, a rollback, an
+update, a delete, a vector index and two restarts, and compares the
+answers byte for byte:
+
+```
+102 of 102 answers are identical
+```
+
+The other gates of the round:
+
+| Gate | Result |
+| --- | --- |
+| `tools/run_public_cases.py` | 20 of 20 |
+| `tools/check_formal_requirements.py` | 27 of 27 |
+| `tools/selftest.py` | all checks passed |
+| `tools/smoke.sh` | all checks passed |
+| `tools/killtest.sh` | 12 rounds passed |
+| `tools/fuzz_kill_recovery.py` | 40 rounds passed |
+| `tools/fuzz_kill_write.py` | 200 rounds passed |
+| `tools/check_ann_equivalence.py` | 100 answers identical |
+| `tools/check_ann_recall.py` | recall 1.0, filtered and unfiltered |
+| `tools/check_filter_semantics.py` | all checks passed |
+| `cargo test --release` | 157 tests |
+
+The performance did not move either, which is the point of the round: the
+query phase of the benchmark went from 2777 ms to 2716 ms and the write
+phase from 1498 ms to 1303 ms, with the recall still at 1.0.
+
+---
+
 ## 4. The formula, and what it means for the score
 
 The formula of the statement is:
@@ -750,4 +953,33 @@ taskset -c 3 ./minivectordb/target/release/kernelbench
 
 # the memory of section 3
 python3 tools/bench_cgroup_peak.py --mode exact
+
+# the memory of section 3.2, at the three data sizes
+python3 tools/check_phase_memory.py --rows 50000
+python3 tools/check_phase_memory.py --rows 200000
+python3 tools/check_phase_memory.py --rows 800000
+
+# the same, at the three sizes at once
+python3 tools/check_memory_scaling.py
+
+# the recovery, at the handshake and after a query (section 3.2)
+python3 tools/check_recovery_steps.py --rows 800000
+
+# the text of the table (section 3.3)
+python3 tools/check_restart_breakdown.py --rows 800000 --text 0
+python3 tools/check_restart_breakdown.py --rows 800000 --text 100
+python3 tools/check_restart_breakdown.py --rows 800000 --text 1000
+
+# the structures that grow (section 3.4)
+python3 tools/check_growing_structures.py --rows 800000
+
+# the data set that is larger than the budget (section 3.5)
+python3 tools/check_memory_limit.py --rows 4400000 --dim 128 --text 1000 --limit-mb 2048
+
+# the gate of the answers (section 3.6). The old build is the one of the
+# commit before the round, and the two are compared byte for byte.
+git stash push -u && cargo build --offline --locked --release --manifest-path minivectordb/Cargo.toml
+cp minivectordb/target/release/minivectordb /tmp/mvdb_baseline && git stash pop
+cargo build --offline --locked --release --manifest-path minivectordb/Cargo.toml
+python3 tools/check_answer_equivalence.py
 ```
