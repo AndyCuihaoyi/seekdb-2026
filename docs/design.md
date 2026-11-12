@@ -132,7 +132,50 @@ steps. A linear search through an access order vector would make every access
 quadratic in the number of cached blocks, which is the kind of hidden cost
 that turns a cache into a slowdown.
 
-## 3. The vector search
+### The budget is the budget of the three caches together
+
+`--buffer-pool-mb` is the memory the block caches of the database may hold
+**in total**, not the budget of each of them. There are three caches - the
+vectors, the directory entries and the scalar columns - and they share the
+budget: half of it for the vectors, which are the largest part of a row, and
+the other half shared by the other two. Each cache keeps at least one
+megabyte, because a cache that may hold nothing reads every block from the
+file again, which costs a system call per block per scan.
+
+The size of a block is the size of what it holds, not a guess about it: the
+allocation of the block, the allocation of every row, the value of every
+column, and the bytes that every text and every vector owns. The size of a
+value is asked of the compiler rather than guessed, so a change of the layout
+of the value cannot make the accounting wrong. An estimate that is too small
+is not a rounding error: the cache evicts by comparing the size against the
+budget, so an estimate that is half the real size lets the cache hold twice
+as much as the budget says.
+
+## 3. The query reads the table without holding it
+
+A query over a table of *N* rows used to materialise every row into a
+`Vec<LiveRow>` before the projection ran, and every one of those rows
+carries its own `Vec<ColValue>` - a copy of every string of every row. The
+answer of the query therefore cost the memory of the whole table twice: once
+as the rows, and once as the projected cells. The peak grew linearly with the
+size of the table, and the statement requires the database to cope with a
+data set that is larger than the memory budget.
+
+The rows are projected **as they are read**. The scan walks the table block by
+block, hands each row to the projection and drops it again, so the answer is
+the only copy of the data.
+
+A statement with a `LIMIT` and no ordering stops reading. The rows come out
+of the table in the order of the table, so the scan knows which rows the
+answer holds as soon as it has enough of them, and the rest of the table is
+never read. A statement with an ordering cannot stop early, because the rows
+that come first in the answer are not known before every row has been seen.
+
+The response of the query is written straight into the string, without a
+`Json` tree in between. The tree was a second copy of the answer, and the
+string a third.
+
+## 4. The vector search
 
 ### Recognising the request
 
@@ -218,7 +261,7 @@ the database starts, every marked table gets its index rebuilt before the
 server reports readiness - the statement requires that the database does not
 report readiness while an index is still being rebuilt.
 
-## 4. The wire protocol
+## 5. The wire protocol
 
 The judge drives the database over the standard streams with one JSON object
 per line. The protocol has three parts.
@@ -270,7 +313,7 @@ without writing anything more.
 Closing the standard input has the same effect, so a driver that simply
 hangs up still gets a clean shutdown.
 
-## 5. Transactions and durability
+## 6. Transactions and durability
 
 A statement that runs outside an explicit transaction is its own transaction
 and takes effect at once.
@@ -320,7 +363,7 @@ rollback marker, discards the staged changes and flushes the committed data
 to disk. The statement requires this explicitly: a transaction that was never
 committed must not become visible after a restart.
 
-## 6. What is not implemented
+## 7. What is not implemented
 
 The following is deliberately out of scope, and the database reports an error
 rather than behaving like something else:
@@ -342,7 +385,7 @@ A finite `--ann-nprobe` gives up early and is therefore genuinely
 approximate; the recall then depends on the data set, and the benchmark
 reports it.
 
-## 7. The measurements
+## 8. The measurements
 
 The performance is measured with `tools/bench.py`, which builds the data set
 of the statement - ten thousand rows of a dimension of 128, a hundred rows

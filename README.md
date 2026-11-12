@@ -82,7 +82,7 @@ command line takes precedence over the environment variable.
 | `--data-dir` | `MINIVECDB_DATA_DIR` | `/data` | Directory that holds the database files. |
 | `--mode` | `MINIVECDB_MODE` | `exact` | The search mode used when a request does not name one. |
 | `--durability` | `MINIVECDB_DURABILITY` | `os` | `os` leaves the durability to the operating system, `full` also flushes the data files at every commit. |
-| `--buffer-pool-mb` | `MINIVECDB_BUFFER_POOL_MB` | `64` | The memory budget of the block cache, in megabytes. |
+| `--buffer-pool-mb` | `MINIVECDB_BUFFER_POOL_MB` | `64` | The memory budget of the block caches, in megabytes. The three caches share it. |
 | `--vector-block-rows` | `MINIVECDB_VECTOR_BLOCK_ROWS` | `4096` | The number of rows in one vector block. |
 | `--ann-nlist` | `MINIVECDB_ANN_NLIST` | `64` | The number of coarse cells of a vector index. |
 | `--ann-nprobe` | `MINIVECDB_ANN_NPROBE` | unlimited | The number of cells an approximate search visits. Without it the search is exact. |
