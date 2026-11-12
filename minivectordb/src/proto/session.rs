@@ -14,6 +14,7 @@ use crate::config::SearchMode;
 use crate::engine::{Cell, QueryResult};
 use crate::error::SqlError;
 use crate::proto::json::{self, Json};
+use std::fmt::Write as _;
 use std::io::{self, BufRead, Write};
 
 /// A protocol level failure that ends the session.
@@ -186,28 +187,103 @@ impl Session {
 }
 
 /// The response of an `execute` request.
+///
+/// The response is written straight into the string, without building a
+/// `Json` tree first.
+///
+/// Why: a query over a large table answers with a large result set, and the
+/// tree of the answer would be a second copy of it. Every row of the answer
+/// became a `Json::Array` of its own, and every cell of every row a `Json`
+/// value, so the tree cost more than the result set itself - and the
+/// response string cost a third copy on top of that. The peak memory of a
+/// query grew with the number of rows of the answer three times over.
+///
+/// The text that is written is the same text the tree would have produced:
+/// the fields are written in the same order, the numbers are formatted with
+/// the same function, and the strings are escaped with the same function.
+/// The response of a query is therefore byte for byte the one it was.
 pub fn execute_response(id: &Json, result: &QueryResult) -> String {
-    let mut fields: Vec<(&str, Json)> = Vec::new();
-    fields.push(("id", id.clone()));
-    fields.push(("ok", Json::Bool(true)));
-    match result.affected {
-        Some(affected) => fields.push(("affected_rows", Json::Int(affected as i64))),
-        None => {}
+    // The answer is written into a string that is grown as it goes. The
+    // size of the first guess is the size of a small answer; a large one
+    // grows the string a few times, which costs a copy each time but keeps
+    // the peak at about twice the size of the answer.
+    let mut out = String::with_capacity(256);
+    out.push('{');
+    // The fields are written in the order the tree would have held them:
+    // the identifier, the flag, the number of affected rows, the columns
+    // and the rows.
+    out.push_str("\"id\":");
+    json::write(id, &mut out);
+    out.push_str(",\"ok\":true");
+    if let Some(affected) = result.affected {
+        out.push_str(",\"affected_rows\":");
+        let _ = write!(out, "{affected}");
     }
     if !result.columns.is_empty() {
-        fields.push((
-            "columns",
-            Json::Array(result.columns.iter().map(|c| Json::Str(c.clone())).collect()),
-        ));
+        out.push_str(",\"columns\":[");
+        for (i, column) in result.columns.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            json::write_string(column, &mut out);
+        }
+        out.push(']');
         // A query always carries the `rows` field, even when the result set
         // is empty: the judge compares the rows of a query against an empty
         // list, and a missing field is not an empty list.
-        fields.push((
-            "rows",
-            Json::Array(result.rows.iter().map(|row| Json::Array(row.iter().map(cell_to_json).collect())).collect()),
-        ));
+        out.push_str(",\"rows\":[");
+        for (i, row) in result.rows.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            write_row(row, &mut out);
+        }
+        out.push(']');
     }
-    json::to_string(&json::object(fields))
+    out.push('}');
+    out
+}
+
+/// Write one row of a result set as a JSON array.
+///
+/// The cells are written into the string one by one, so that a row does not
+/// have to be turned into a tree of its own first.
+fn write_row(row: &[Cell], out: &mut String) {
+    out.push('[');
+    for (i, cell) in row.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        match cell {
+            Cell::Int(i) => {
+                let _ = write!(out, "{i}");
+            }
+            Cell::Float(f) => {
+                if f.is_finite() {
+                    out.push_str(&json::format_f64(*f));
+                } else {
+                    out.push_str("null");
+                }
+            }
+            Cell::Text(s) => json::write_string(s, out),
+            Cell::Vector(v) => {
+                out.push('[');
+                for (i, x) in v.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    if x.is_finite() {
+                        out.push_str(&json::format_f64(*x));
+                    } else {
+                        out.push_str("null");
+                    }
+                }
+                out.push(']');
+            }
+            Cell::Null => out.push_str("null"),
+        }
+    }
+    out.push(']');
 }
 
 /// The response of a failed `execute` request.
@@ -256,6 +332,40 @@ fn cell_to_json(cell: &Cell) -> Json {
         Cell::Vector(v) => Json::Array(v.iter().map(|x| Json::Float(*x)).collect()),
         Cell::Null => Json::Null,
     }
+}
+
+/// Build the response of an `execute` request the way the tree did.
+///
+/// This is the shape the response had before it was written straight into the
+/// string. It is kept so that the two can be compared against each other:
+/// the direct rendering has to produce the same bytes, because the judge
+/// compares the response against its own expectation.
+#[cfg(test)]
+fn execute_response_via_tree(id: &Json, result: &QueryResult) -> String {
+    let mut fields: Vec<(&str, Json)> = Vec::new();
+    fields.push(("id", id.clone()));
+    fields.push(("ok", Json::Bool(true)));
+    match result.affected {
+        Some(affected) => fields.push(("affected_rows", Json::Int(affected as i64))),
+        None => {}
+    }
+    if !result.columns.is_empty() {
+        fields.push((
+            "columns",
+            Json::Array(result.columns.iter().map(|c| Json::Str(c.clone())).collect()),
+        ));
+        fields.push((
+            "rows",
+            Json::Array(
+                result
+                    .rows
+                    .iter()
+                    .map(|row| Json::Array(row.iter().map(cell_to_json).collect()))
+                    .collect(),
+            ),
+        ));
+    }
+    json::to_string(&json::object(fields))
 }
 
 /// Map the wire `search_mode` onto the engine's search mode.
@@ -343,5 +453,76 @@ mod tests {
         let result = QueryResult { columns: Vec::new(), rows: Vec::new(), affected: Some(0) };
         let text = execute_response(&id, &result);
         assert!(text.contains(r#""id":7"#), "{text}");
+    }
+
+    /// The response has to be the same bytes as the one the tree produced.
+    ///
+    /// The response of a query is no longer built as a `Json` tree, because
+    /// the tree of a large answer is a second copy of it. The bytes are
+    /// unchanged, though: the judge compares the response against its own
+    /// expectation, and the transcript of a run is part of the material.
+    #[test]
+    fn the_response_is_the_same_bytes_as_the_one_of_the_tree() {
+        let cases = vec![
+            // A query with rows of several kinds.
+            QueryResult {
+                columns: vec!["id".to_string(), "content".to_string(), "d".to_string()],
+                rows: vec![
+                    vec![
+                        Cell::Int(1),
+                        Cell::Text("你好 \"世界\"\n".to_string()),
+                        Cell::Float(0.5),
+                    ],
+                    vec![
+                        Cell::Int(-9007199254740993),
+                        Cell::Text(String::new()),
+                        Cell::Float(5.196152210235596),
+                    ],
+                ],
+                affected: None,
+            },
+            // An empty result.
+            QueryResult {
+                columns: vec!["id".to_string()],
+                rows: Vec::new(),
+                affected: None,
+            },
+            // A vector cell.
+            QueryResult {
+                columns: vec!["v".to_string()],
+                rows: vec![vec![Cell::Vector(vec![1.0, 2.5, -3.0])]],
+                affected: None,
+            },
+            // A null cell and a non finite float.
+            QueryResult {
+                columns: vec!["a".to_string(), "b".to_string()],
+                rows: vec![vec![Cell::Null, Cell::Float(f64::NAN)]],
+                affected: None,
+            },
+            // A modification.
+            QueryResult {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                affected: Some(7),
+            },
+        ];
+        for result in cases {
+            let direct = execute_response(&Json::Int(1), &result);
+            let via_tree = execute_response_via_tree(&Json::Int(1), &result);
+            assert_eq!(direct, via_tree);
+        }
+    }
+
+    /// The identifier of the request is echoed with its own type.
+    #[test]
+    fn the_response_keeps_the_type_of_the_identifier() {
+        let id = request("{\"id\":\"abc\",\"op\":\"execute\",\"sql\":\"SELECT 1;\"}").get("id").cloned().unwrap();
+        let result = QueryResult {
+            columns: vec!["id".to_string()],
+            rows: vec![vec![Cell::Int(1)]],
+            affected: None,
+        };
+        let text = execute_response(&id, &result);
+        assert_eq!(text, r#"{"id":"abc","ok":true,"columns":["id"],"rows":[[1]]}"#);
     }
 }
