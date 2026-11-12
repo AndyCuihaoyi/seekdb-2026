@@ -72,6 +72,92 @@ fn detect_index_filter(expr: &Expr, def: &TableDef) -> Option<IndexFilter> {
     Some(IndexFilter { column, value: value.to_string() })
 }
 
+/// Whether a statement reads the vector column of its table.
+///
+/// A statement that does not read it never has to copy the vector of a row
+/// into its answer, and the vector is the largest part of a row: at a
+/// dimension of 128 it is 512 bytes against a handful of bytes for the
+/// other columns. A statement that projects the ordinary columns of a large
+/// table would otherwise hold a copy of every vector of the table, which is
+/// more memory than the container has.
+///
+/// The answer is the same for every row of the statement, so it is computed
+/// once and handed to the scan.
+fn statement_reads_vector(sel: &Select, def: &TableDef) -> bool {
+    // `SELECT *` projects the vector column.
+    for item in &sel.items {
+        match &item.expr {
+            None => {
+                if def.vector_column.is_some() {
+                    return true;
+                }
+            }
+            Some(expr) => {
+                if expression_reads_vector(expr, def) {
+                    return true;
+                }
+            }
+        }
+    }
+    // The filter.
+    if let Some(filter) = &sel.filter {
+        if expression_reads_vector(filter, def) {
+            return true;
+        }
+    }
+    // The ordering.
+    for (expr, _) in &sel.order_by {
+        let resolved = match expr {
+            Expr::Column(name) => sel
+                .items
+                .iter()
+                .find(|i| i.alias.as_deref() == Some(name.as_str()))
+                .and_then(|i| i.expr.clone())
+                .unwrap_or_else(|| expr.clone()),
+            other => other.clone(),
+        };
+        if expression_reads_vector(&resolved, def) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether an expression reads the vector column of its table.
+fn expression_reads_vector(expr: &Expr, def: &TableDef) -> bool {
+    match expr {
+        Expr::Column(name) => match def.column_index(name) {
+            Some(idx) => def.vector_column == Some(idx),
+            None => false,
+        },
+        Expr::L2Distance(l, r) => {
+            expression_reads_vector(l, def) || expression_reads_vector(r, def)
+        }
+        Expr::Compare(l, _, r) => {
+            expression_reads_vector(l, def) || expression_reads_vector(r, def)
+        }
+        Expr::BoolOp(l, _, r) => {
+            expression_reads_vector(l, def) || expression_reads_vector(r, def)
+        }
+        _ => false,
+    }
+}
+
+/// Whether a row holds a given value in a given column.
+fn row_matches_value(
+    cols: &[ColValue],
+    column: usize,
+    def: &TableDef,
+    value: &str,
+) -> bool {
+    let _ = def;
+    match cols.get(column) {
+        Some(ColValue::Text(text)) => text == value,
+        Some(ColValue::BigInt(number)) => number.to_string() == value,
+        _ => false,
+    }
+}
+
 /// A value produced by evaluating an expression against a row.
 #[derive(Debug, Clone)]
 pub enum EvalValue {
@@ -369,52 +455,19 @@ impl Engine {
             return self.exec_primary_key_lookup(sel, &def, found);
         }
 
-        // The rows the inverted index of the filter column names.
-        //
-        // When the filter is an equality on an indexed column, the index
-        // names the rows that can satisfy it, and only those rows are read.
-        // The filter is still applied to them, so the answer does not depend
-        // on the index being up to date.
-        let candidate_rows: Option<Vec<u64>> = match sel.filter.as_ref() {
-            Some(f) => match detect_index_filter(f, &def) {
-                Some(plan) => {
-                    let table_id = self
-                        .tables
-                        .values()
-                        .find(|t| t.def.name == def.name)
-                        .map(|t| t.id);
-                    table_id
-                        .and_then(|id| self.tables.values().find(|t| t.id == id))
-                        .and_then(|state| state.inverted.get(plan.column))
-                        .and_then(|index| index.lookup(&plan.value))
-                        .map(|rows| rows.to_vec())
-                }
-                None => None,
-            },
-            None => None,
-        };
-
         // Only the rows the index names are read.
-        let rows = match candidate_rows.as_ref() {
-            Some(ids) => self.materialize_rows(&def, ids)?,
-            None => self.collect_rows(&def)?,
-        };
-
-        // The vector literals of the statement are parsed once and then
-        // reused for every row, instead of being parsed once per row.
-        let mut cache: LiteralCache = LiteralCache::new();
-
-        // Apply the filter first: a filtered TopK must be computed over the
-        // filtered set, not over the whole table.
-        let mut selected: Vec<LiveRow> = Vec::with_capacity(rows.len());
-        for row in rows {
-            if let Some(filter) = &sel.filter {
-                if !self.eval_predicate(filter, &row, &def, &mut cache)? {
-                    continue;
-                }
-            }
-            selected.push(row);
-        }
+        //
+        // Without an index the table is walked block by block and the
+        // filter is applied as the rows are read, so that a row that the
+        // filter rejects never has its vector decoded. The memory of the
+        // answer is then proportional to the number of rows that pass the
+        // filter, not to the size of the table.
+        //
+        // The vector of a row is only read when the statement uses it. A
+        // statement that projects the ordinary columns alone would
+        // otherwise copy the vector of every row of the table into the
+        // answer, and the vector is the largest part of a row.
+        let with_vector = statement_reads_vector(sel, &def);
 
         // Determine the output columns.
         let mut columns: Vec<String> = Vec::new();
@@ -451,26 +504,159 @@ impl Engine {
             order_terms.push((resolved, *term));
         }
 
-        // Materialise the projected values.
-        let mut out: Vec<Vec<Cell>> = Vec::with_capacity(selected.len());
-        let mut sort_keys: Vec<Vec<EvalValue>> = Vec::with_capacity(selected.len());
-        for row in &selected {
+        // The rows the inverted index of the filter column names.
+        let candidate_rows: Option<Vec<u64>> = match sel.filter.as_ref() {
+            Some(f) => match detect_index_filter(f, &def) {
+                Some(plan) => {
+                    let table_id = self
+                        .tables
+                        .values()
+                        .find(|t| t.def.name == def.name)
+                        .map(|t| t.id);
+                    let mut ids = table_id
+                        .and_then(|id| self.tables.values().find(|t| t.id == id))
+                        .and_then(|state| state.inverted.get(plan.column))
+                        .and_then(|index| index.lookup(&plan.value))
+                        .map(|rows| rows.to_vec())
+                        .unwrap_or_default();
+                    // The rows the transaction inserted, and the rows it
+                    // updated into a value that satisfies the filter, are
+                    // candidates as well. A row the transaction deleted is
+                    // not: the filter is applied to it afterwards anyway, so
+                    // a row that is not a candidate is simply not read.
+                    let staged = self.staged_rows_matching(table_id, &def, plan.column, &plan.value);
+                    for (row_id, cols) in staged {
+                        if !ids.contains(&row_id) {
+                            ids.push(row_id);
+                        }
+                        let _ = cols;
+                    }
+                    ids.sort_unstable();
+                    Some(ids)
+                }
+                None => None,
+            },
+            None => None,
+        };
+
+        // The vector literals of the statement are parsed once and then
+        // reused for every row, instead of being parsed once per row.
+        let mut cache: LiteralCache = LiteralCache::new();
+
+        // The answer of the statement, built row by row.
+        //
+        // The rows are projected as they are read, so the answer never
+        // holds a second copy of the table: the intermediate `Vec<LiveRow>`
+        // that the old path materialised is gone, and with it the peak that
+        // grew with the number of rows of the table.
+        let mut out: Vec<Vec<Cell>> = Vec::new();
+        // The sort keys of every row, and the primary key that breaks a tie.
+        let mut sort_keys: Vec<Vec<EvalValue>> = Vec::new();
+        let mut sort_pks: Vec<i64> = Vec::new();
+
+        // How many rows are still wanted.
+        //
+        // A statement without an ordering keeps the rows in the order of the
+        // table, so the scan can stop as soon as it has enough rows. This is
+        // what keeps `SELECT ... LIMIT 1` over a large table cheap: the
+        // statement only ever looks at the first row.
+        //
+        // A statement with an ordering cannot stop early, because the rows
+        // that come first in the answer are not known before every row has
+        // been seen.
+        let limit = match (sel.limit, order_terms.is_empty()) {
+            (Some(n), true) => Some(n),
+            _ => None,
+        };
+        let mut remaining = limit;
+
+        // The rows of the answer, projected.
+        //
+        // The projection is applied to the row as it is read, so that the
+        // row itself does not have to be kept. The projection does not need
+        // the engine, so it is a free function: the scan holds the engine
+        // mutably, and a closure that borrowed it would not compile.
+        let project = |row: &LiveRow,
+                       cache: &mut LiteralCache|
+         -> SqlResult<(Vec<Cell>, Vec<EvalValue>, i64)> {
+            let values_of = RowValues::Decoded(&row.cols);
             let mut values = Vec::with_capacity(projections.len());
             for proj in &projections {
                 let v = match proj {
-                    Projection::Column(idx) => self.column_at(row, &def, *idx)?,
-                    Projection::Expr(e) => self.eval_expr(e, row, &def, &mut cache)?,
+                    Projection::Column(idx) => values_of.at(*idx)?,
+                    Projection::Expr(e) => eval_expr(e, &values_of, &def, cache)?,
                 };
                 values.push(v.to_cell());
             }
-            out.push(values);
-
             // Compute the sort keys.
             let mut keys = Vec::with_capacity(order_terms.len());
             for (expr, _) in &order_terms {
-                keys.push(self.eval_expr(expr, row, &def, &mut cache)?);
+                keys.push(eval_expr(expr, &values_of, &def, cache)?);
             }
-            sort_keys.push(keys);
+            Ok((values, keys, row.pk))
+        };
+
+        match candidate_rows.as_ref() {
+            Some(ids) => {
+                // The index named the rows. They are read one at a time and
+                // projected as they are read.
+                //
+                // The rows are not materialised as a list first: a filter
+                // that matches a large part of the table would otherwise
+                // hold every matching row at once, and the memory of the
+                // statement would grow with the number of rows that match
+                // rather than with the number of rows of the answer.
+                for row_id in ids {
+                    let row = match self.materialize_row(&def, *row_id, with_vector)? {
+                        Some(r) => r,
+                        None => continue,
+                    };
+                    if let Some(filter) = &sel.filter {
+                        if !eval_predicate(
+                            filter,
+                            &RowValues::Decoded(&row.cols),
+                            &def,
+                            &mut cache,
+                        )? {
+                            continue;
+                        }
+                    }
+                    let (values, keys, pk) = project(&row, &mut cache)?;
+                    out.push(values);
+                    sort_keys.push(keys);
+                    sort_pks.push(pk);
+                    if let Some(left) = remaining.as_mut() {
+                        *left -= 1;
+                        if *left == 0 {
+                            break;
+                        }
+                    }
+                }
+            }
+            None => {
+                // The table is walked and the rows are projected as they are
+                // read.
+                //
+                // The scan stops as soon as the statement has enough rows,
+                // so a statement with a limit does not read the whole table.
+                let mut stopped = false;
+                self.for_each_visible_row(&def, sel.filter.as_ref(), with_vector, |row| {
+                    if stopped {
+                        return Ok(());
+                    }
+                    let (values, keys, pk) = project(row, &mut cache)?;
+                    out.push(values);
+                    sort_keys.push(keys);
+                    sort_pks.push(pk);
+                    if let Some(left) = remaining.as_mut() {
+                        *left -= 1;
+                        if *left == 0 {
+                            stopped = true;
+                        }
+                    }
+                    Ok(())
+                })?;
+            }
         }
 
         // ORDER BY. The sort is stable and the primary key is the final tie
@@ -491,18 +677,29 @@ impl Engine {
                     }
                 }
                 // Tie break on the primary key, ascending.
-                compare_pk(&selected[*a], &selected[*b])
+                sort_pks[*a].cmp(&sort_pks[*b])
             });
-            let mut new_out = Vec::with_capacity(out.len());
-            for idx in &order {
-                new_out.push(out[*idx].clone());
+            // The rows are moved rather than copied: the answer of the
+            // statement is the same set of rows, only in another order.
+            let mut sorted: Vec<Vec<Cell>> = Vec::with_capacity(out.len());
+            let mut empty = Vec::new();
+            for idx in order {
+                sorted.push(std::mem::replace(&mut out[idx], std::mem::take(&mut empty)));
             }
-            out = new_out;
+            out = sorted;
         }
 
         // LIMIT.
+        //
+        // A statement that ordered its rows cannot stop the scan early, so
+        // the limit is applied here.
         if let Some(limit) = sel.limit {
-            out.truncate(limit);
+            if order_terms.is_empty() {
+                // The scan already stopped at the limit.
+                debug_assert!(out.len() <= limit);
+            } else {
+                out.truncate(limit);
+            }
         }
 
         Ok(QueryResult { columns, rows: out, affected: None })
@@ -647,7 +844,7 @@ impl Engine {
                 if self.txn_buffer.deleted_of(table_id).contains(&row_id) {
                     return Ok(QueryResult { columns, rows: Vec::new(), affected: None });
                 }
-                let rows = self.materialize_rows(def, &[row_id])?;
+                let rows = self.materialize_rows(def, &[row_id], true)?;
                 match rows.into_iter().next() {
                     Some(r) => r,
                     None => {
@@ -1040,7 +1237,9 @@ impl Engine {
         // Only the rows of the answer are materialised, so the rendering
         // costs one read per row of the answer, not per row of the table.
         let wanted: Vec<u64> = candidates.iter().map(|(_, _, row_id)| *row_id).collect();
-        let rows = self.materialize_rows(def, &wanted)?;
+        // The distance of a row was measured, so the vector of the row may
+        // still be needed to render it.
+        let rows = self.materialize_rows(def, &wanted, true)?;
         let row_index = RowIndex::build(&rows);
         let mut out: Vec<Vec<Cell>> = Vec::with_capacity(candidates.len());
         for (pk, _d, row_id) in &candidates {
@@ -1069,10 +1268,75 @@ impl Engine {
     ///
     /// The rows that the current transaction changed are taken from the
     /// transaction, the others from the storage.
+    /// Materialise one row of a table, given its identifier.
+    ///
+    /// The rows the current transaction changed are taken from the
+    /// transaction rather than from the storage: an updated row is seen with
+    /// its new values, and an inserted row is seen at all.
+    ///
+    /// This is the streaming form of [`Engine::materialize_rows`]: a caller
+    /// that projects the rows as it reads them does not have to hold them
+    /// all at once.
+    fn materialize_row(
+        &mut self,
+        def: &TableDef,
+        row_id: u64,
+        with_vector: bool,
+    ) -> SqlResult<Option<LiveRow>> {
+        let key = def.name.to_ascii_lowercase();
+        let table_id = self.tables.get(&key).map(|t| t.id).unwrap_or(0);
+
+        // A row the transaction deleted is not visible.
+        if self
+            .txn_buffer
+            .deleted_of(table_id)
+            .into_iter()
+            .any(|id| id == row_id)
+        {
+            return Ok(None);
+        }
+        // A row the transaction changed is answered from the transaction.
+        for (id, cols) in self.txn_buffer.updated_of(table_id) {
+            if id == row_id {
+                let pk = match cols.get(def.pk_index) {
+                    Some(ColValue::BigInt(i)) => *i,
+                    _ => 0,
+                };
+                return Ok(Some(LiveRow { row_id, pk, cols }));
+            }
+        }
+        for (id, cols) in self.txn_buffer.inserted_of(table_id) {
+            if id == row_id {
+                let pk = match cols.get(def.pk_index) {
+                    Some(ColValue::BigInt(i)) => *i,
+                    _ => 0,
+                };
+                return Ok(Some(LiveRow { row_id, pk, cols }));
+            }
+        }
+
+        let state = match self.tables.get_mut(&key) {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        // The row is read whole: the scalar columns of the image and the
+        // vector of the vector file. Both come from the caches of the
+        // block, so an answer row costs no system call.
+        //
+        // The vector is only read when the statement uses it.
+        let read = if with_vector {
+            state.store.read_row_cached(row_id)?
+        } else {
+            state.store.read_row_without_vector(row_id)?
+        };
+        Ok(read.map(|(meta, cols)| LiveRow { row_id, pk: meta.pk, cols }))
+    }
+
     fn materialize_rows(
         &mut self,
         def: &TableDef,
         row_ids: &[u64],
+        with_vector: bool,
     ) -> SqlResult<Vec<LiveRow>> {
         let key = def.name.to_ascii_lowercase();
         let table_id = self.tables.get(&key).map(|t| t.id).unwrap_or(0);
@@ -1112,7 +1376,14 @@ impl Engine {
             // The row is read whole: the scalar columns of the image and
             // the vector of the vector file. Both come from the caches of
             // the block, so an answer row costs no system call.
-            let (meta, cols) = match state.store.read_row_cached(*row_id)? {
+            //
+            // The vector is only read when the statement uses it.
+            let read = if with_vector {
+                state.store.read_row_cached(*row_id)?
+            } else {
+                state.store.read_row_without_vector(*row_id)?
+            };
+            let (meta, cols) = match read {
                 Some(r) => r,
                 None => continue,
             };
@@ -1128,12 +1399,464 @@ impl Engine {
             .any(|t| t.id == table_id && t.index.is_some())
     }
 
+    /// The rows of the current transaction whose value of a column is a
+    /// given one.
+    ///
+    /// The inverted index holds the committed rows. The rows that the
+    /// current transaction inserted or updated are not in it, so a filter
+    /// that is answered through the index has to name them by hand.
+    ///
+    /// The rows are the ones the transaction changed: an inserted row and
+    /// an updated row. A deleted row is not among them, because a deleted
+    /// row is not visible at all.
+    fn staged_rows_matching(
+        &self,
+        table_id: Option<u32>,
+        def: &TableDef,
+        column: usize,
+        value: &str,
+    ) -> Vec<(u64, Vec<ColValue>)> {
+        let table_id = match table_id {
+            Some(id) => id,
+            None => return Vec::new(),
+        };
+        let mut out = Vec::new();
+        let mut seen: HashSet<u64> = HashSet::new();
+        for (row_id, cols) in self.txn_buffer.inserted_of(table_id) {
+            if row_matches_value(&cols, column, def, value) && seen.insert(row_id) {
+                out.push((row_id, cols));
+            }
+        }
+        for (row_id, cols) in self.txn_buffer.updated_of(table_id) {
+            if row_matches_value(&cols, column, def, value) && seen.insert(row_id) {
+                out.push((row_id, cols));
+            }
+        }
+        out
+    }
+
     /// The vector index of a table.
     fn vector_index(&self, table_id: u32) -> Option<&crate::vector::ann::IvfIndex> {
         self.tables
             .values()
             .find(|t| t.id == table_id)
             .and_then(|t| t.index.as_ref())
+    }
+
+    /// Whether a predicate reads the vector column.
+    ///
+    /// The scalar scan cannot answer such a predicate, because it does not
+    /// decode the vector of a row. A statement with such a predicate falls
+    /// back to the general path, which materialises the rows it needs.
+    fn reads_vector_column(expr: &Expr, def: &TableDef) -> bool {
+        match expr {
+            Expr::Column(name) => match def.column_index(name) {
+                Some(idx) => def.vector_column == Some(idx),
+                None => false,
+            },
+            Expr::L2Distance(l, r) => {
+                Self::reads_vector_column(l, def) || Self::reads_vector_column(r, def)
+            }
+            Expr::Compare(l, _, r) => {
+                Self::reads_vector_column(l, def) || Self::reads_vector_column(r, def)
+            }
+            Expr::BoolOp(l, _, r) => {
+                Self::reads_vector_column(l, def) || Self::reads_vector_column(r, def)
+            }
+            _ => false,
+        }
+    }
+
+    /// Visit the visible rows of a table, one at a time.
+    ///
+    /// This is the streaming form of [`Engine::collect_rows_filtered`]: the
+    /// rows are handed to the callback as they are read, so the caller
+    /// never holds a second copy of the table.
+    ///
+    /// Why this matters: an unfiltered `SELECT` over a table of *N* rows
+    /// used to materialise every row into a `Vec<LiveRow>` before the
+    /// projection ran. Each of those rows carries its own `Vec<ColValue>`,
+    /// so the answer of a query cost the memory of the whole table *twice*
+    /// - once as rows and once as projected cells - and the peak grew
+    /// linearly with the size of the table. The statement requires the
+    /// database to cope with a data set larger than the memory budget, so a
+    /// structure whose cost is proportional to the number of rows is not
+    /// acceptable.
+    ///
+    /// The callback receives the rows in the order of the table - ascending
+    /// by row identifier for the committed rows, then the rows the current
+    /// transaction staged - which is the order the old path produced, so
+    /// the answer of the statement does not change.
+    ///
+    /// The filter is applied here, exactly as the old path applied it: the
+    /// scalar columns of a row for a filter that does not read the vector
+    /// column, and the whole row for a filter that does. A filter that
+    /// reads the vector column therefore needs the row to be materialised
+    /// before it can be decided, which is the one case where the scan
+    /// cannot avoid the work.
+    ///
+    /// The rows the current transaction staged are visited after the
+    /// committed ones, and a staged update replaces the values of the
+    /// committed row it belongs to, so that a query inside a transaction
+    /// sees what the transaction has done.
+    pub(crate) fn for_each_visible_row(
+        &mut self,
+        def: &TableDef,
+        filter: Option<&Expr>,
+        with_vector: bool,
+        mut visit: impl FnMut(&LiveRow) -> SqlResult<()>,
+    ) -> SqlResult<()> {
+        let key = def.name.to_ascii_lowercase();
+        let table_id = match self.tables.get(&key) {
+            Some(t) => t.id,
+            None => return Ok(()),
+        };
+
+        // The rows the transaction changed are handled separately: they are
+        // not in the storage yet, and they are few.
+        let deleted: HashSet<u64> =
+            self.txn_buffer.deleted_of(table_id).into_iter().collect();
+        // A staged update replaces the values of the row it belongs to. The
+        // map is small - it holds the rows the transaction changed - so it
+        // does not grow with the size of the table.
+        let staged_updates: HashMap<u64, Vec<ColValue>> = self
+            .txn_buffer
+            .updated_of(table_id)
+            .into_iter()
+            .collect();
+        let mut cache = crate::exec::query::LiteralCache::new();
+
+        // A filter that reads the vector column cannot be decided from the
+        // scalar columns alone, so the row is materialised whole before it
+        // is tested.
+        let filter_needs_vector = match filter {
+            Some(f) => Self::reads_vector_column(f, def),
+            None => false,
+        };
+
+        // The committed rows, block by block.
+        let blocks = self.tables.get(&key).map(|t| t.store.blocks).unwrap_or(0);
+        let block_rows = self.block_rows_of(&key);
+        for block in 0..blocks {
+            let (metas, scalars) = {
+                let state = match self.tables.get_mut(&key) {
+                    Some(s) => s,
+                    None => break,
+                };
+                let metas = match state.store.read_meta_block(block as u32) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                if metas.is_empty() {
+                    break;
+                }
+                // The scalar columns of the block. The vector column is not
+                // among them, so the vectors of the block are not touched.
+                let scalars = match state.store.read_scalar_block(block as u32, &metas) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                (metas, scalars)
+            };
+            for (slot, meta) in metas.iter().enumerate() {
+                if meta.alive == 0 {
+                    continue;
+                }
+                let row_id = block * block_rows as u64 + slot as u64;
+                if deleted.contains(&row_id) {
+                    continue;
+                }
+                // The filter is applied to the scalar columns of the row,
+                // unless it reads the vector column: then the row has to
+                // be materialised whole before it can be decided.
+                if let Some(filter) = filter {
+                    if filter_needs_vector {
+                        let row = match self.materialize_committed_row(def, row_id, with_vector)? {
+                            Some(r) => r,
+                            None => continue,
+                        };
+                        let row = self.apply_staged_update(row, &staged_updates);
+                        if !eval_predicate_borrowed(
+                            filter,
+                            &RowValues::Decoded(&row.cols),
+                            def,
+                            &mut cache,
+                        )? {
+                            continue;
+                        }
+                        visit(&row)?;
+                        continue;
+                    }
+                    let cols = match scalars.get(slot) {
+                        Some(c) => c,
+                        None => continue,
+                    };
+                    // A row whose columns cannot be read does not satisfy the
+                    // filter: the answer has to stay the answer of the rows
+                    // that are readable.
+                    if !eval_predicate_borrowed(
+                        filter,
+                        &RowValues::Scalars(cols),
+                        def,
+                        &mut cache,
+                    )? {
+                        continue;
+                    }
+                }
+                // The row passed the filter, so it is materialised whole.
+                //
+                // The vector is only read when the statement needs it: it is
+                // the largest part of a row, and a statement that projects
+                // the ordinary columns alone never looks at it.
+                let row = match self.materialize_committed_row(def, row_id, with_vector)? {
+                    Some(r) => r,
+                    None => continue,
+                };
+                let row = self.apply_staged_update(row, &staged_updates);
+                visit(&row)?;
+            }
+        }
+
+        // Rows staged in the current transaction.
+        let inserted = self.txn_buffer.inserted_of(table_id);
+        for (row_id, cols) in inserted {
+            if deleted.contains(&row_id) {
+                continue;
+            }
+            let pk = match cols.get(def.pk_index) {
+                Some(ColValue::BigInt(i)) => *i,
+                _ => 0,
+            };
+            let row = LiveRow { row_id, pk, cols };
+            if let Some(filter) = filter {
+                if !eval_predicate_borrowed(
+                    filter,
+                    &RowValues::Decoded(&row.cols),
+                    def,
+                    &mut cache,
+                )? {
+                    continue;
+                }
+            }
+            visit(&row)?;
+        }
+        Ok(())
+    }
+
+    /// Materialise one committed row of a table.
+    ///
+    /// The vector is only read when the statement needs it.
+    fn materialize_committed_row(
+        &mut self,
+        def: &TableDef,
+        row_id: u64,
+        with_vector: bool,
+    ) -> SqlResult<Option<LiveRow>> {
+        let key = def.name.to_ascii_lowercase();
+        let state = match self.tables.get_mut(&key) {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let read = if with_vector {
+            state.store.read_row_cached(row_id)?
+        } else {
+            state.store.read_row_without_vector(row_id)?
+        };
+        Ok(read.map(|(meta, cols)| LiveRow { row_id, pk: meta.pk, cols }))
+    }
+
+    /// Replace the values of a row with the ones a staged update holds.
+    ///
+    /// An update that belongs to a row the transaction inserted is applied
+    /// to that row as well, so that a row that was inserted and then
+    /// changed is seen with its current values.
+    fn apply_staged_update(
+        &self,
+        mut row: LiveRow,
+        staged_updates: &HashMap<u64, Vec<ColValue>>,
+    ) -> LiveRow {
+        if let Some(cols) = staged_updates.get(&row.row_id) {
+            row.cols = cols.clone();
+        }
+        row
+    }
+
+    /// Collect the visible rows of a table that satisfy a filter.
+    ///
+    /// The filter is applied while the table is walked, and the rows that
+    /// pass it are the only ones that are materialised. The filter is
+    /// evaluated against the **scalar** columns of a row, so a row that the
+    /// filter rejects never has its vector decoded.
+    ///
+    /// This is what keeps the memory of a query over a large table bounded:
+    /// materialising every row of the table first would need the vector of
+    /// every row - `dim * 4` bytes each - and the statement requires that
+    /// the database copes with a data set that is larger than the memory
+    /// budget.
+    ///
+    /// The filter is applied to the rows as they are read, so the answer is
+    /// the same as the one the general path produces: the filter is part of
+    /// the statement, not of the storage.
+    ///
+    /// A filter that reads the vector column cannot be answered by the
+    /// scalar scan, so the general path is used for it.
+    ///
+    /// The answer says whether the rows are already filtered. A caller that
+    /// applies the filter a second time would drop the rows whose vector
+    /// the scalar scan could not read, and the answer of the statement
+    /// would not be the answer of the rows that satisfy the filter.
+    pub(crate) fn collect_rows_filtered(
+        &mut self,
+        def: &TableDef,
+        filter: Option<&Expr>,
+        with_vector: bool,
+    ) -> SqlResult<(Vec<LiveRow>, bool)> {
+        if let Some(filter) = filter {
+            if Self::reads_vector_column(filter, def) {
+                // The filter reads the vector, so the row has to be read
+                // whole before it can be decided. The filter is applied
+                // here, so that the caller does not have to.
+                let rows = self.collect_rows(def)?;
+                let mut cache = crate::exec::query::LiteralCache::new();
+                let mut out = Vec::with_capacity(rows.len());
+                for row in rows {
+                    if !self.eval_predicate(filter, &row, def, &mut cache)? {
+                        continue;
+                    }
+                    out.push(row);
+                }
+                return Ok((out, true));
+            }
+        }
+        let key = def.name.to_ascii_lowercase();
+        let table_id = match self.tables.get(&key) {
+            Some(t) => t.id,
+            None => return Ok((Vec::new(), true)),
+        };
+
+        // The rows the transaction changed are handled separately: they are
+        // not in the storage yet, and they are few.
+        let mut out: Vec<LiveRow> = Vec::new();
+        let mut deleted: HashSet<u64> =
+            self.txn_buffer.deleted_of(table_id).into_iter().collect();
+        let mut cache = crate::exec::query::LiteralCache::new();
+
+        // The committed rows, block by block.
+        let count = self.tables.get(&key).map(|t| t.store.row_count).unwrap_or(0);
+        let blocks = self.tables.get(&key).map(|t| t.store.blocks).unwrap_or(0);
+        for block in 0..blocks {
+            let (metas, scalars) = {
+                let state = match self.tables.get_mut(&key) {
+                    Some(s) => s,
+                    None => break,
+                };
+                let metas = match state.store.read_meta_block(block as u32) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                if metas.is_empty() {
+                    break;
+                }
+                // The scalar columns of the block. The vector column is not
+                // among them, so the vectors of the block are not touched.
+                let scalars = match state.store.read_scalar_block(block as u32, &metas) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                (metas, scalars)
+            };
+            for (slot, meta) in metas.iter().enumerate() {
+                if meta.alive == 0 {
+                    continue;
+                }
+                let row_id = block * self.block_rows_of(&key) as u64 + slot as u64;
+                if deleted.contains(&row_id) {
+                    continue;
+                }
+                if let Some(filter) = filter {
+                    let cols = match scalars.get(slot) {
+                        Some(c) => c,
+                        None => continue,
+                    };
+                    // A row whose columns cannot be read does not satisfy the
+                    // filter: the answer has to stay the answer of the rows
+                    // that are readable.
+                    if !eval_predicate_borrowed(
+                        filter,
+                        &RowValues::Scalars(cols),
+                        def,
+                        &mut cache,
+                    )? {
+                        continue;
+                    }
+                }
+                // The row passed the filter, so it is materialised whole.
+                //
+                // The vector is only read when the statement needs it: it is
+                // the largest part of a row, and a statement that projects
+                // the ordinary columns alone never looks at it.
+                let state = match self.tables.get_mut(&key) {
+                    Some(s) => s,
+                    None => break,
+                };
+                let read = if with_vector {
+                    state.store.read_row_cached(row_id)?
+                } else {
+                    state.store.read_row_without_vector(row_id)?
+                };
+                if let Some((meta, cols)) = read {
+                    out.push(LiveRow { row_id, pk: meta.pk, cols });
+                }
+            }
+        }
+
+        // Rows staged in the current transaction.
+        let inserted = self.txn_buffer.inserted_of(table_id);
+        for (row_id, cols) in inserted {
+            if deleted.contains(&row_id) {
+                continue;
+            }
+            let pk = match cols.get(def.pk_index) {
+                Some(ColValue::BigInt(i)) => *i,
+                _ => 0,
+            };
+            if let Some(filter) = filter {
+                if !eval_predicate_borrowed(
+                    filter,
+                    &RowValues::Decoded(&cols),
+                    def,
+                    &mut cache,
+                )? {
+                    continue;
+                }
+            }
+            out.push(LiveRow { row_id, pk, cols });
+        }
+
+        // Staged updates replace the committed values. The rows that were
+        // staged for an update are already in the list, so they are replaced
+        // rather than added.
+        let updates = self.txn_buffer.updated_of(table_id);
+        if !updates.is_empty() {
+            let index = RowIndex::build(&out);
+            for (row_id, cols) in updates {
+                if let Some(pos) = index.get(row_id) {
+                    if let Some(row) = out.get_mut(pos) {
+                        row.cols = cols;
+                    }
+                }
+            }
+        }
+
+        Ok((out, true))
+    }
+
+    /// The number of rows in one block of a table.
+    fn block_rows_of(&self, key: &str) -> usize {
+        self.tables
+            .get(key)
+            .map(|t| t.store.block_rows)
+            .unwrap_or(1)
     }
 
     /// Collect the visible rows of a table: committed rows plus the rows
