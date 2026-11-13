@@ -37,11 +37,11 @@ So the three numbers that the platform counts are these:
 
 | Axis | Baseline | Now | Note |
 | --- | ---: | ---: | --- |
-| The time of the query | 969.2 ms | 323.5 ms | 3.00x better (1.25x under a quota) |
+| The time of the query | 965.5 ms | 318.7 ms | 3.03x better (1.25x under a quota) |
 | The bytes of the query | 0 B | 0 B | the page cache serves all of it |
-| The memory of the query | 14,800 KB | 11,896 KB | 20% less |
-| The time of the write | 751.4 ms | 566.4 ms | 1.33x better |
-| The bytes of the write | 11,407,360 B | 11,407,360 B | **not moved** |
+| The memory of the query | 14,788 KB | 11,392 KB | 23% less |
+| The time of the write | 762.2 ms | 583.6 ms | 1.31x better |
+| The bytes of the write | 11,407,360 B | 11,411,456 B | **not moved** |
 
 The one that has not moved is the one that is worth the next round. The
 ratio of the query is given twice, because the placement of the two
@@ -78,18 +78,28 @@ phase became 2.2 times faster.
 python3 tools/bench_median.py --mode exact --rounds 5 --cpu 7
 ```
 
-| Measurement | Baseline `b88e0209` | Now `7ff176a53` | Ratio |
-| --- | ---: | ---: | ---: |
-| Query `T` | 969.2 ms | 323.5 ms | **3.00x faster** |
-| Query `B` (device) | 0 B | 0 B | both are served by the page cache |
-| Query `M` (RSS) | 14,800 KB | 11,896 KB | **0.80x, 20% less** |
-| Write `T` | 751.4 ms | 566.4 ms | 1.33x faster |
-| Write `B` (device) | 11,407,360 B | 11,407,360 B | 1.00x |
-| Write `M` (RSS) | 3,960 KB | 3,988 KB | 1.01x more |
+| Measurement | Baseline `b88e0209` | Before `7ff176a53` | Now | Ratio to the baseline |
+| --- | ---: | ---: | ---: | ---: |
+| Query `T` | 969.2 ms | 323.5 ms | 318.7 ms | **3.03x faster** |
+| Query `B` (device) | 0 B | 0 B | 0 B | both are served by the page cache |
+| Query `M` (RSS) | 14,800 KB | 11,896 KB | 11,392 KB | **0.77x, 23% less** |
+| Write `T` | 751.4 ms | 566.4 ms | 583.6 ms | 1.29x faster |
+| Write `B` (device) | 11,407,360 B | 11,407,360 B | 11,411,456 B | 1.00x |
+| Write `M` (RSS) | 3,960 KB | 3,988 KB | 3,872 KB | 0.98x |
 
 The spread of the five rounds of each row is under 4%. The measurements
-are in `docs/perf/baseline-pinned-exact.json` and
-`docs/perf/p5-current-exact.json`.
+are in `docs/perf/baseline-pinned-exact.json`,
+`docs/perf/p5-current-exact.json` and `docs/perf/p6-memory-round-exact.json`.
+
+**The middle column is the point of this round.** The numbers of the
+table above the baseline column were the ones of `7ff176a53`, and the
+round that removed the memory that grew with the number of rows changed
+them. The three binaries were measured one after another, five rounds
+each, in the order `baseline`, `before`, `now`, so that a drift of the
+machine hits all three of them and cancels out; the commands are in
+section 5. The result was that the round made the query *faster* and the
+memory *smaller*, but only after a regression was found and fixed - see
+section 1.2.
 
 **The query is 3.00 times faster than the baseline, and the earlier
 figure of 1.51 times was an artefact of the noise.** The earlier table of
@@ -100,6 +110,67 @@ the comparison landed in the middle of it.
 The answers of the two versions are byte for byte identical, in both the
 exact and the approximate mode (`docs/perf/answers-baseline-*.txt`). That
 was checked against the baseline binary itself, not only against the file.
+
+### 1.2 The round that removed the growing memory made the memory worse
+
+The round of 2026-11-12 removed the memory that grew with the number of
+rows. It changed the code that builds the vector index, among other
+things, and the build of the index is charged against the peak memory of
+the container, so the numbers of section 1 had to be taken again.
+
+They came out **worse on the memory**, and the cause was not the round
+itself but one constant in it.
+
+**The measurement.** The three binaries were measured one after another,
+five rounds each, in the order `baseline`, `before`, `now`:
+
+| Binary | Query `T` | Query `M` | Index build `T` |
+| --- | ---: | ---: | ---: |
+| `b88e0209` (baseline) | 965.5 ms | 14,788 KB | 73.6 ms |
+| `7ff176a53` (before) | 326.0 ms | 11,808 KB | 60.2 ms |
+| the round, as it was | 315.0 ms | **13,892 KB** | 29.6 ms |
+
+The query was faster and the memory was 17% worse. The memory of the
+phase that builds the index says where it came from: it went from 9 MiB
+to 14 MiB at ten thousand rows.
+
+**The cause.** The build of the index chose the centroids of the cells
+from a sample of the table, and the sample held the *vectors* of the
+sampled rows: `SAMPLE_ROWS` vectors of `dim` floats, which is four
+megabytes at a dimension of 128. The second pass of the build allocated
+the index on top of that sample, so the peak of the build was four
+megabytes higher than it had to be. The constant was even wrong about
+itself: the comment above it said the sample was "1 MiB at a dimension of
+128", and 8192 rows of 128 floats is 4 MiB.
+
+**The fix.** The sample holds the *identifiers* of the sampled rows now,
+and not their vectors. The farthest point sampling needs, for every row
+of the sample, the distance to the closest centroid chosen so far, and it
+needs it again for every centroid it picks afterwards; the pass therefore
+walks the table once per centroid and keeps only the distance of every
+row of the sample - four bytes each - and one block of vectors. The
+number of centroids is small (64 by default), so the number of passes is
+small too, and the rows are read through the block cache, so the rows
+that are still cached cost no system call.
+
+The build of the index got *faster* as well - 29.0 ms against 60.2 ms -
+because the table is walked twice instead of once, but the second walk
+reads the rows it has already read.
+
+**The size of the sample was not the thing to change.** The obvious fix
+is to make the sample smaller, and it is the wrong one: the sample is
+what decides where the cells are, and a smaller sample spreads them
+worse. At a finite `--ann-nprobe` of 4, 8 and 16, a sample of 2048 rows
+gave a recall of 0.22, 0.36 and 0.55, where a sample of 8192 rows gave
+0.30, 0.45 and 0.63. Every one of those is below the 0.95 the statement
+asks for, so the platform has to use the default of no limit - but a
+smaller sample would have made the answer worse for nothing.
+
+**What the fix did not change.** The answers are byte for byte identical
+to the ones of the round before it, in both the exact and the approximate
+mode: 102 of 102 answers of `tools/check_answer_equivalence.py`, and 400
+answers of a script that asks the same 200 queries in the two modes
+against the two binaries.
 
 ### 1.0 How the measurement is taken, and why it is this way
 
@@ -593,9 +664,10 @@ The order of the levers, with the numbers of this machine:
    This axis is closed.
 4. **The peak memory of the query.** It is 13 1/3% of the weight, and it
    used to grow against the baseline. It does not any more: the block of
-   the vector file was made smaller, and the peak fell to 11,896 KB against
-   the 14,800 KB of the baseline, so `R_M` is 1.24. This axis is now on
-   the right side.
+   the vector file was made smaller, and the peak fell to 11,392 KB against
+   the 14,788 KB of the baseline, so `R_M` is 1.30. This axis is now on
+   the right side. Section 1.2 tells how the round of 2026-11-12 made it
+   worse before it was made better.
 5. **The time of the write.** It is 20% of the weight, and it is 1.33 times
    faster than the baseline already. Section 4.4 shows that it is worth
    nothing to improve it further.
@@ -930,7 +1002,29 @@ Every measurement of this file is reproduced by these commands:
 python3 tools/bench_median.py --mode exact --rounds 5 --cpu 3 --cpus 3
 python3 tools/bench_median.py --binary <baseline binary> --mode exact --rounds 5 --cpu 3 --cpus 3
 
-# the counters of the I/O, both of them side by side
+# the table of section 1.2, which measures three binaries at once. The
+# rounds are interleaved, so that a drift of the machine hits all three of
+# them and cancels out. The three binaries are built with the profile that
+# is delivered - `strip = true` - so that the numbers are the numbers of
+# the delivered build.
+for round in 1 2 3 4 5; do
+  for binary in baseline before now; do
+    python3 tools/bench.py --binary "$binary" --mode exact \
+        --rows 10000 --dim 128 --queries 1000 --cpu 3 --cpus 3 \
+        --output "docs/perf/p6-$binary-$round.json"
+  done
+done
+
+# the same, in the approximate mode
+for round in 1 2 3 4 5; do
+  for binary in baseline before now; do
+    python3 tools/bench.py --binary "$binary" --mode ann \
+        --rows 10000 --dim 128 --queries 1000 --cpu 3 --cpus 3 \
+        --output "docs/perf/p6ann-$binary-$round.json"
+  done
+done
+
+# the counter of the I/O, both of them side by side
 python3 tools/measure_io.py --mode exact --cpu 3
 
 # the profile of section 2. The release profile of the crate sets
