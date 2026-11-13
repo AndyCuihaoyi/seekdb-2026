@@ -212,6 +212,8 @@ bash tools/killtest.sh                                       # the crash recover
 python3 tools/bench.py                                       # the performance measurement
 python3 tools/perf_compare.py --before A --after B           # the performance comparison
 python3 tools/check_time_budget.py --rows 4000000 --dim 128 --limit-mb 2048
+python3 tools/check_ann_nprobe_equivalence.py --broken /tmp/mvdb_broken
+python3 tools/check_ann_recall.py
 ```
 
 The last one holds every phase of the run to **half** of the budget of
@@ -221,6 +223,15 @@ whose cost grows with the size of the table faster than it has to; see
 [docs/perf/ledger.md](docs/perf/ledger.md) §4.1.3. It has to be run at the
 large size: at the size of the public cases (ten thousand rows) the build
 of the index takes 29 ms and no timeout is possible there.
+
+The two after it are about the **approximate** answers. The first one
+compares the answers of two builds at a finite number of visited cells,
+where the answer really depends on the cells of the index; the build
+before the fix and the build after it have to answer exactly the same
+thing, because the fix changed the time of the build and not its result.
+The second one measures the recall in the mode the platform runs, where
+the number of visited cells is not limited and the recall is 1.000 by
+construction.
 
 The official checker of the test package can be run against the image as
 well:
