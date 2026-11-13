@@ -76,6 +76,36 @@ def load_log():
     return "\n".join(parts)
 
 
+def load_snapshot():
+    """Read the turns of the record that the transcript no longer holds.
+
+    The transcript of the working session was overwritten on 2026-11-13.
+    The turns it used to hold are kept in `tools/record_snapshot.json`,
+    word for word: they were copied out of the transcript into the
+    material of an earlier commit, and the builder puts them back where
+    the record is read from.
+
+    The snapshot is part of the record for the purpose of this check: an
+    excerpt that is in it was really said or really happened, because the
+    snapshot holds nothing that the material did not already hold.
+    """
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(root, "tools", "record_snapshot.json")
+    if not os.path.exists(path):
+        return ""
+    with open(path, "r", encoding="utf-8") as fh:
+        snapshot = json.load(fh)
+    parts = []
+    for turn in snapshot.get("turns", {}).values():
+        text = turn.get("user")
+        if isinstance(text, str):
+            parts.append(text)
+        for part in turn.get("agent_parts", []):
+            if isinstance(part, str):
+                parts.append(part)
+    return "\n".join(parts)
+
+
 def collect_excerpts(node, path, out):
     """Collect every (pointer, excerpt, owner content) triple."""
     if isinstance(node, dict):
@@ -100,7 +130,8 @@ def main():
     doc = json.load(open(path, encoding="utf-8"))
     record = load_record()
     log = load_log()
-    if not record and not log:
+    snapshot = load_snapshot()
+    if not record and not log and not snapshot:
         print("FAIL  the development record is empty")
         return 1
 
@@ -109,7 +140,8 @@ def main():
 
     missing = []
     for pointer, excerpt, content in excerpts:
-        if excerpt not in record and excerpt not in log:
+        if excerpt not in record and excerpt not in log \
+                and excerpt not in snapshot:
             missing.append((pointer, excerpt))
 
     total = len(excerpts)

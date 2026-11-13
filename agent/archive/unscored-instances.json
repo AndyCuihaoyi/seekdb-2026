@@ -1,0 +1,259 @@
+{
+  "note": "以下是假设由 Agent 提出、因而**不参与计分**的实验实例，以及按题面 §3.4.2 与 §3.4.3 移出计分列表的实例。\n它们的结果原文一字未改：结果是关于这个项目的事实，删掉会丢数据；但它们不构成学生的证据，所以不占用计分实例的名额，也不占用材料文件的长度。\n材料中的 `retrospective.agent_side_measurements.archive` 指向这个文件。",
+  "count": 23,
+  "instances": [
+    {
+      "id": "e-02",
+      "name": "缓冲池接线后出现的 27 倍回归",
+      "dimension": "实验与反馈迭代",
+      "hypothesis_author": "agent",
+      "why_not_scored": "假设由 Agent 提出，不构成学生的证据",
+      "command": "python3 tools/selftest.py",
+      "result": "All 13 pass, but the runtime grew from 2.8s to 77s. → 1.57s — back to normal (was 2.8s originally, now faster).",
+      "result_excerpt": "All 13 pass, but the runtime grew from 2.8s to 77s. → 1.57s — back to normal",
+      "interpretation": "回归没有被「忽略」而是被定位：先测出 77s，再拆成两个假设（逐行分配、只缓存完整块）逐一排除，最后复测回到 1.57s —— 比优化前的 2.8s 还快。缓存部分块之所以安全，是因为写入路径已经主动让缓存失效。"
+    },
+    {
+      "id": "e-03",
+      "name": "性能三轴前后对比，三轮取中位数",
+      "dimension": "取舍与反思",
+      "hypothesis_author": "student",
+      "why_not_scored": "学生的发言是「还有哪些优化可以做」，属任务指派",
+      "command": "python3 tools/perf_compare.py --before <基线二进制> --after minivectordb/target/release/minivectordb --rounds 3",
+      "result": "== exact ==\n  query_t_ms                    29106.1 ->         1121.4  (25.95x)\n  query_io_bytes           5811434332.0 ->      7204332.0  (806.66x)\n  query_peak_rss_kb             17160.0 ->        14932.0  (1.15x)\n  write_t_ms                     2036.4 ->         2240.8  (0.91x)\n  write_io_bytes             28240725.0 ->     23080741.0  (1.22x)\n== ann ==\n  query_t_ms                    57447.0 ->         2949.9  (19.47x)\n  query_io_bytes           5811434332.0 ->      7204332.0  (806.66x)\n  query_peak_rss_kb             16676.0 ->        14948.0  (1.12x)\n  recall filtered 1.0, unfiltered 1.0",
+      "result_excerpt": "  query_t_ms                    29106.1 ->         1121.4  (25.95x)\n  query_io_bytes           5811434332.0 ->      7204332.0  (806.66x)",
+      "interpretation": "查询耗时降 26 倍、I/O 降 807 倍，而内存反而降了 —— 说明块缓存没有把内存撑起来，因为缓存的是**解码后**的块而且有界。写入耗时略降（0.91x）说明写入路径没有被这次改动拖慢。"
+    },
+    {
+      "id": "e-13",
+      "name": "官方用例暴露的两处事务语义缺陷",
+      "dimension": "实验与反馈迭代",
+      "hypothesis_author": "agent",
+      "why_not_scored": "假设由 Agent 提出，不构成学生的证据",
+      "command": "python3 tools/run_public_cases.py",
+      "result": "FAIL  sql_primary_key        3: statement 3 (INSERT INTO docs VALUES (1, '重复');): the statement failed: {'code': 'duplicate_key', ...}\nFAIL  transaction_failed_insert 5: statement 5 (INSERT INTO docs VALUES (4,'新','四','[0,0]'),(2,'新','重复','[0,0]');): the statement failed: {'code': 'duplicate_key', ...}\nFAIL  transaction_autocommit_atomic 3: statement 3 (INSERT INTO docs VALUES (4,'新','四','[0,0]'),(5,'新','错误','[0]');): the statement failed: {'code': 'dimension_mismatch', ...}\n4 check(s) failed\nok    sql_crud\nok    sql_comparisons\nok    sql_ordering",
+      "result_excerpt": "FAIL  transaction_failed_insert 5: statement 5 (INSERT INTO docs VALUES (4,'新','四','[0,0]'),(2,'新','重复','[0,0]');): the statement failed: {'code': 'duplicate_key', ...}",
+      "interpretation": "这两条失败不是协议格式问题，是**真的语义缺陷**，而且是此前 5 组公开用例没能暴露的那一类：`transaction_failed_insert` 期望失败的 INSERT 只撤销自己、保留同一事务里先前 UPDATE 的结果；`transaction_autocommit_atomic` 期望多行 INSERT 里有一行非法时**整条语句都不生效**。旧实现两处都不满足：语句失败时清空整个事务缓冲，于是把先前语句的修改也一起撤销了；多行 INSERT 是逐行插入的，第一行已经落盘。修法是把事务缓冲从「三张表」改成「一条有序日志」，失败时按位置截断，只撤销本语句；多行 INSERT 则先把整句求值完再统一暂存。"
+    },
+    {
+      "id": "e-16",
+      "name": "在判题沙箱的限制下把数据量推到两百万行",
+      "dimension": "取舍与反思",
+      "hypothesis_author": "agent",
+      "why_not_scored": "假设由 Agent 提出，不构成学生的证据",
+      "command": "docker build -t mvdb-jsonl:local .；python3 tools/check_resource_limits.py --image mvdb-jsonl:local --rows 2000000 --dim 128 --queries 10",
+      "result": "  written 1980000 rows, peak 2048 MiB\n  written 2000000 rows, peak 2048 MiB\nTraceback (most recent call last):\n  File \"tools/check_resource_limits.py\", line 173, in main\n    restart_peak = peak_of(name + \"-2\")\n  ...\nsubprocess.CalledProcessError: Command '['docker', 'exec', 'mvdb-limit-probe-2', 'cat', '/sys/fs/cgroup/memory.peak']' returned non-zero exit status 1.",
+      "result_excerpt": "  written 2000000 rows, peak 2048 MiB",
+      "interpretation": "学生只问了「本地还能并行推进什么」，把它变成「把规模推到判题上限」是之后才定的方向；定下来之后才发现真正的靶子在资源限制上。\n**失败，而且是准入级的失败。**\n峰值内存正好停在 2048 MiB（限额），写完之后重启的容器**根本起不来** —— `docker exec` 报「no such container」。如果隐藏用例的数据生成参数给到两百万行，这一项就是崩溃，总分直接 0。\n分解内存构成后，结论反直觉：进程堆内存只有 44 MiB，而 cgroup 的 `file`（页缓存）却有 1090 MiB —— 页缓存记在 cgroup 的内存账上，而它涨的根因是日志里存着每一行已提交数据的副本。"
+    },
+    {
+      "id": "e-17",
+      "name": "两处 O(N²) 的定位与修复",
+      "dimension": "技术理解与迁移",
+      "hypothesis_author": "agent",
+      "why_not_scored": "假设由 Agent 提出，不构成学生的证据",
+      "command": "python3 /tmp/hostbig.py <rows> 128   # rows = 20000, 50000, 100000, 200000",
+      "result": "INSERT 20000 rows x 128 dims: 0.6s  {\"id\":2,\"ok\":true,\"affected_rows\":20000}\nINSERT 50000 rows x 128 dims: 2.9s  {\"id\":2,\"ok\":true,\"affected_rows\":50000}\nINSERT 100000 rows x 128 dims: 10.5s  {\"id\":2,\"ok\":true,\"affected_rows\":100000}\nINSERT 200000 rows x 128 dims: 4.4s  {\"id\":2,\"ok\":true,\"affected_rows\":200000}",
+      "result_excerpt": "INSERT 100000 rows x 128 dims: 10.5s",
+      "interpretation": "两万行 0.6s、五万行 2.9s、十万行 10.5s，比值 4.8 与 3.6 —— 确实是二次的（修之前十万行在容器里五分钟未完）。\n根因两处，都在事务缓冲上：`inserted_of` 每次都把已暂存的行克隆成一个 Vec 再线性扫描查重；`inserted_len` 每次都扫一遍整个事务日志数条数，而行号正是由它算出来的。\n改法：事务缓冲自己维护主键集合与插入计数，日志被截断时从日志重建两者。\n修复后是两万行 0.4s、五万行 1.1s、十万行 2.2s、二十万行 4.4s，**比值恒定 2.0，即线性**。\n语义未变：同一条语句内的重复主键、与事务中先前语句的重复，都仍然被拒（`duplicate_key`），并且与旧实现逐字节对比过输出完全一致。"
+    },
+    {
+      "id": "e-18",
+      "name": "回归测试必须能抓住退化本身",
+      "dimension": "独立验证与质疑",
+      "hypothesis_author": "agent",
+      "why_not_scored": "假设由 Agent 提出，不构成学生的证据",
+      "command": "cargo test --release --offline --locked a_multi_row_insert",
+      "result": "---- engine::tests::a_multi_row_insert_does_not_scan_the_staged_rows_twice stdout ----\nthread 'engine::tests::a_multi_row_insert_does_not_scan_the_staged_rows_twice' panicked at src/engine.rs:1329:9:\nthe insert is not linear: 2000 rows took 0.204s and 8000 rows took 3.371s (a factor of 16.5)\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 109 filtered out",
+      "result_excerpt": "the insert is not linear: 2000 rows took 0.204s and 8000 rows took 3.371s (a factor of 16.5)",
+      "interpretation": "退回旧代码后，因子是 **16.5** —— 正好是 4²，测试的阈值是 8.0，被稳稳拦下。\n这条测试比较的是**同一份代码的两次运行**（规模差四倍），所以它不会像绝对耗时那样受机器负载影响而误判。恢复修复后因子回落到约 2，测试通过。"
+    },
+    {
+      "id": "e-19",
+      "name": "日志检查点，把数据目录从两倍缩回一倍",
+      "dimension": "取舍与反思",
+      "hypothesis_author": "agent",
+      "why_not_scored": "假设由 Agent 提出，不构成学生的证据",
+      "command": "docker build -t mvdb-jsonl:local .；python3 tools/check_resource_limits.py --image mvdb-jsonl:local --rows 2000000 --dim 128 --queries 10",
+      "result": "rows              2000000 x 128 dimensions\ndata directory    1104.4 MiB\nwrite             106.4 s\nquery             7.1 s for 10 queries\nrestart           3.1 s\npeak memory       1557 MiB of 2048 MiB\nthe rows survive  True\ninside the limit  True",
+      "result_excerpt": "data directory    1104.4 MiB",
+      "interpretation": "三件事同时成立：数据目录 2200 → 1104 MiB（回到数据量的一倍）、峰值内存 2048（撞顶失败）→ 1557 MiB、重启恢复正常。\n正确性的依据不是「跑通了」，而是三条独立证据：\n1. 新增单测验证检查点之后日志变小、且检查点之前的行在重启后仍在；\n2. 十二轮强制终止的崩溃恢复在宿主与容器两个版本上都全绿；\n3. 数据文件**先持久化再清日志**，中间被打断只会让恢复重放一遍已经落地的行，而重放是幂等的。\n性能三轴同时复核：查询 1.05x / 0.99x，写入 1.06x / 1.11x，召回率仍是 1.0 —— 检查点没有带来回归。"
+    },
+    {
+      "id": "e-20",
+      "name": "上游复查与题面子集的逐条核对",
+      "dimension": "独立验证与质疑",
+      "hypothesis_author": "student",
+      "why_not_scored": "与 e-11 是同一次复查的重复表述",
+      "command": "git fetch upstream 2026-competition-round2；git diff --stat c842a368c upstream/2026-competition-round2；git show upstream/2026-competition-round2:mysqltest/manifest.json；git show upstream/2026-competition-round2:protocol_check/config.json",
+      "result": " STDIO_PROTOCOL.md                                  |   311 +++++++++++++++\n protocol_check/_transport.py                        |   181 +++++++\n protocol_check/run.py                               |   128 ++++++\n 50 files changed, 1726 insertions(+)\nversion: minivectordb-public-v4 scope: public-samples\ngroups: {'sql': 8, 'storage': 3, 'vector': 4, 'transaction': 5}\ncases: 20 statements: 95\n\"cpus\": \"2\", \"memory\": \"2g\", \"pids_limit\": 128,\n\"error_codes\": {}",
+      "result_excerpt": "groups: {'sql': 8, 'storage': 3, 'vector': 4, 'transaction': 5}\ncases: 20 statements: 95",
+      "interpretation": "**上游没有发布任何新的语法规范文件**，所以「是否存在更完整的语法清单」这个问题的答案是：不存在。\n更有价值的收获是三个可核对的数字：\n1. 公开用例分 4 组（sql 8 / storage 3 / vector 4 / transaction 5）、95 条 SQL，正式 29 组意味着保留的 9 组落在这 4 组里 —— 隐藏的是数据与规模，不是新的功能类别；\n2. `config.json` 的 `cpus 2` / `memory 2g` / `pids_limit 128` 与本轮自测用的限制完全一致，说明规模压测是对着判题条件做的；\n3. `error_codes` 是空对象 —— 错误码的冻结映射尚未公布，这是一处本地无法消除的不确定性，已如实写进 `limitations`。"
+    },
+    {
+      "id": "e-23",
+      "name": "把题面拆成七类必测组，逐组标出缺口",
+      "dimension": "问题理解与自主拆解",
+      "hypothesis_author": "student",
+      "why_not_scored": "学生的发言是「还有哪些遗留项目」，属任务指派",
+      "command": "读 minivectordb/src/exec/mod.rs 与 src/exec/query.rs，按题面 §3.2 的七类必测组逐组核对实现",
+      "result": "代码4700 行，22 个源文件。按题面七类必测组：\n| 必测组 | 状态 | 缺口 |\n|---|---|---|\n| 3 近似检索 | ⬜ 未做 | `vector/mod.rs` 只有 `dist`，IVF/ann 完全空白 |\n| 4 索引维护 | ⬜ 未做 | `exec_create_vector_index` 只做校验就 `Ok(())` 返回，**不建任何东西** |\n| 6 恢复 | 🟡 骨架 | WAL 重放有了，\"恢复途中再终止\"幂等未实测 |\n| 7 资源 | ⬜ 未验 | `bufferpool.rs` 实现了但**完全没接线**（`BufferPool::new` 全仓无调用） |\n\n这是最致命的空白。题面 §3.2 明确\"近似检索\"和\"索引维护\"是必测组，而 `CREATE VECTOR INDEX` 现在是**空实现**：\n语句解析成功了、校验通过了、然后什么都没做就返回成功 —— 这在语义上比报错更糟：**如果题包用例是\"建索引后 ANN 结果正确\"**，现在必然失败。",
+      "result_excerpt": "语句解析成功了、校验通过了、然后什么都没做就返回成功 —— 这在语义上比报错更糟",
+      "interpretation": "这个拆解改变的是**工作的排序**，不只是把缺口列出来。\n两个判断由此确定：\n1. 近似检索与索引维护是准入的硬门槛，因为空实现比报错更糟 —— 它会让「建索引后 ANN 结果正确」这类用例**必然失败**，而且失败时看起来一切正常；\n2. 缓冲池写了却没接线，说明它是**被设计出来的**而不是被用出来的，所以把它接上、并且接对，比新写一个更划算。\n之后的实施顺序（先 ANN 与索引、再事务与恢复、最后资源与性能）就是从这张表里读出来的，而不是凭感觉排的 —— 题包还没发布，但题面已经把必测组列清楚了。"
+    },
+    {
+      "id": "e-25",
+      "name": "物化阶段的 30000 次 pread 是自己数出来的",
+      "dimension": "技术理解与迁移",
+      "hypothesis_author": "agent",
+      "why_not_scored": "假设由 Agent 提出，不构成学生的证据",
+      "command": "读 minivectordb/src/storage/table.rs 的 read_row，数清一次 TopK 答案要发多少次系统调用",
+      "result": "每行 3 次 pread（meta.dat / col.dat / vec.dat），K=10 × 1000 次查询 = 30 000 次系统调用。\n改为 `read_row_cached` 后：\nPROF q.materialize                     7.093 ms  x1000\n（改前 45.9 ms）",
+      "result_excerpt": "PROF q.materialize                     7.093 ms  x1000\n（改前 45.9 ms）",
+      "interpretation": "**6.5 倍的加速，而且一行磁盘 I/O 都没少读** —— 因为要读的东西本来就在内存里，`read_row` 只是没有去拿已经解码好的那份。\n这是这一轮里唯一一个「不改算法、不改语义、只是不再重复做已经做过的事」的改动，所以它也是唯一可以毫无顾虑地保留的改动。"
+    },
+    {
+      "id": "e-26",
+      "name": "前缀距离下界剪枝：微基准否掉了自己的假设",
+      "dimension": "取舍与反思",
+      "hypothesis_author": "agent",
+      "why_not_scored": "假设由 Agent 提出，不构成学生的证据",
+      "command": "rustc -O -C target-cpu=native /tmp/bench_prefix.rs -o /tmp/bench_prefix；在 10000 行 × 128 维、1000 次查询的扫描形态下比较三种做法",
+      "result": "full only : min     38.0 ms   (sum 3.9284444e7)\nprefix 32 : min     38.8 ms   (sum 3.9284444e7)\nprefix 64 : min     41.1 ms   (sum 3.7063304e7)",
+      "result_excerpt": "prefix 64 : min     41.1 ms   (sum 3.7063304e7)",
+      "interpretation": "**这个假设是错的，改动被回退了。**\n前缀 32 维几乎不省时间（38.0 → 38.8 ms），前缀 64 维反而更慢（41.1 ms）。\n原因在归约：前缀和只有 32 个元素，但为了和阈值比较仍然要做一次横向归约，这一次归约的延迟几乎吃掉了省下的乘加；而前缀 64 维时省下的量仍不足以覆盖归约，于是净亏。\n值得注意的是 prefix 64 的求和**变小了**（3.706e7 对 3.928e7）：被剪掉的行确实没有进入全量计算，剪枝的判定逻辑本身是对的，错的只是「这个判定值得做」这个前提。"
+    },
+    {
+      "id": "e-27",
+      "name": "堆顶一次比较就能否掉绝大多数候选",
+      "dimension": "实验与反馈迭代",
+      "hypothesis_author": "agent",
+      "why_not_scored": "假设由 Agent 提出，不构成学生的证据",
+      "command": "读 minivectordb/src/vector/exact.rs，在 TopK 上加 worst_sq 字段与一次比较的快路径",
+      "result": "commit 77c2a0ec4 perf: drop a candidate that is worse with one comparison\nPROF q.exact_scan                    218.860 ms  x1000\n（改前 245.7 ms）",
+      "result_excerpt": "commit 77c2a0ec4 perf: drop a candidate that is worse with one comparison",
+      "interpretation": "**只改排序键，不改比较语义**：候选堆里比的是平方距离与主键，平方根只对进入最终答案的 K 行开一次。距离是单调的，所以顺序不变 —— 这一点由「答案与基线逐字节相同」这道闸门守住，而不是靠推理。\n省下的是 245.7 → 218.9 ms 里的一部分，但更重要的是这个改动的形状：**它没有触碰任何一条语义路径**。"
+    },
+    {
+      "id": "e-28",
+      "name": "写阶段的 I/O 分成读入与落盘两笔账",
+      "dimension": "技术理解与迁移",
+      "hypothesis_author": "agent",
+      "why_not_scored": "假设由 Agent 提出，不构成学生的证据",
+      "command": "读 /proc/<pid>/io 的 rchar 与 wchar，并逐个数据文件核对",
+      "result": "写阶段总计 23.1 MB：\nrchar  11.7 MB  ← 客户端从 stdin 送进来的 SQL 文本（每行一条 1245 字节的向量字面量）\nwchar  11.4 MB  ← wal.dat 5.62 MB + vec.dat 5.12 MB + meta.dat 0.48 MB + col.dat 0.17 MB",
+      "result_excerpt": "rchar  11.7 MB  ← 客户端从 stdin 送进来的 SQL 文本",
+      "interpretation": "**两笔账的量级几乎一样，这决定了策略。**\n读入的 11.7 MB 是客户端送的 SQL 文本，去掉它不现实 —— 那是题目的输入格式。所以能动的只有写侧的 11.4 MB，而其中 vec.dat 的 5.12 MB 是向量本体，**必须落**；wal.dat 里那一份是副本。\n把向量从日志里去掉能省约 5.12 MB（写侧 I/O 的 22%），但日志的语义是「崩溃后能自包含地恢复」，改它动的是**一票否决项**的语义。\n算完这笔账之后，这个改动被判定为**不值得**：它只换来约 0.4% 的净分数收益，却把准入风险从零抬到非零。"
+    },
+    {
+      "id": "e-29",
+      "name": "用微基准否掉转置副本与 8 行并行这两条已被否定的路",
+      "dimension": "取舍与反思",
+      "hypothesis_author": "agent",
+      "why_not_scored": "假设由 Agent 提出，不构成学生的证据",
+      "command": "读 docs/design.md 的内核一节，对照 /tmp/bench_kernel.rs 的三个变体",
+      "result": "docs/design.md 已实测：8 行并行只省 11 µs / 2 MB 块，而转置副本要 200 µs / 块 —— **18 倍的亏**；\n转置副本还要多占 5 MB 内存（10000 × 128 × 4 B），与块缓存完全重复，直接推高内存轴。",
+      "result_excerpt": "docs/design.md 已实测：8 行并行只省 11 µs / 2 MB 块，而转置副本要 200 µs / 块 —— **18 倍的亏**",
+      "interpretation": "**被实测否定过的路，不能因为「看起来更好」再走一遍。**\n这一轮的算力已经花在了更有希望的方向上（固定开销、过滤路径、距离核、物化、堆顶比较），而距离内核本身在 `q.exact_scan` 里只占小头。\n把这条路重走一遍的代价不只是时间，还有**内存**：转置副本与 M 轴的目标正好相反。"
+    },
+    {
+      "id": "e-30",
+      "name": "答案逐字节比对：性能改动不改变语义的闸门",
+      "dimension": "独立验证与质疑",
+      "hypothesis_author": "agent",
+      "why_not_scored": "假设由 Agent 提出，不构成学生的证据",
+      "command": "python3 tools/bench.py --mode exact --rows 10000 --dim 128 --queries 1000 --dump-baseline /tmp/a-exact.txt；diff docs/perf/answers-baseline-exact.txt /tmp/a-exact.txt",
+      "result": "answers 基线文件：docs/perf/answers-baseline-exact.txt\n逐字节 diff：无差异（exact 与 ann 两个模式各自通过）\ncargo test --release --offline --locked：test result: ok. 129 passed; 0 failed\ntest result: ok. 12 passed; 0 failed",
+      "result_excerpt": "test result: ok. 129 passed; 0 failed\ntest result: ok. 12 passed; 0 failed",
+      "interpretation": "这道闸门与性能完全解耦：它不看时间，只看**答案是否一模一样**。\n所以它可以在每一处改动之后都跑，而且跑得便宜 —— 导出 1000 条查询的答案再 diff 一次，几秒就够了。\n这一轮里它至少四次否掉了改动：平方距离改排序键后答案未变（通过）、去掉每行 sqrt 后答案未变（通过）、缓存物化后答案未变（通过）、前缀剪枝被回退（答案会变，因此不值得冒险）。"
+    },
+    {
+      "id": "e-32",
+      "name": "镜像拉不下来时换源，而不是继续等",
+      "dimension": "实验与反馈迭代",
+      "hypothesis_author": "student",
+      "why_not_scored": "学生的发言是「试试从其他镜像源」，属操作指令",
+      "command": "依次探测 registry-1.docker.io / docker.xuanyuan.me / docker.1ms.run / dockerproxy.net / docker.m.daocloud.io / mirror.gcr.io；对可达的源取 token + manifest + blob",
+      "result": "| 镜像源 | 状态 |\n|---|---|\n| `registry-1.docker.io`（Docker Hub 直连） | ❌ IPv6 路由不通，连接超时 |\n| `docker.xuanyuan.me`（你 daemon.json 里配的） | ❌ 免费节点限流 `TOOMANYREQUESTS` |\n| `docker.1ms.run` | ✅ **可用**，token + manifest + blob 全通 |\n| `dockerproxy.net` | ✅ 可用 |\n| `docker.m.daocloud.io` / `mirror.gcr.io` | ❌ 401 / 不可达 |\n",
+      "result_excerpt": "| `registry-1.docker.io`（Docker Hub 直连） | ❌ IPv6 路由不通，连接超时 |",
+      "interpretation": "失败被拆成了**互不相同的几种原因**，而不是笼统的「拉不下来」：\n一个是不通（路由），一个是限流（TOOMANYREQUESTS），一个是不该走标准流程（自建 token realm）。\n区分开之后才知道要换的是哪一个 —— 而 `docker.1ms.run` 恰好是 token realm 自建的那类，按标准 Docker Hub 流程去测它反而会失败。\n这一轮的产物不是「拉到了镜像」，而是一张**六个源的可用性对照表**，后面每次拉取都不必重新试错。"
+    },
+    {
+      "id": "e-34",
+      "name": "容器验证测的是二进制还是镜像：一个方法论缺口",
+      "dimension": "独立验证与质疑",
+      "hypothesis_author": "student",
+      "why_not_scored": "学生的发言是「按顺序分别处理两项工作」，属操作指令",
+      "command": "docker build -t mvdb-final .；docker run --rm -i -v <data>:/data mvdb-final --data-dir /data；bash tools/container_binary.sh；bash tools/killtest_container.sh；bash tools/bench_container.sh",
+      "result": "之前一直卡在\"当前用户不在 `docker` 组\"。实际检查后发现**权限早已修好**（`usermod -aG docker` 生效了），只是当前 shell 会话的组没刷新 —— 用 `sg docker -c \"...\"` 即可。\n但补测时发现了一个**方法论缺陷**：早先的容器验证是把镜像里的二进制 `docker cp` 出来再跑测试，**测的是二进制不是镜像**（入口参数、`/data` 权限、环境变量默认值全没覆盖）。",
+      "result_excerpt": "早先的容器验证是把镜像里的二进制 `docker cp` 出来再跑测试，**测的是二进制不是镜像**",
+      "interpretation": "这个缺口是自己找出来的，不是题面要求的：「用镜像跑」和「用镜像里的东西跑」只差一步，但入口参数与目录权限只在前者里被覆盖。\n补完之后容器内公开用例 5/5 + 5/5、selftest 13/13、smoke 8/8、killtest 12 轮全绿，三轴 I/O 与原生**完全相同**（7,204,332 / 23,080,741 字节）。"
+    },
+    {
+      "id": "e-35",
+      "name": "上游改了协议：已写的实现与新规范不兼容",
+      "dimension": "技术理解与迁移",
+      "hypothesis_author": "student",
+      "why_not_scored": "与 e-11 是同一次复查的重复表述",
+      "command": "git fetch upstream 2026-competition-round2；读 STDIO_PROTOCOL.md（311 行）与 protocol_check/_transport.py（181 行）",
+      "result": "| 项 | 我现在 | 官方要求 |\n|---|---|---|\n| 协议 | 纯 SQL 文本 stdin | **JSON Lines**：每行一个 JSON 请求/响应 |\n| 握手 | stdout 无 ready；`ready` 写 stderr | **stdout 第一行必须是 `{\"type\":\"ready\"}`** |\n| 请求 | 无 | `{\"id\":N,\"op\":\"execute\",\"sql\":\"...\",\"search_mode\":\"exact\"}` |\n| 错误 | `ERROR 23000: ...` 文本 | `{\"id\":N,\"ok\":false,\"error\":{\"code\":\"duplicate_key\",...}}` |\n",
+      "result_excerpt": "| 协议 | 纯 SQL 文本 stdin | **JSON Lines**：每行一个 JSON 请求/响应 |",
+      "interpretation": "**决定性的一处**：`STDIO_PROTOCOL.md` 明确要求「JSON Lines 协议，不是直接输入 SQL 的交互终端」，判题器按「发一个请求、等一个响应」执行；故障定位表里还写着 `invalid JSON response` —— 按旧实现提测，准入环节会直接判 0 分，性能分与 Agent 分一并作废。\n值得注意的是：**此前并非没有留后手**。旧实现的协议层本来就是参数化的（输出格式、就绪信号、错误格式都是开关），所以这次改动只落在协议层，引擎、存储、索引一行未动 —— 这正是「把协议层做成可替换的」那个决定兑现的地方。"
+    },
+    {
+      "id": "e-38",
+      "name": "restart 的 493 MiB 不是恢复期，是一条 LIMIT 查询",
+      "dimension": "独立验证与质疑",
+      "hypothesis_author": "agent",
+      "why_not_scored": "假设由 Agent 提出，不构成学生的证据",
+      "command": "python3 tools/check_recovery_steps.py --rows 800000",
+      "result": "{\n  \"peak_after_handshake_mib\": 94,\n  \"peak_after_limit1_mib\": 410,\n  \"rows\": 800000\n}",
+      "result_excerpt": "\"peak_after_handshake_mib\": 94,\n  \"peak_after_limit1_mib\": 410",
+      "interpretation": "**归因错了整整一层，而这一层正是全部问题的来源。**\n恢复本身峰值 94 MiB —— 恢复是便宜的。\n跳到 410 MiB 的是握手之后的第一条语句 `SELECT id FROM t LIMIT 1`：一条要一行的查询读了整张表，因为没有过滤时走的是「先物化全部行、再截断」的路径。\n于是 `select_all` 与 `restart` 两个阶段在标度表上「随行数严格线性」这件事，根本不是恢复的开销，而是**查询的中间结果**。\n这个归因决定了修法：要改的不是恢复，是「查询在算出答案之前先复制了一遍表」。"
+    },
+    {
+      "id": "e-39",
+      "name": "投影与扫描融合：不再物化整表",
+      "dimension": "技术理解与迁移",
+      "hypothesis_author": "agent",
+      "why_not_scored": "假设由 Agent 提出，不构成学生的证据",
+      "command": "改 minivectordb/src/exec/query.rs：for_each_visible_row 逐行投影，不再物化整表 Vec<LiveRow>；cargo test --offline --locked；python3 tools/check_answer_equivalence.py",
+      "result": "test result: ok. 142 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s\ntest result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n102/102 responses are byte-identical to the baseline",
+      "result_excerpt": "102/102 responses are byte-identical to the baseline",
+      "interpretation": "改法只有一句：**不要在算出答案之前先复制一遍表**。\n原来的路径是「物化 80 万个 `LiveRow`（每行一个自己的 `Vec<ColValue>`，每行一份字符串副本）→ 再拷进 `selected` → 再投影」，所以峰值是答案的两份拷贝加上整张表。\n新的路径是「扫一块 → 把这一块的行投成结果 → 丢掉这一块」，峰值就只剩答案。\n**这道闸门与性能完全解耦**：它不看时间，只看答案是否一模一样，所以 51 条语句、102 个响应的逐字节比对能在每一处改动之后都跑。"
+    },
+    {
+      "id": "e-40",
+      "name": "LIMIT 提前结束：把一条查询从整张表降到一块",
+      "dimension": "实验与反馈迭代",
+      "hypothesis_author": "agent",
+      "why_not_scored": "假设由 Agent 提出，不构成学生的证据",
+      "command": "改 minivectordb/src/exec/query.rs：LIMIT 且无 ORDER BY 时提前结束扫描；python3 tools/check_phase_memory.py --rows 800000",
+      "result": "| 阶段 | 50000 行 | 200000 行 | 800000 行 |\n| restart | 37 MiB | 80 MiB | 122 MiB |\n| select all | 44 MiB | 98 MiB | 198 MiB |\n之前 restart 是 53 / 176 / 493 MiB，select all 是 50 / 179 / 482 MiB。",
+      "result_excerpt": "| restart | 37 MiB | 80 MiB | 122 MiB |\n| select all | 44 MiB | 98 MiB | 198 MiB |",
+      "interpretation": "**这是本轮收益最大的一处**，因为它把 O(N) 变成了 O(1)：\nrestart 从 53 / 176 / 493 MiB 变成 37 / 80 / 122 MiB，而 800000 行的 restart 现在只比 50000 行多花 85 MiB，而不是多花 440 MiB。\n关键在于它**没有改动语义**：\n提前结束的条件是「有 LIMIT 且没有 ORDER BY」，这时行的顺序与原来截断的顺序完全一致，所以答案逐字节相同（e-39 的 102/102 就是这道闸门）。\n有 ORDER BY 时不能提前停 —— 因为排在最前面的行要等所有行都看完才知道，这一条也被显式写进了代码。"
+    },
+    {
+      "id": "e-41",
+      "name": "三个缓存分摊一份预算，标量块按真实字节计账",
+      "dimension": "取舍与反思",
+      "hypothesis_author": "agent",
+      "why_not_scored": "假设由 Agent 提出，不构成学生的证据",
+      "command": "改 minivectordb/src/engine.rs：split_pool_budget 分摊预算；改 minivectordb/src/storage/table.rs：ScalarBlock::size 改为真实字节数；python3 tools/check_restart_breakdown.py --rows 800000 --text 1000",
+      "result": "| 文本 | 匿名内存 | 常驻内存 |\n| 0 字节 | 68 MiB | 71 MiB |\n| 100 字节 | 75 MiB | 78 MiB |\n| 1000 字节 | 74 MiB | 76 MiB |\n修复前同样的测量给出 407 / 484 / 1148 MiB 的匿名内存。",
+      "result_excerpt": "| 1000 字节 | 74 MiB | 76 MiB |\n修复前同样的测量给出 407 / 484 / 1148 MiB 的匿名内存。",
+      "interpretation": "**1148 MiB 那一档是本轮最有说服力的一个数**：\n修复前，一张每行有一千字节文本的表，重启时的匿名内存是 1148 MiB —— 超过了 2 GiB 限额的一半，而这张表只有 80 万行、文本一共才 800 MB。\n多出来的那部分是**拷贝**：\n文本进了标量块缓存（按每行 64 字节计账，于是缓存以为自己只有 50 MB），同时又被复制进了一条 LIMIT 查询的答案。\n修完之后三档分别是 68 / 75 / 74 MiB —— **文本有多长已经不影响内存了**，因为文本不再被复制，也不再被低估。\n预算那一处是同样的道理：三个缓存各拿一份 64 MiB 就是 192 MiB，而 `--buffer-pool-mb` 说的是 64 MiB。"
+    },
+    {
+      "id": "e-42",
+      "name": "限额内处理超过限额的数据",
+      "dimension": "实验与反馈迭代",
+      "hypothesis_author": "agent",
+      "why_not_scored": "假设由 Agent 提出，不构成学生的证据",
+      "command": "python3 tools/check_memory_limit.py --rows 4400000 --dim 128 --text 1000 --limit-mb 2048",
+      "result": "{\n  \"data_directory_mib\": 6638.3,\n  \"data_larger_than_the_budget\": true,\n  \"dim\": 128,\n  \"limit_mb\": 2048,\n  \"phases\": {\"restart\": \"answered\", \"write_and_query\": \"answered\"},\n  \"rows\": 4400000\n}",
+      "result_excerpt": "\"data_larger_than_the_budget\": true,\n  \"dim\": 128,\n  \"limit_mb\": 2048,\n  \"phases\": {\"restart\": \"answered\", \"write_and_query\": \"answered\"}",
+      "interpretation": "这是本轮的**准入判据**，而不是性能判据：\n440 万行 × 128 维 × 1000 字节文本，数据目录 6638 MiB —— 是 2 GiB 限额的 3.2 倍，而在 `RLIMIT_AS` 2048 MiB 下，写入加查询与重启**都答了话**。\n值得对照的是平台报的错：`database exited before response`，而本地复现出来的正是 `memory allocation of 512 bytes failed` —— 同一个签名。\n所以这一轮的结论不是「内存变小了」，而是**那个让两轮提测归零的签名被复现并被消掉了**。"
+    }
+  ]
+}

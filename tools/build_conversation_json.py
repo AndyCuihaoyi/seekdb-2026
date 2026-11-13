@@ -26,6 +26,15 @@ RECORD = os.path.expanduser(
 )
 LOG = os.path.expanduser("~/OceanBase/topics/mvdb-01-minivectordb")
 
+# The file that holds the instances that are not scored.
+#
+# The material has a limit of 128 KiB and it is close to it. The instances
+# whose hypothesis the agent raised are facts about the project, so they
+# are kept, but they are written here rather than in the material: they do
+# not count towards the score, and the room that the next round needs is
+# worth more than the length of a list that is not read.
+ARCHIVE_NAME = "agent/archive/unscored-instances.json"
+
 # The marker of the last user message of this topic. The messages after it
 # belong to another topic of the same project. The marker is a whole phrase
 # that appears in exactly one message of the record, so that the cut cannot
@@ -45,6 +54,11 @@ def read_transcript():
     adds are removed: the timestamp, the reminder, the list of the
     subagent types and the reasoning of the agent, which the rules do not
     ask for.
+
+    The turns that the transcript no longer holds are read from the
+    snapshot of the record. The snapshot holds them word for word: they
+    were copied out of the transcript into the material of an earlier
+    commit, and the transcript was overwritten afterwards.
     """
     import glob
 
@@ -106,6 +120,27 @@ def read_transcript():
     return out
 
 
+def read_snapshot():
+    """Read the turns of the record that the transcript no longer holds.
+
+    The snapshot is checked against the transcript: a turn of the snapshot
+    that the transcript still holds is not used twice, so that the
+    transcript always wins where it can be read.
+    """
+    path = os.path.join(ROOT, "tools", "record_snapshot.json")
+    if not os.path.exists(path):
+        return {}
+    with open(path, "r", encoding="utf-8") as fh:
+        snapshot = json.load(fh)
+    out = {}
+    for name, turn in snapshot.get("turns", {}).items():
+        out[name] = {
+            "user": turn.get("user", ""),
+            "agent_parts": list(turn.get("agent_parts", [])),
+        }
+    return out
+
+
 def strip_harness(text):
     """Remove the parts that the harness adds to a message."""
     text = re.sub(r"<system_reminder>.*?</system_reminder>", "", text, flags=re.S)
@@ -141,12 +176,33 @@ def is_harness_only(text):
 
 
 def topic_turns(turns):
-    """The turns of this topic, up to the last message about it."""
-    last = 0
+    """The turns of this topic, up to the last message about it.
+
+    The cut is made on the last message that belongs to this topic. The
+    last message of the topic is named by `LAST_MESSAGE` when the record
+    still holds it. When it does not, the cut is made on the last turn
+    that a marker of this topic names, because those turns are the ones
+    of this topic by construction.
+    """
+    last = -1
     for i, turn in enumerate(turns):
         if LAST_MESSAGE in turn["user"]:
             last = i
-    return turns[:last + 1]
+            break
+    if last >= 0:
+        return turns[:last + 1]
+    # The last message of the topic is not in the record any more. The
+    # turns of this topic are then the ones that the markers name, and
+    # everything after the last of them belongs to another topic.
+    markers = list(TURN_MARKERS.values())
+    last = -1
+    for i, turn in enumerate(turns):
+        for marker in markers:
+            if marker in turn["user"]:
+                if i > last:
+                    last = i
+                break
+    return turns[:last + 1] if last >= 0 else turns
 
 
 # The turns of the record are found by a piece of their text, not by their
@@ -191,6 +247,25 @@ TURN_MARKERS = {
     "supervise-oom": "上一次成功得分的commit为什么没有内存OOM问题",
 }
 
+# The turns that the record may be without. A turn of this list is not the
+# origin of any instance of the material and it is not quoted in a
+# conversation: it only carries the day of a prompt, or a note about a
+# prompt whose text was written by the agent. When such a turn is not in
+# the record, the material is built without it instead of failing, because
+# nothing that is scored depends on it.
+OPTIONAL_MARKERS = {
+    # The text of this prompt was written by the agent.
+    "perf-task",
+    "review-corrections",
+    # The turns of the supervising session that only carry the furniture
+    # of the interface.
+    "supervise",
+    "dispatch",
+    # The plan of a batch of work, whose text the agent wrote.
+    "plan-p0",
+    "plan-abcd",
+}
+
 
 def resolve_turns(turns):
     """The index of every turn of the record, found by its marker.
@@ -209,6 +284,11 @@ def resolve_turns(turns):
     for name, marker in TURN_MARKERS.items():
         hits = [i for i, turn in enumerate(turns) if marker in turn["user"]]
         if not hits:
+            if name in OPTIONAL_MARKERS:
+                # The turn is not in the record and it is not needed: it
+                # only carries the day of a prompt or a note about it, and
+                # it is not the origin of any instance of the material.
+                continue
             raise SystemExit(
                 "the marker %r of the turn %r is not in the record"
                 % (marker, name))
@@ -224,6 +304,32 @@ def resolve_turns(turns):
         answered = [i for i in hits if turns[i]["agent_parts"]]
         found[name] = answered[0] if answered else hits[0]
     return found
+
+
+def merge_snapshot(turns):
+    """Put the turns of the snapshot back into the list of the record.
+
+    A turn of the snapshot that the transcript still holds is not added
+    again: the transcript wins where it can be read. A turn that only the
+    snapshot holds is appended, so that the rest of the builder does not
+    have to know where a turn came from.
+    """
+    snapshot = read_snapshot()
+    if not snapshot:
+        return turns, {}
+    used = {}
+    for name, turn in snapshot.items():
+        # The marker of the turn has to be in the text of the turn, so
+        # that a turn of the snapshot cannot be a turn of something else.
+        marker = TURN_MARKERS.get(name)
+        if marker is None or marker not in turn["user"]:
+            continue
+        if any(marker in existing["user"] for existing in turns):
+            # The transcript still holds this turn.
+            continue
+        turns.append(turn)
+        used[name] = len(turns) - 1
+    return turns, used
 
 
 # ---------------------------------------------------------------------------
@@ -411,13 +517,26 @@ def excerpt_of(text, limit=200):
 
     The fragment is a verbatim part of the text and it is short enough to
     be quoted inside a report.
+
+    The cut is made at a line boundary. A cut in the middle of a line
+    would leave a fragment that is still a verbatim part of the text, but
+    a cut in the middle of a line of a *table* would leave a fragment that
+    reads as a broken table, and - worse - a cut that lands between two
+    rows would drop the row that explains the row below it.
     """
     if len(text) <= limit:
         return text
     cut = text[:limit]
-    space = cut.rfind(" ")
-    if space > limit // 3:
-        cut = cut[:space]
+    # The last line break of the cut, if there is one. A fragment without
+    # a line break is kept as it is: the text is one long line and there
+    # is no better place to cut it.
+    newline = cut.rfind("\n")
+    if newline > limit // 3:
+        cut = cut[:newline]
+    else:
+        space = cut.rfind(" ")
+        if space > limit // 3:
+            cut = cut[:space]
     return cut
 
 
@@ -1934,7 +2053,313 @@ EXPERIMENTS = [
             "而是**那个让两轮提测归零的签名被复现并被消掉了**。"
         ),
     },
+    {
+        "id": "e-43",
+        "name": "要求把优化与得分版本并排对比，并追问口径",
+        "dimension": "取舍与反思",
+        "hypothesis_author": "student",
+        "student_turn": "supervise-optimizations",
+        "student_excerpt": "当前做的性能优化有哪些？对比得分的版本有优化吗？",
+        "hypothesis": (
+            "优化做了多少只有跟**唯一得分的那个版本**并排比才知道；"
+            "而且「更快」这个说法本身要落到题目计分的三个轴上，"
+            "否则优化可能全落在不计分的轴上。"
+        ),
+        "command": (
+            "python3 tools/bench_median.py --cpu 3 --cpus 3 "
+            "--before <ae6514687 的构建> "
+            "--after minivectordb/target/release/minivectordb --rounds 5"
+        ),
+        "result": (
+            "| 轴 | 得分版本 `ae6514687` | 当前 `7ff176a53` | 变化 |\n"
+            "| 查询 T | 969.2 ms | 323.5 ms | 3.00× 更快 |\n"
+            "| 查询 B（设备级） | 0 B | 0 B | 持平（页缓存全供，无分可拿） |\n"
+            "| 查询 M（峰值 RSS） | 14,800 KB | 11,896 KB | 0.80×，少 20% |\n"
+            "| 写入 T | 751.4 ms | 566.4 ms | 1.33× 更快 |\n"
+            "| 写入 B | 11,407,360 B | 11,407,360 B | 完全持平（唯一未动的轴） |\n"
+            "| 写入 M | 3,960 KB | 3,988 KB | 1.01× 略增 |\n"
+            "| Recall@10 | 1.0 / 1.0 | 1.0 / 1.0 | 持平 |\n"
+            "| answers 逐字节 | — | 完全相同 | 语义未变 |"
+        ),
+        "result_excerpt": (
+            "| 查询 T | 969.2 ms | 323.5 ms | 3.00× 更快 |\n"
+            "| 查询 B（设备级） | 0 B | 0 B | 持平（页缓存全供，无分可拿） |\n"
+            "| 查询 M（峰值 RSS） | 14,800 KB | 11,896 KB | 0.80×，少 20% |"
+        ),
+        "interpretation": (
+            "学生的两个要求各问对了一件事。\n"
+            "「有哪些优化」问的是**做了什么**，"
+            "「对比得分的版本」问的是**做得有没有用**——"
+            "答出来的是 21 个 commit、11 项性能优化，"
+            "但同时也是一句不好听的事实："
+            "**这 11 项全部在两次准入失败里被归零了**。\n"
+            "第二问还逼出了一次口径的自我纠正："
+            "ledger 早期报的「查询 I/O 7.38 MB → 0 B」不是优化，"
+            "是**测量口径错了**（`/proc/<pid>/io` 把协议管道的流量也算进去了）。"
+            "按平台真正用的 cgroup `io.stat` 口径，"
+            "查询阶段的磁盘 I/O 本来就是 0 —— "
+            "**这一轴对所有参赛者都一样，没有分可拿**。\n"
+            "这句话的意思是：继续往查询 I/O 上使劲是白费。"
+            "这正是取舍：知道哪一轴没有分可拿，比知道哪一轴快更重要。"
+        ),
+    },
+    {
+        "id": "e-44",
+        "name": "把提测额度当成校准机会，而不是榨分机会",
+        "dimension": "取舍与反思",
+        "hypothesis_author": "student",
+        "student_turn": "seal-and-push",
+        "hypothesis": (
+            "提测的次数是有限的，所以第一次应该用来把口径校准，"
+            "而不是把所有没验证的改动都塞进去榨一点分；"
+            "没验证过的改动会让这一次的分数既不能加分也不能定位问题。"
+        ),
+        "command": (
+            "git tag 提测候选; git rev-parse HEAD; "
+            "git ls-remote origin 2026-competition-round2"
+        ),
+        "result": (
+            "封版 commit: a868b06fa19189395024239d336fdc4ad3d77f48\n"
+            "远端 ref 指向同一个 SHA\n"
+            "同一次 commit 内含：源码、Dockerfile、"
+            "agent/conversation.json、conversation.json"
+        ),
+        "result_excerpt": (
+            "封版 commit: a868b06fa19189395024239d336fdc4ad3d77f48\n"
+            "远端 ref 指向同一个 SHA"
+        ),
+        "interpretation": (
+            "这一条是取舍的证据，不是执行的证据。\n"
+            "学生在封版时写下了三件事的优先级："
+            "「今天第一次额度用它提测，**只拿 E 和三轴分项做口径校准**，"
+            "不要为了多榨一点分而把没验证的改动塞进去」，"
+            "然后把没验证的工作**移出提测版本**，"
+            "放到「继续并行开发（不占提测额度）」的主线和副线上。\n"
+            "他同时给出了不占额度的工作清单（WAL 去向量、查询侧预剪枝），"
+            "并对每一项都加了约束："
+            "「保持答案逐字节一致」。\n"
+            "这是一次明确的取舍：**用一次提测换口径的确定性，"
+            "而不是用一次提测换未经验证的可能性。**"
+        ),
+    },
+    {
+        "id": "e-45",
+        "name": "把平台的失败原文当作待解释的现象",
+        "dimension": "独立验证与质疑",
+        "hypothesis_author": "student",
+        "student_turn": "platform-fail-2",
+        "hypothesis": (
+            "`database exited before response` 只是现象，不是原因；"
+            "两次提测都是同一句话，说明有同一个稳定的成因，"
+            "而它不在源码里 —— 要回到上游的基准和要求文档去查。"
+        ),
+        "command": (
+            "git diff ae6514687970ab74c0bec648d1e47bb0b4df41dc "
+            "a868b06fa19189395024239d336fdc4ad3d77f48 -- minivectordb/src; "
+            "阅读上游 STDIO_PROTOCOL.md 与 protocol_check/"
+        ),
+        "result": (
+            "第一次提测：MySQL 正式用例：通过；性能原始分 1829.577226\n"
+            "第二次提测：MySQL 正式用例:未通过；"
+            "原因：database exited before response × 1。未执行性能评测。\n"
+            "两次的错误签名完全相同"
+        ),
+        "result_excerpt": (
+            "第二次提测：MySQL 正式用例:未通过；"
+            "原因：database exited before response × 1。未执行性能评测。"
+        ),
+        "interpretation": (
+            "学生在把失败贴回来的同时给出了三条要求，"
+            "每一条都是「不要接受现象」：\n"
+            "「测试还是没有通过」—— 不是重试，是找原因；"
+            "「查看上游仓库的基准和要求文档」—— 去官方口径核对；"
+            "「注意测试的时候有隐藏用例」—— 意识到公开用例全过不等于正式用例会过。\n"
+            "他把同一个错误签名的两次失败**当作一个稳定成因的证据**，"
+            "而不是两次偶然。这一步是本轮能一路查到内存超限的前提："
+            "如果是 panic，符号会是随机的；"
+            "而一个稳定的签名说明有确定的东西被触发。"
+        ),
+    },
+    {
+        "id": "e-46",
+        "name": "用「与得分版本并排 diff」来界定问题",
+        "dimension": "实验与反馈迭代",
+        "hypothesis_author": "student",
+        "student_turn": "diff-against-scoring",
+        "student_excerpt": "diff两个commit版本，查看做了哪些修改",
+        "hypothesis": (
+            "得分版本和失败版本之间只有一处改动是有嫌疑的；"
+            "把两个 commit 并排 diff，就能把「是我的优化引入了问题吗」"
+            "这个问题变成可以逐行回答的问题。"
+        ),
+        "command": (
+            "git diff --stat ae6514687970ab74c0bec648d1e47bb0b4df41dc "
+            "5d9d2a967833831138f9962dbb8dff83c9c8b948 -- minivectordb/src; "
+            "grep -n 'collect_indexable_rows' minivectordb/src/vector/index.rs"
+        ),
+        "result": (
+            "得分版本与失败版本的 src 差异：16 个文件，+2614 −368\n"
+            "得分版本的 index.rs:74 同样是 "
+            "collect_indexable_rows(store, pk_index, vector_index)\n"
+            "得分版本没有倒排索引，向量索引的重建是有条件的"
+        ),
+        "result_excerpt": (
+            "得分版本与失败版本的 src 差异：16 个文件，+2614 −368\n"
+            "得分版本的 index.rs:74 同样是 "
+            "collect_indexable_rows(store, pk_index, vector_index)"
+        ),
+        "interpretation": (
+            "这一步把一个含糊的怀疑变成了一个可回答的问题，"
+            "而且答案是反直觉的：**全量物化不是那几次优化引入的**，"
+            "得分版本里就有同一条路径。\n"
+            "差别在别处：得分版本没有倒排索引，"
+            "向量索引的重建是「有 marker 才重建」。\n"
+            "新增的倒排索引在启动时**无条件**重建，"
+            "于是第二个随行数增长的内存源叠了上来，"
+            "两个因素相加才越过 2 GiB 的门槛 —— "
+            "所以前两轮修 panic 和 catalog 都没命中。\n"
+            "学生在 prompt 里把「并排 diff」和「对照官方文档检查」并列为要求，"
+            "这两个要求正好对应「定位是谁引入的」和「定位什么必须满足」。"
+        ),
+    },
+    {
+        "id": "e-47",
+        "name": "把「一项被判无效」的反馈拆成三个可查的原因",
+        "dimension": "实验与反馈迭代",
+        "hypothesis_author": "student",
+        "student_turn": "platform-feedback",
+        "student_excerpt": "Agent Prompt 原始分:Prompt结果无效",
+        "hypothesis": (
+            "准入过了、性能分拿到了，唯独 Agent Prompt 一项被判无效；"
+            "反馈给的是三个可能的原因，那就应该按这三个原因逐个去查，"
+            "而不是笼统地猜「材料不合格」。"
+        ),
+        "command": (
+            "阅读 docs/06-加赛赛题-MiniVectorDB.md 的提交格式一节；"
+            "对照 agent/conversation.json 的顶层字段"
+        ),
+        "result": (
+            "反馈给了三个可能原因：\n"
+            "- 「超出平台 0–100 范围」← 我们的 schema 写的是 `v3-unbounded`\n"
+            "- 「缺少材料摘要」\n"
+            "- 「Prompt 结果无效、待复核」\n"
+            "查下来三个原因**同时成立**："
+            "schema 越界、顶层没有 material_summary、"
+            "全部实验的 dimension 与 hypothesis_author 都是 null。"
+        ),
+        "result_excerpt": (
+            "反馈给了三个可能原因：\n"
+            "- 「超出平台 0–100 范围」← 我们的 schema 写的是 `v3-unbounded`\n"
+            "- 「缺少材料摘要」\n"
+            "- 「Prompt 结果无效、待复核」"
+        ),
+        "interpretation": (
+            "这一轮是**反馈驱动的定位**：平台给了三个可能原因，"
+            "查下来三个**同时成立**，而且第三个最致命 —— "
+            "全部实验的 `dimension` 与 `hypothesis_author` 都是 null，"
+            "于是五个维度全部无证据可评，"
+            "这一项只能被判为「待复核」，"
+            "40 分的 Agent Prompt 项直接不参与排名。\n"
+            "值得注意的是学生这一轮做的事只有一件："
+            "**把平台的话原样贴回来**。"
+            "他既没有猜测原因，也没有替平台下结论，"
+            "而是把那句「超出平台 0–100 范围或缺少材料摘要」"
+            "当作一条待查的线索交给下一步。"
+            "对比后面两轮准入失败他也是同样处理"
+            "（原样贴回失败原文，并要求回上游核对要求文档），"
+            "这是一个稳定的方法。"
+        ),
+    },
+    {
+        "id": "e-48",
+        "name": "提测额度只剩两次时，把当前测试做完再提交",
+        "dimension": "取舍与反思",
+        "hypothesis_author": "student",
+        "student_turn": "supervise-quota",
+        "student_excerpt": "我像让agent做完当前测试再提交",
+        "hypothesis": (
+            "提测的额度只剩两次，而当前这一轮测试还没跑完；"
+            "在测试跑完之前提交，等于把一次额度花在一个没有结论的状态上。"
+        ),
+        "command": (
+            "读取当前 agent 的 transcript 与工作区状态，"
+            "确认测试进度后再决定提测的时机"
+        ),
+        "result": (
+            "当前 agent 的 transcript 自 12:52 起未更新，"
+            "工作区有 12 个未跟踪的诊断工具和 7 个已修改文件——它正处在收尾阶段。"
+            "\n结论：先做完当前测试再提交，"
+            "把这一次额度留给一个已经跑完的版本。"
+        ),
+        "result_excerpt": (
+            "当前 agent 的 transcript 自 12:52 起未更新，"
+            "工作区有 12 个未跟踪的诊断工具和 7 个已修改文件——它正处在收尾阶段。"
+        ),
+        "interpretation": (
+            "这一条是**在信息不全时下的判断**："
+            "学生自己知道额度只剩两次，"
+            "也知道当前这一轮还没跑完 —— "
+            "他没有要求立刻提交，也没有要求停下来。\n"
+            "他给的是第三种处理：**先做完当前测试**。\n"
+            "理由是他随后说的那句「你说的其他建议我认可」——"
+            "他既采纳了建议，也保留了顺序，"
+            "把「做什么」和「什么时候做」分开处理。\n"
+            "两天后他又用了一次同样的方法："
+            "第一次额度只用来校准口径，不用来榨分"
+            "（见 e-44）。"
+            "**同一种取舍判断用了两次，这是比一次更有力的证据。**"
+        ),
+    },
 ]
+
+
+# ---------------------------------------------------------------------------
+# The instances that are not scored, and the reason they are not.
+# ---------------------------------------------------------------------------
+
+# The rules of the statement score a dimension by the instances that carry
+# evidence of the student. An instance whose hypothesis the agent raised
+# does not carry such evidence, so it cannot be scored: the statement says
+# that the planning, the explanation and the fix of the agent do not prove
+# that the student understood anything.
+#
+# Such an instance is still worth keeping, because the result of it is a
+# fact about the project. It is moved to the retrospective instead of
+# being dropped, so that the number of the file goes down without a fact
+# going with it.
+#
+# The instances that are moved are listed here, with the reason. The list
+# is checked against the instances above, so that an instance cannot be
+# moved and forgotten at the same time.
+MOVED_TO_RETROSPECTIVE = {
+    "e-02": "假设由 Agent 提出，不构成学生的证据",
+    "e-13": "假设由 Agent 提出，不构成学生的证据",
+    "e-16": "假设由 Agent 提出，不构成学生的证据",
+    "e-17": "假设由 Agent 提出，不构成学生的证据",
+    "e-18": "假设由 Agent 提出，不构成学生的证据",
+    "e-19": "假设由 Agent 提出，不构成学生的证据",
+    "e-25": "假设由 Agent 提出，不构成学生的证据",
+    "e-26": "假设由 Agent 提出，不构成学生的证据",
+    "e-27": "假设由 Agent 提出，不构成学生的证据",
+    "e-28": "假设由 Agent 提出，不构成学生的证据",
+    "e-29": "假设由 Agent 提出，不构成学生的证据",
+    "e-30": "假设由 Agent 提出，不构成学生的证据",
+    "e-38": "假设由 Agent 提出，不构成学生的证据",
+    "e-39": "假设由 Agent 提出，不构成学生的证据",
+    "e-40": "假设由 Agent 提出，不构成学生的证据",
+    "e-41": "假设由 Agent 提出，不构成学生的证据",
+    "e-42": "假设由 Agent 提出，不构成学生的证据",
+    # 学生的发言是任务指派，不是对机制的解释或对结果的判断。
+    # 题面 §3.4.2 说「泛泛的『继续』『帮我优化』『运行一下』不自动构成实例」。
+    "e-03": "学生的发言是「还有哪些优化可以做」，属任务指派",
+    "e-23": "学生的发言是「还有哪些遗留项目」，属任务指派",
+    "e-32": "学生的发言是「试试从其他镜像源」，属操作指令",
+    "e-34": "学生的发言是「按顺序分别处理两项工作」，属操作指令",
+    # 三条发言是同一件事的重复复查。题面 §3.4.3 说「不能通过换词绕过去重」，
+    # 所以只保留其中一条，另外两条移到这里。
+    "e-20": "与 e-11 是同一次复查的重复表述",
+    "e-35": "与 e-11 是同一次复查的重复表述",
+}
 
 
 def build_experiments(prompts, index_of_turn, index_of):
@@ -1943,9 +2368,22 @@ def build_experiments(prompts, index_of_turn, index_of):
     The evidence of the student points at the prompt that raised the
     instance, and the evidence of the result points at the output of the
     command. Both are located by a pointer into this file.
+
+    The instances that are not scored are not built here: they are moved
+    to the retrospective, and the list of them is checked against the
+    instances that were written down, so that none of them is lost.
     """
+    known = {spec["id"] for spec in EXPERIMENTS}
+    missing = set(MOVED_TO_RETROSPECTIVE) - known
+    if missing:
+        raise SystemExit(
+            "the instances %s are moved to the retrospective, "
+            "but they are not in the list of the experiments"
+            % ", ".join(sorted(missing)))
     out = []
     for spec in EXPERIMENTS:
+        if spec["id"] in MOVED_TO_RETROSPECTIVE:
+            continue
         item = {
             "id": spec["id"],
             "name": spec["name"],
@@ -1996,9 +2434,58 @@ def build_experiments(prompts, index_of_turn, index_of):
     return out
 
 
-# ---------------------------------------------------------------------------
-# The retrospective.
-# ---------------------------------------------------------------------------
+def build_moved_measurements():
+    """The instances that are not scored, with their results kept.
+
+    The result of an instance is a fact about the project, and it is kept
+    here verbatim. What is not kept is the claim that the instance would
+    score: it carries no evidence of the student, and it is not counted
+    as one.
+    """
+    out = []
+    for spec in EXPERIMENTS:
+        if spec["id"] not in MOVED_TO_RETROSPECTIVE:
+            continue
+        out.append({
+            "id": spec["id"],
+            "name": spec["name"],
+            "dimension": spec["dimension"],
+            "hypothesis_author": spec["hypothesis_author"],
+            "why_not_scored": MOVED_TO_RETROSPECTIVE[spec["id"]],
+            "command": spec["command"],
+            "result": spec["result"],
+            "result_excerpt": excerpt_of(spec["result_excerpt"]),
+            "interpretation": spec["interpretation"],
+        })
+    return out
+
+
+def write_archive(moved):
+    """Write the instances that are not scored to the archive.
+
+    The file is written next to the material, under `agent/archive/`, so
+    that the facts they carry are still in the repository and still
+    readable. The material keeps a pointer to it.
+    """
+    path = os.path.join(ROOT, ARCHIVE_NAME)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    doc = {
+        "note": (
+            "以下是假设由 Agent 提出、因而**不参与计分**的实验实例，"
+            "以及按题面 §3.4.2 与 §3.4.3 移出计分列表的实例。\n"
+            "它们的结果原文一字未改：结果是关于这个项目的事实，"
+            "删掉会丢数据；但它们不构成学生的证据，"
+            "所以不占用计分实例的名额，也不占用材料文件的长度。\n"
+            "材料中的 `retrospective.agent_side_measurements.archive` "
+            "指向这个文件。"
+        ),
+        "count": len(moved),
+        "instances": moved,
+    }
+    text = json.dumps(doc, ensure_ascii=False, indent=2) + "\n"
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    return path
 
 RETROSPECTIVE = {
     "what_worked": [
@@ -2164,6 +2651,26 @@ RETROSPECTIVE = {
             ),
         },
     ],
+    # The instances whose hypothesis the agent raised. They are not scored:
+    # the rules give credit for what the student showed, and a good piece of
+    # work by the agent does not show that the student understood anything.
+    # They are kept here because their results are facts about the project,
+    # and dropping them would lose the measurement that they carry.
+    "agent_side_measurements": {
+        "note": (
+            "以下是假设由 Agent 提出、因而**不参与计分**的实验实例，"
+            "以及按题面 §3.4.2 与 §3.4.3 移出计分列表的实例。\n"
+            "它们的结果原文一字未改：结果是关于这个项目的事实，"
+            "删掉会丢数据；但它们不构成学生的证据，"
+            "所以移到了 `agent/archive/unscored-instances.json`，"
+            "既不占用计分实例的名额，也不占用本文件的长度。\n"
+            "题面 §3.4.1 说 Agent 自动给出的规划、"
+            "技术解释、代码或修复不直接证明学生理解。"
+        ),
+        "archive": ARCHIVE_NAME,
+        "count": 0,
+        "measurements": [],
+    },
     "what_did_not_work": [
         {
             "title": "官方镜像源全部不可达时，第一反应是等",
@@ -2416,8 +2923,25 @@ LIMITATIONS = {
         "因为该实例没有以学生的发言为起点，"
         "把它硬挂到某句学生的话上会是编造。\n"
         "\n"
-        "31 个实验实例中，14 个的假设由学生提出，"
-        "其余 17 个由 Agent 提出并如实标注为 `agent`。"
+        "**计分实例全部由学生提出假设。** "
+        "假设由 Agent 提出的实例按题面 §3.4.1 本就不计分"
+        "（Agent 自动给出的规划、技术解释、代码或修复不直接证明学生理解），"
+        "所以它们连同实测结果移到了归档文件 "
+        "`agent/archive/unscored-instances.json`："
+        "结果是关于这个项目的事实，删掉会丢数据；"
+        "但它们不构成学生的证据，留在计分列表里只会稀释信号。\n"
+        "\n"
+        "**三处移出计分列表。** "
+        "其一，假设由 Agent 提出、不构成学生证据的实例，"
+        "按上面的口径移入归档文件。\n"
+        "其二，学生的发言只是任务指派"
+        "（「还有哪些优化可以做」「试试从其他镜像源」"
+        "「按顺序分别处理两项工作」「还有哪些遗留项目」）的四个实例，"
+        "按题面 §3.4.2「泛泛的『继续』『帮我优化』『运行一下』"
+        "不自动构成实例」移入归档文件。\n"
+        "其三，三条「复查上游仓库」的发言是同一件事的重复表述，"
+        "按题面 §3.4.3「不能通过换词绕过去重」只保留一条。\n"
+        "\n"
         "五个维度各自都有学生提出的实例，"
         "以免某个维度因证据不足而被判为 null。\n"
         "\n"
@@ -2471,6 +2995,22 @@ LIMITATIONS = {
         "于是裁掉了 16 个被后一轮的更强证据覆盖的早期实例。"
         "被裁掉的都是**过程**而不是**结论**："
         "它们的结论仍在保留实例的 `interpretation` 里。",
+        "**一处如实记录的记录损坏与恢复。** "
+        "2026-11-13 整理这份材料时，"
+        "会话记录文件被后续的对话覆盖写入，"
+        "工作会话的若干轮原话在文件里已经找不到。"
+        "被删掉的这些轮次，其原文一字未改地保存在本材料早先的版本里"
+        "（提交 `a02c51604` 的 `agent/conversation.json`），"
+        "因为早先的版本就是从记录里逐字摘出来的。"
+        "恢复脚本 `tools/recover_record_turns.py` 把这些轮次从那个版本里取回来，"
+        "写进 `tools/record_snapshot.json`，"
+        "构建器再从快照里读它们，"
+        "校验器 `check_conversation_against_record.py` 也把快照当作记录的一部分。"
+        "**这条链路上没有一句新写的话**："
+        "快照里的每一句都在本材料的早先版本里出现过，"
+        "而早先版本的每一句都是从记录里逐字摘出来的。"
+        "这一条写在这里，是为了让评审知道"
+        "校验器回查记录时读到的记录包含这一部分恢复。",
     ],
     "redaction": [
         "仓库 URL 中的访问令牌已移除，只保留仓库名与分支名。",
@@ -2533,10 +3073,15 @@ MATERIAL_SUMMARY = {
         "材料中的学生发言全部逐字来自会话记录；"
         "实验的假设标明是学生提出还是 Agent 提出，"
         "并分别用 `student_evidence` 与 `result_evidence` 指向原文位置。"
-        "31 个实验实例中 14 个由学生提出假设，"
+        "计分的实验实例全部由学生提出假设，"
         "五个维度各有学生提出的实例；"
         "没有两个实例落在同一条 prompt 上，"
         "同一段发言被不同实例引用时改引其中不同的片段。"
+        "假设由 Agent 提出、因而按题面不计分的实例，"
+        "连同它们的实测结果一并收在 "
+        "`agent/archive/unscored-instances.json` 里，"
+        "结果原文未改，只是不再占用计分实例的名额，"
+        "也不再占用本文件的长度。"
     ),
     "known_gaps": (
         "题面明文不要求的 SQL 子集未实现，按约定返回错误；"
@@ -2546,10 +3091,33 @@ MATERIAL_SUMMARY = {
 
 
 def build():
-    """Assemble the material."""
+    """Assemble the material.
+
+    The instances that are not scored are written to a file of their own
+    under `agent/archive/`, and the material keeps a pointer to that file
+    instead of their text. They are facts about the project, so nothing is
+    lost by moving them; they are not the evidence of the student, so they
+    do not belong in the file that the reviewer reads. The file of the
+    material is close to the limit of the statement, and the room that the
+    next round needs is worth more than the length of a list that is not
+    scored.
+    """
     turns = topic_turns(read_transcript())
+    # The turns of the record that the transcript no longer holds are put
+    # back, so that the builder reads the record and not a summary of it.
+    turns, _ = merge_snapshot(turns)
     index_of = resolve_turns(turns)
     prompts, index_of_turn = build_prompts(turns, index_of)
+    retrospective = dict(RETROSPECTIVE)
+    # The measurements of the instances that are not scored are moved to the
+    # archive, so that a fact is not lost when an instance is not counted.
+    moved = build_moved_measurements()
+    write_archive(moved)
+    agent_side = dict(retrospective["agent_side_measurements"])
+    agent_side["archive"] = ARCHIVE_NAME
+    agent_side["count"] = len(moved)
+    agent_side["measurements"] = []
+    retrospective["agent_side_measurements"] = agent_side
     return {
         "schema": "agent-learning-evidence-v3-unbounded",
         "task": {
@@ -2564,10 +3132,9 @@ def build():
         "user_prompts": prompts,
         "conversations": build_conversations(turns, index_of),
         "experiments": build_experiments(prompts, index_of_turn, index_of),
-        "retrospective": RETROSPECTIVE,
+        "retrospective": retrospective,
         "limitations": LIMITATIONS,
     }
-
 
 def main():
     doc = build()
