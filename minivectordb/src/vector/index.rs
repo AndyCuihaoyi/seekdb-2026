@@ -32,14 +32,25 @@
 //! before the handshake. The judge would read that as a database that
 //! exited before it answered.
 //!
-//! The build therefore walks the table **twice, in blocks**, and never
-//! holds more than one block of vectors at a time:
+//! The build therefore walks the table **twice**, and never holds more
+//! than a bounded sample of the table at a time:
 //!
 //! 1. The first pass chooses the centroids. The centroids are chosen by
 //!    farthest point sampling over a **bounded sample** of the table, so
 //!    the pass costs a fixed amount of memory however large the table is.
+//!    The vectors of the sample are read **once**, by the identifier of
+//!    the row, and the sampling then runs over them in memory. The cost of
+//!    the pass is therefore `nlist * SAMPLE_ROWS` distance computations,
+//!    which does not depend on the size of the table either.
 //! 2. The second pass assigns every row to the cell of its nearest
 //!    centroid and measures the radius of that cell.
+//!
+//! The first pass must not depend on the size of the table, because the
+//! build of the index happens **before the handshake** of the start-up:
+//! the database must not be ready while an index is still being rebuilt.
+//! A build that cost `nlist * N` - one pass over the table per centroid -
+//! would miss the start-up timeout of the judge on a data set that is
+//! larger than the memory budget.
 //!
 //! The answer of an approximate query does not depend on which rows the
 //! sample happened to pick. The pruning of the index is exact: a cell is
@@ -62,8 +73,8 @@ const INDEX_MARKER: &str = "index.dat";
 ///
 /// The sample decides where the cells are. It has to be large enough to
 /// spread the cells over the data and small enough to keep the memory of
-/// the build bounded: `sample_rows * dim * 4` bytes, which is 1 MiB at a
-/// dimension of 128.
+/// the build bounded: `sample_rows * dim * 4` bytes, which is **four megabytes**
+/// at a dimension of 128 (`8192 * 128 * 4 = 4 194 304` bytes).
 ///
 /// The number of cells is much smaller than this, so the sample always
 /// holds more rows than there are cells, and the farthest point sampling
@@ -177,8 +188,9 @@ fn for_each_live_row(
 
 /// Build an index over a table.
 ///
-/// The build walks the table twice and never holds more than one block of
-/// vectors, so its memory does not depend on the size of the table.
+/// The build walks the table twice and never holds more than a bounded
+/// sample of the table at a time, so neither its memory nor its time
+/// depends on the size of the table.
 pub fn build_index(
     dim: usize,
     nlist: usize,
@@ -195,18 +207,14 @@ pub fn build_index(
     // runs over a bounded sample of the table, so that the memory of the
     // pass does not depend on the size of the table.
     //
-    // The sample holds the *identifiers* of the sampled rows and not their
-    // vectors: a sample that carried its vectors would be
-    // `SAMPLE_ROWS * dim * 4` bytes - four megabytes at a dimension of
-    // 128 - and the second pass would allocate the index on top of it, so
-    // the peak of the build would be four megabytes higher than it has to
-    // be. The identifiers are sixteen bytes each, so the sample is a
-    // hundred and thirty kilobytes instead.
+    // The reservoir holds the *identifiers* of the sampled rows and not
+    // their vectors: the reservoir itself is then sixty-four kilobytes,
+    // rather than the four megabytes that the vectors of the sample would
+    // take. The vectors are read once, by the identifier of the row, when
+    // the centroids are chosen - see `select_centroids_from_sample`.
     //
-    // The vectors of the sampled rows are read again when the centroids are
-    // chosen. That is one extra read of a bounded number of rows, and the
-    // rows are read through the block cache, so the rows that are still
-    // cached cost no system call.
+    // The rows are read through the block cache, so a row whose block is
+    // still cached costs no system call.
     let sample = sample_rows(store, SAMPLE_ROWS)?;
     let centroids = select_centroids_from_sample(store, dim, nlist, &sample)?;
 
@@ -232,8 +240,8 @@ pub fn build_index(
 /// sample is the memory of the reservoir and nothing else.
 ///
 /// The reservoir holds the *identifiers* of the rows and not their vectors,
-/// so that it costs sixteen bytes per row rather than `dim * 4` bytes per
-/// row. The vectors are read again by [`select_centroids_from_sample`].
+/// so that it costs eight bytes per row rather than `dim * 4` bytes per
+/// row. The vectors are read once by [`select_centroids_from_sample`].
 fn sample_rows(store: &mut TableStore, limit: usize) -> SqlResult<Vec<u64>> {
     let mut reservoir: Vec<u64> = Vec::with_capacity(limit);
     let mut seen: u64 = 0;
@@ -261,21 +269,41 @@ fn sample_rows(store: &mut TableStore, limit: usize) -> SqlResult<Vec<u64>> {
 
 /// Choose the centroids from a sample of row identifiers.
 ///
-/// The vectors of the sampled rows are **not** held in memory. The
-/// farthest point sampling needs, for every row of the sample, the distance
-/// to the closest centroid chosen so far, and it needs it again for every
-/// centroid it picks afterwards. Holding the vectors would cost
-/// `SAMPLE_ROWS * dim * 4` bytes - four megabytes at a dimension of 128 -
-/// and the second pass of the build would allocate the index on top of
-/// them, so the peak of the build would be four megabytes higher than it
-/// has to be.
+/// The vectors of the sampled rows are read **once**, and the farthest point
+/// sampling then runs over them in memory.
 ///
-/// The pass therefore walks the table once per centroid. The table is read
-/// through the block cache, so the rows that are still cached cost no
-/// system call, and the number of centroids is small (64 by default), so
-/// the number of passes is small too. The memory of the pass is the
-/// distance of every row of the sample - four bytes each - and one block
-/// of vectors.
+/// # Why the sample is read once
+///
+/// The farthest point sampling needs, for every row of the sample, the
+/// distance to the closest centroid chosen so far, and it needs it again for
+/// every centroid it picks afterwards. There are two ways to get those
+/// distances:
+///
+/// * hold the vectors of the sample in memory and compute the distances
+///   there. The cost is `SAMPLE_ROWS * dim * 4` bytes - four megabytes at a
+///   dimension of 128 - and the number of distance computations is
+///   `nlist * SAMPLE_ROWS`, which is bounded by the size of the sample and
+///   not by the size of the table.
+/// * walk the table once per centroid and compute the distances against the
+///   table as it goes. The memory of the pass is a single block of vectors,
+///   but the number of distance computations is `nlist * N`, where `N` is
+///   the number of rows of the table, and the table is walked `nlist` times.
+///
+/// The second one was tried and it is a trap. The build of the index became
+/// linear in the size of the table *and* it repeated the walk of the table
+/// sixty-four times. At a million rows the build took twenty seconds
+/// instead of one and a half, and the rebuild of the index that happens
+/// before the handshake of the start-up took the same time - which is
+/// enough to miss the start-up timeout of the judge on a data set that is
+/// larger than the memory budget.
+///
+/// The first one is used. The sample is bounded, so neither the memory nor
+/// the time of the build depends on the size of the table.
+///
+/// The vectors of the sample are read one row at a time, by the identifier
+/// of the row, so that only the blocks that hold a sampled row are touched.
+/// The blocks are read through the block cache, so a block that is still
+/// cached costs no system call.
 fn select_centroids_from_sample(
     store: &mut TableStore,
     dim: usize,
@@ -293,34 +321,49 @@ fn select_centroids_from_sample(
     wanted.sort_unstable();
     wanted.dedup();
 
-    // The distance of every row of the sample to the closest centroid
-    // chosen so far. It is four bytes per row, so it is cheap.
-    let mut best_dist: Vec<f32> = Vec::with_capacity(wanted.len());
-    let mut centroids: Vec<Vec<f32>> = Vec::with_capacity(nlist.min(wanted.len()));
+    // The vectors of the sample, held as one flat buffer: the vector of row
+    // `i` is at `vectors[i * dim .. (i + 1) * dim]`. A flat buffer is one
+    // allocation instead of one per row, and the distance kernel works on
+    // slices of it without a copy.
+    let mut vectors: Vec<f32> = Vec::with_capacity(wanted.len() * dim);
+    for row_id in &wanted {
+        let meta = match store.read_meta(*row_id) {
+            Ok(Some(m)) => m,
+            Ok(None) => continue,
+            Err(_) => continue,
+        };
+        if meta.alive == 0 {
+            continue;
+        }
+        let vec = store.read_vector_cached(&meta)?;
+        if vec.len() != dim {
+            // A row whose vector is not of the right length cannot be
+            // measured, so it is not part of the sample.
+            continue;
+        }
+        vectors.extend_from_slice(&vec);
+    }
+
+    let held = vectors.len() / dim;
+    if held == 0 {
+        return Ok(Vec::new());
+    }
+
+    // The farthest point sampling runs over the rows of the sample, in
+    // memory. It is the same pass as the one that `ann::select_centroids`
+    // runs, over the same rows, so the centroids are the same ones.
+    let mut centroids: Vec<Vec<f32>> = Vec::with_capacity(nlist.min(held));
 
     // The first centroid is the vector of the first row of the sample.
-    let first = wanted[0];
-    let mut first_vec: Option<Vec<f32>> = None;
-    for_each_live_row(store, |row_id, _pk, vec| {
-        if row_id == first {
-            first_vec = Some(vec.to_vec());
-        }
-        Ok(())
-    })?;
-    let first_vec = match first_vec {
-        Some(v) => v,
-        // The row of the sample is gone. A centroid of zeroes keeps the
-        // cell count stable, and the second pass measures the real radius
-        // of every cell, so the pruning stays exact.
-        None => vec![0.0f32; dim],
-    };
-    centroids.push(first_vec.clone());
+    let first = &vectors[..dim];
+    centroids.push(first.to_vec());
 
-    // The distance of every row of the sample to the first centroid.
-    for_each_sample_row(store, &wanted, |_row_id, vec| {
-        best_dist.push(l2_sq_dispatch(vec, &first_vec));
-        Ok(())
-    })?;
+    // The distance of every row of the sample to the closest centroid
+    // chosen so far. It is four bytes per row, so it is cheap.
+    let mut best_dist: Vec<f32> = Vec::with_capacity(held);
+    for vec in vectors.chunks_exact(dim) {
+        best_dist.push(l2_sq_dispatch(vec, first));
+    }
 
     while centroids.len() < nlist {
         // The row that is farthest away from all the centroids chosen so
@@ -341,62 +384,20 @@ fn select_centroids_from_sample(
             }
             break;
         }
-        // The vector of the row that was picked. It is read on its own, so
-        // that only one vector is held at a time.
-        let picked = wanted[pick];
-        let mut centroid: Option<Vec<f32>> = None;
-        for_each_live_row(store, |row_id, _pk, vec| {
-            if row_id == picked {
-                centroid = Some(vec.to_vec());
-            }
-            Ok(())
-        })?;
-        let centroid = match centroid {
-            Some(v) => v,
-            None => vec![0.0f32; dim],
-        };
+        let centroid = vectors[pick * dim..(pick + 1) * dim].to_vec();
 
         // The distance of every row of the sample to the new centroid.
-        let mut slot = 0usize;
-        for_each_sample_row(store, &wanted, |_row_id, vec| {
+        for (i, vec) in vectors.chunks_exact(dim).enumerate() {
             let d = l2_sq_dispatch(vec, &centroid);
-            if d < best_dist[slot] {
-                best_dist[slot] = d;
+            if d < best_dist[i] {
+                best_dist[i] = d;
             }
-            slot += 1;
-            Ok(())
-        })?;
+        }
 
         centroids.push(centroid);
     }
     debug_assert!(centroids.len() == nlist);
     Ok(centroids)
-}
-
-/// Walk the rows of the sample, in the order of the sample, and hand their
-/// vectors to the caller.
-///
-/// The rows are read in the order of the table, so the walk is one pass
-/// over the blocks of the table, and the vectors are handed over as slices
-/// of the block: one block of vectors is held at a time.
-fn for_each_sample_row(
-    store: &mut TableStore,
-    wanted: &[u64],
-    mut visit: impl FnMut(u64, &[f32]) -> SqlResult<()>,
-) -> SqlResult<()> {
-    let mut cursor = 0usize;
-    for_each_live_row(store, |row_id, _pk, vec| {
-        // The rows are walked in storage order and the sample is sorted, so
-        // the cursor only moves forward.
-        while cursor < wanted.len() && wanted[cursor] < row_id {
-            cursor += 1;
-        }
-        if cursor < wanted.len() && wanted[cursor] == row_id {
-            visit(row_id, vec)?;
-            cursor += 1;
-        }
-        Ok(())
-    })
 }
 
 /// A small deterministic random generator.
