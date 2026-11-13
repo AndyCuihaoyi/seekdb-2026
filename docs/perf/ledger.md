@@ -970,10 +970,10 @@ the two versions are on the other side of the budget of the judge:
 
 | Binary | build of the index | handshake of the restart | budget |
 | --- | ---: | ---: | ---: |
-| `13edf5513` (before the fix) | **76.2 s** | **77.4 s** | 60 s / 120 s |
+| `13edf5513` (before the fix) | **77.1 s** | **78.3 s** | 60 s / 120 s |
 | the fix | 5.5 s | 6.9 s | 60 s / 120 s |
 
-The build of the broken version needs seventy-six seconds for one
+The build of the broken version needs seventy-seven seconds for one
 statement, and the judge gives it sixty. That is the timeout.
 
 #### 4.1.3.3 Why the local checks did not catch it
@@ -1179,7 +1179,7 @@ holds the identity of every row - so the growth of the total time is not
 an invariant, and a check on it would pass a build that walks the table
 once per centroid. What distinguishes the builds is the constant, and the
 constant is caught by the **absolute budget at a size where it matters**:
-four million rows, where the broken build needs seventy-six seconds and
+four million rows, where the broken build needs seventy-seven seconds and
 the fixed one needs five and a half.
 
 The tool also compares the cost **per row** between the two sizes, which
@@ -1187,8 +1187,19 @@ catches a build that is super-linear - a defect of its own.
 
 | Binary | build at 4 000 000 rows | handshake at 4 000 000 rows | the tool |
 | --- | ---: | ---: | --- |
-| `13edf5513` | 76.2 s | 77.4 s | **fails**, two failures |
+| `13edf5513` | 77.1 s | 78.3 s | **fails**, two failures |
 | the fix | 5.5 s | 6.9 s | passes |
+
+The two failures of the broken version are:
+
+```
+"the build of the index took 77.1 s at 4000000 rows (the large run), the budget is 30.0 s"
+"the handshake of the restart took 78.3 s at 4000000 rows (the large run), the budget is 60.0 s"
+```
+
+and the output of the fixed one ends with `"failures": []` and
+`"passed": true`. **A gate that passes both implementations is not a
+gate**, so the two runs above are part of the check of the check.
 
 ### 4.2 The write axis, and what it would take
 
