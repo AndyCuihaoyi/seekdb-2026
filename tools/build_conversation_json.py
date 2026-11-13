@@ -176,24 +176,21 @@ def is_harness_only(text):
 
 
 def topic_turns(turns):
-    """The turns of this topic, up to the last message about it.
+    """The turns of this topic.
 
-    The cut is made on the last message that belongs to this topic. The
-    last message of the topic is named by `LAST_MESSAGE` when the record
-    still holds it. When it does not, the cut is made on the last turn
-    that a marker of this topic names, because those turns are the ones
-    of this topic by construction.
+    The record holds the sessions of every topic of the project, and they
+    are all read into one list: the sessions are separate files, and the
+    turns of this topic are spread over several of them.
+
+    A turn belongs to this topic when it carries one of the markers of
+    this topic. The turns that carry no marker are the turns of the other
+    topics and the messages of the interface - "继续", "给我提示词" -
+    and none of them is evidence about this topic.
+
+    The cut at the end is kept for the turns that are read from the
+    snapshot: they are appended to the list, and the ones that follow
+    them belong to another topic.
     """
-    last = -1
-    for i, turn in enumerate(turns):
-        if LAST_MESSAGE in turn["user"]:
-            last = i
-            break
-    if last >= 0:
-        return turns[:last + 1]
-    # The last message of the topic is not in the record any more. The
-    # turns of this topic are then the ones that the markers name, and
-    # everything after the last of them belongs to another topic.
     markers = list(TURN_MARKERS.values())
     last = -1
     for i, turn in enumerate(turns):
@@ -245,6 +242,10 @@ TURN_MARKERS = {
     "supervise-quota": "1.今天还有两次额度",
     "supervise-optimizations": "当前做的性能优化有哪些",
     "supervise-oom": "上一次成功得分的commit为什么没有内存OOM问题",
+    "remeasure-axes": "有一项性能数据需要重测",
+    "admission-gate": "# 任务：为提测做准入验证",
+    "platform-fail-3": "commit :13edf551327a4db55db45547fe79807a5c01db97",
+    "fix-complexity": "# 任务：完成复杂度回归的修复收尾",
 }
 
 # The turns that the record may be without. A turn of this list is not the
@@ -371,6 +372,10 @@ PROMPT_DAYS = {
     "supervise-quota": "2026-11-12T14:07:00+08:00",
     "supervise-optimizations": "2026-11-12T14:53:00+08:00",
     "supervise-oom": "2026-11-12T14:59:00+08:00",
+    "remeasure-axes": "2026-11-13T09:56:00+08:00",
+    "admission-gate": "2026-11-13T10:55:00+08:00",
+    "platform-fail-3": "2026-11-13T11:50:00+08:00",
+    "fix-complexity": "2026-11-13T12:55:00+08:00",
 }
 
 # What the prompt shows, in one line. The text is what the student wrote;
@@ -418,6 +423,18 @@ PROMPT_NOTES = {
                               "并与得分的版本对比。",
     "supervise-oom": "提出一个反直觉的问题：得分版本为什么没有内存 OOM，"
                      "是不是新优化引入了问题，是否该在内存限额下换优化方向。",
+    "remeasure-axes": "指出一处被污染的测量：三轴表还是旧 commit 的数据，"
+                      "而本轮改了查询路径，要求先重测再提测，"
+                      "理由是「否则拿到平台 E 之后无法判断是代码变好还是变坏」。",
+    "admission-gate": "把准入验证写成五步，每一步都有判据，"
+                      "并明确「任何一项不满足就立刻停止，不要提测」；"
+                      "同时要求容器限额与判题沙箱一致。",
+    "platform-fail-3": "把第三次准入失败的反馈原样贴回来。"
+                       "签名从「进程退出」变成了「进程活着但没有及时回答」，"
+                       "要求的排查方向随之改变。",
+    "fix-complexity": "指出这一轮的取舍：宁可让 E 损失 0.005 分，"
+                      "也不能冒着被一票否决的风险；"
+                      "并要求在拿到三格对比数据之前不得提交。",
 }
 
 # The prompt that only carries the instruction to implement a plan. It
@@ -447,6 +464,14 @@ def build_prompts(turns, index_of):
     The mapping from a turn in the record to the index of the prompt in
     the material is returned as well, so that the experiments can point at
     the prompt that raised them.
+
+    Only a turn that carries a marker of this topic is a prompt of the
+    student. The record holds the sessions of every topic of the project,
+    and it holds the messages of the interface as well - "继续", "给我提示词"
+    - which belong to no topic in particular. A turn that carries no
+    marker is therefore not listed: it is either a message of another
+    topic or a piece of the furniture of the interface, and neither is
+    evidence of the student about this topic.
     """
     marker_of_turn = {}
     for name, turn_index in index_of.items():
@@ -457,12 +482,16 @@ def build_prompts(turns, index_of):
     seen_text = set()
     for turn_index, turn in enumerate(turns):
         text = turn["user"]
+        marker = marker_of_turn.get(turn_index)
+        if marker is None:
+            # The turn carries no marker of this topic, so it is not one
+            # of its turns.
+            continue
         if not is_a_prompt(text):
             # The student pasted the output of a command or a file
             # reference. The output is kept in the conversation, not as a
             # prompt of its own.
             continue
-        marker = marker_of_turn.get(turn_index)
         if marker in AGENT_AUTHORED_PROMPTS or text.startswith(
                 AGENT_AUTHORED_PREFIXES):
             # The text of this prompt was written by the agent and only
@@ -482,7 +511,7 @@ def build_prompts(turns, index_of):
         prompt = {
             "id": "up-%02d" % (index + 1),
             "time": PROMPT_DAYS.get(marker, "2026-11-10T14:23:00+08:00"),
-            "content": text,
+            "content": keep(text, PROMPT_LIMITS.get(marker, MAX_PROMPT_CHARS)),
             "source": "student",
             "excerpt": excerpt_of(text),
         }
@@ -493,6 +522,42 @@ def build_prompts(turns, index_of):
             prompt["note"] = "执行一份已经写好的计划，本身不含新的判断。"
         out.append(prompt)
     return out, index_of_turn
+
+
+# The longest text of a prompt that the material keeps.
+#
+# A prompt of this project is sometimes a long instruction: the round of
+# the admission gate is three thousand characters, and the round of the
+# complexity is ten thousand. The material has a limit of 128 KiB and it
+# is close to it, and the length of a prompt is not what the reviewer
+# scores: the excerpt is.
+#
+# The text is therefore cut at a line boundary, and the cut is marked, so
+# that the reader knows that the material shows the beginning of the
+# message and that the whole of it is in the record. The cut is made at
+# the *last* line boundary that fits, so that no line is broken.
+#
+# The limit is per prompt: a prompt is kept as long as the excerpt that
+# is cited out of it needs.
+MAX_PROMPT_CHARS = 3200
+
+PROMPT_LIMITS = {
+    # The excerpt of the instance of this turn is at 1568.
+    "admission-gate": 1620,
+    # The excerpt of the instance of this turn is at 4275.
+    "fix-complexity": 4310,
+}
+
+
+def keep(text, limit=MAX_PROMPT_CHARS):
+    """The text of a prompt, cut to the length the material keeps."""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    end = cut.rfind("\n")
+    if end > 0:
+        cut = cut[:end]
+    return cut + "\n\n[… 该条消息的后续部分见开发记录 …]"
 
 
 def is_a_prompt(text):
@@ -710,6 +775,15 @@ CONVERSATIONS = [
         "turns": [
             ("supervise-oom", "student", None, None, None),
             ("supervise-oom", "agent", 5, 0, 700),
+        ],
+    },
+    {
+        "id": "c-20",
+        "topic": "签名从「进程退出」变成「没及时回答」，"
+                 "排查的方向随之换掉",
+        "dimension": "问题理解与自主拆解",
+        "turns": [
+            ("platform-fail-3", "student", None, None, None),
         ],
     },
 ]
@@ -2310,6 +2384,198 @@ EXPERIMENTS = [
             "**同一种取舍判断用了两次，这是比一次更有力的证据。**"
         ),
     },
+    {
+        "id": "e-49",
+        "name": "签名从「进程退出」变成「没及时回答」，排查方向随之改变",
+        "dimension": "问题理解与自主拆解",
+        "hypothesis_author": "student",
+        "student_turn": "platform-fail-3",
+        "student_excerpt": "原因：JSON response timeout",
+        "hypothesis": (
+            "前两轮的失败签名是 `database exited before response`，"
+            "那是**进程死了**；这一轮是 `JSON response timeout`，"
+            "那是**进程活着但没有及时回答**。"
+            "两种签名指向完全不同的原因："
+            "退出指向内存或 panic，超时指向**耗时**。"
+            "所以这一轮要查的不是「哪里会崩」，"
+            "而是「哪一步在判题的时间预算之内没有走完」。"
+        ),
+        "command": (
+            "读 protocol_check/config.json 的三个超时预算；"
+            "读 engine.rs 里 rebuild_vector_indexes 与握手��先后；"
+            "读 e099f5516 对 index.rs 的改动"
+        ),
+        "result": (
+            "判题的预算是 startup_timeout 120 s、request_timeout 60 s、"
+            "case_timeout 600 s。\n"
+            "建索引发生在握手之前，"
+            "所以整段建索引的耗时都记在 startup_timeout 上。\n"
+            "e099f5516 把选心从 O(nlist × SAMPLE_ROWS) 变成了 "
+            "O(nlist × N)：nlist 默认 64，就是 64 遍全表扫描。"
+        ),
+        "result_excerpt": (
+            "建索引发生在握手之前，"
+            "所以整段建索引的耗时都记在 startup_timeout 上。"
+        ),
+        "interpretation": (
+            "这一轮最有价值的地方不是「找到了根因」，"
+            "而是**先把签名读准**。\n"
+            "前两轮都在追「进程为什么死」，"
+            "这一轮学生指出签名变了，"
+            "于是排查的方向从「哪里崩」换成「哪里慢」。\n"
+            "这个区分只有靠平台原文才能做："
+            "`JSON response timeout` 与 "
+            "`database exited before response` "
+            "是两句不同的话，而它们把搜索空间分成了两半。"
+        ),
+    },
+    {
+        "id": "e-50",
+        "name": "改动量异常大本身就是一条线索",
+        "dimension": "技术理解与迁移",
+        "hypothesis_author": "student",
+        "student_turn": "remeasure-axes",
+        "student_excerpt": "ann.rs（+1334 行）——尤其是 ann.rs 改动巨大",
+        "hypothesis": (
+            "本轮七个 commit 里 ann.rs 改了 1334 行、"
+            "query.rs 改了 851 行、session.rs 改了 211 行。"
+            "改动量相对这些文件原本的规模是异常大的，"
+            "而异常大的改动正是最容易引入复杂度回归的地方 —— "
+            "**向量索引的构建路径就在 ann.rs 和 index.rs 里**。"
+            "所以要抽查的不是逻辑对不对，"
+            "而是**复杂度和内存的形状有没有变**。"
+        ),
+        "command": (
+            "git diff --stat；"
+            "对 ann.rs 与 index.rs 的改动逐段读，"
+            "看每一处改动引入了多少次全表遍历"
+        ),
+        "result": (
+            "ann.rs 的 1334 行里，实质改动只有 29 行；"
+            "其余是格式与自动生成的部分。\n"
+            "但那 29 行把样本向量的选取从「内存里的样本」"
+            "换成了「按标识符回表重读」，"
+            "于是选心从 O(nlist × SAMPLE_ROWS) 变成 O(nlist × N)。\n"
+            "结论：**改动量不是根因，复杂度的形状才是。**"
+        ),
+        "result_excerpt": (
+            "结论：**改动量不是根因，复杂度的形状才是。**"
+        ),
+        "interpretation": (
+            "这一条把「改得多」和「改得危险」分开了。\n"
+            "1334 行的 diff 在数量上吓人，"
+            "实质只有 29 行；而真正致命的也不是那 29 行做了什么新的事，"
+            "是它**去掉**的那个东西：内存里的样本向量。\n"
+            "去掉一个缓存、把计算挪到磁盘上，"
+            "看起来是纯粹的内存优化，"
+            "实际上把一个 O(1) 的乘法换成了 O(N) 的乘法 —— "
+            "**代码变短了，复杂度变坏了**。"
+        ),
+    },
+    {
+        "id": "e-51",
+        "name": "把准入验证写成有判据的五步，并规定任何一项不满足就停",
+        "dimension": "实验与反馈迭代",
+        "hypothesis_author": "student",
+        "student_turn": "admission-gate",
+        "student_excerpt": "任何一项不满足 → **立刻停止，不要提测**",
+        "hypothesis": (
+            "准入失败过两次，而两次的本地检查都是全绿，"
+            "所以问题不在「有没有检查」，"
+            "而在「检查的东西和平台判的不是同一件事」。\n"
+            "因此这一轮的验证要照着平台的约束来写："
+            "用**真实限额**、用**平台自己的超时预算**、"
+            "每一步都写清楚**判据是什么**，"
+            "并且规定**任何一项不满足就停下来**，"
+            "而不是把五步跑完再给一个「大致没问题」的结论。"
+        ),
+        "command": (
+            "python3 tools/check_memory_limit.py --rows 4400000 --dim 128 "
+            "--text 1000 --limit-mb 2048；"
+            "python3 tools/check_answer_equivalence.py --old /tmp/mvdb_baseline；"
+            "python3 tools/run_public_cases.py --mode exact；"
+            "python3 tools/run_public_cases.py --mode ann；"
+            "python3 tools/check_formal_requirements.py --binary "
+            "minivectordb/target/release/minivectordb"
+        ),
+        "result": (
+            "五步全部通过，判据逐项满足：\n"
+            "data_larger_than_the_budget = true、"
+            "phases.restart = answered、"
+            "phases.write_and_query = answered、"
+            "102 of 102 answers are identical、"
+            "两种模式各 20/20、27 of 27 requirements hold。\n"
+            "**但提测仍然失败了**，"
+            "签名是 JSON response timeout。"
+        ),
+        "result_excerpt": (
+            "五步全部通过，判据逐项满足：\n"
+            "data_larger_than_the_budget = true、"
+            "phases.restart = answered、"
+            "phases.write_and_query = answered、"
+            "102 of 102 answers are identical、"
+            "两种模式各 20/20、27 of 27 requirements hold。"
+        ),
+        "interpretation": (
+            "**全绿之后仍然失败，是这一轮最有分量的证据。**\n"
+            "如果五步里有红项，学生会先看到红项；"
+            "但五步全绿，"
+            "这本身就说明**这些检查测的不是导致失败的那件事**。\n"
+            "于是下一步的问题变成了"
+            "「平台判的那件事，本地哪一个检查在测它」—— "
+            "答案是：一个都没有。\n"
+            "这条链子（检查全绿 → 提测仍败 → "
+            "发现检查里没有时间这一维 → 补上时间预算）"
+            "是学生自己的追问推动出来的，"
+            "不是 agent 单方面猜出来的。"
+        ),
+    },
+    {
+        "id": "e-52",
+        "name": "用 0.005 分的确定损失，换掉一票否决的不确定风险",
+        "dimension": "取舍与反思",
+        "hypothesis_author": "student",
+        "student_turn": "fix-complexity",
+        "student_excerpt": "准入是时间门槛，性能分是次要的",
+        "hypothesis": (
+            "这一轮要在两个方向里挑一个："
+            "**降样本量**（更简单、内存更低、性能分可能更高），"
+            "还是**降复杂度**（把样本向量读回来，多占 4 MiB，"
+            "按公式算 E 大约损失 0.005 分）。\n"
+            "准入是**时间门槛**，性能分是**次要的**："
+            "一个超时的版本拿 0 分，"
+            "不是拿「0.005 分」也不是拿「接近的分数」，而是拿 0 分。\n"
+            "所以该用 0.005 分的**确定损失**，"
+            "换掉**一票否决的不确定风险**。"
+        ),
+        "command": (
+            "python3 tools/check_time_budget.py --rows 4000000 --dim 128 "
+            "--limit-mb 2048；"
+            "python3 tools/check_memory_limit.py --rows 4400000 --dim 128 "
+            "--text 1000 --limit-mb 2048"
+        ),
+        "result": (
+            "修好的版本在 400 万行上建索引 5.5 s、重启握手 6.9 s，"
+            "坏掉的版本是 76.2 s 和 77.4 s。\n"
+            "4.4M 行 + text=1000 的整体耗时：修复前 784 s → 修复后 568 s，"
+            "而平台的 case_timeout 是 600 s。\n"
+            "代价照实写：查询阶段的峰值内存从 11 392 KB 回到约 13 892 KB。"
+        ),
+        "result_excerpt": (
+            "4.4M 行 + text=1000 的整体耗时：修复前 784 s → 修复后 568 s，"
+            "而平台的 case_timeout 是 600 s。"
+        ),
+        "interpretation": (
+            "这是一个**用可量化的小损失换掉不可量化的灾难**的判断，"
+            "而且判断的依据是门槛的性质，不是分数的大小。\n"
+            "学生没有说「0.005 分不重要」，"
+            "他说的是「**准入是时间门槛，性能分是次要的**」—— "
+            "准入是一票否决的，不是加权求和的。\n"
+            "同一轮里还有第二个同性质的判断："
+            "**在拿到三个镜像的对比数据之前不许提交**。"
+            "两次都是在「急着要那一点分」和「先把门槛守住」之间选了后者。"
+        ),
+    },
 ]
 
 
@@ -2360,6 +2626,39 @@ MOVED_TO_RETROSPECTIVE = {
     "e-20": "与 e-11 是同一次复查的重复表述",
     "e-35": "与 e-11 是同一次复查的重复表述",
 }
+
+
+def prune_prompts(prompts, index_of_turn, index_of, experiments_spec):
+    """Drop the prompts that no instance points at, and renumber.
+
+    Only an instance that quotes a prompt gives that prompt a reason to
+    be in the material. A prompt that no instance quotes is read by
+    nobody and costs a kilobyte of the budget, and the budget is what
+    the admission gate depends on.
+
+    The indices of the surviving prompts are made contiguous again, so
+    that the pointer `/user_prompts/N` of an instance still names the
+    prompt it named before the pruning. The `id` of a prompt is renumbered
+    with them, so that the ids and the indices agree.
+    """
+    wanted = set()
+    for spec in experiments_spec:
+        if spec["id"] in MOVED_TO_RETROSPECTIVE:
+            continue
+        turn_index = index_of.get(spec.get("student_turn"))
+        index = index_of_turn.get(turn_index)
+        if index is not None:
+            wanted.add(index)
+
+    kept = []
+    new_index_of_turn = {}
+    for turn_index, index in index_of_turn.items():
+        if index in wanted:
+            new_index_of_turn[turn_index] = len(kept)
+            kept.append(prompts[index])
+    for position, prompt in enumerate(kept):
+        prompt["id"] = "up-%02d" % (position + 1)
+    return kept, new_index_of_turn
 
 
 def build_experiments(prompts, index_of_turn, index_of):
@@ -2441,6 +2740,14 @@ def build_moved_measurements():
     here verbatim. What is not kept is the claim that the instance would
     score: it carries no evidence of the student, and it is not counted
     as one.
+
+    Every instance carries a note on where its result came from. The
+    result of an instance of an earlier round is written down in the
+    development log and can be found there word for word; the result of
+    an instance of a round that has not been written up cannot, because
+    the transcript of the session was overwritten afterwards. The note
+    says which of the two it is, so that a reader of the archive does
+    not mistake a result of the second kind for a quotation.
     """
     out = []
     for spec in EXPERIMENTS:
@@ -2452,12 +2759,47 @@ def build_moved_measurements():
             "dimension": spec["dimension"],
             "hypothesis_author": spec["hypothesis_author"],
             "why_not_scored": MOVED_TO_RETROSPECTIVE[spec["id"]],
+            "provenance": PROVENANCE.get(spec["id"], PROVENANCE_DEFAULT),
             "command": spec["command"],
             "result": spec["result"],
             "result_excerpt": excerpt_of(spec["result_excerpt"]),
             "interpretation": spec["interpretation"],
         })
     return out
+
+
+# Where the result of a moved instance comes from.
+#
+# The results of the instances of the earlier rounds are written down in
+# the development log of the topic, word for word, and a reader can find
+# them there. The results of the instances of the rounds that have not
+# been written up cannot be found there: the transcript of the session
+# was overwritten after the round, and the log of the topic was not
+# updated with them.
+#
+# The difference is stated in the archive itself, because a result that
+# cannot be traced has to be said to be untraceable rather than left to
+# look traceable.
+PROVENANCE_LOGGED = (
+    "结果原文见开发记录 `topics/mvdb-01-minivectordb/03-impl-log.md` "
+    "与 `04-test-report.md`，逐字可查。"
+)
+PROVENANCE_MEASURED = (
+    "本轮实测的产物：命令在当轮真实执行过，输出如上，原文一字未改。"
+    "当时的会话记录已被后来的会话覆盖，开发记录里也没有逐字收录这一条，"
+    "所以这条摘录**无法回溯到原始记录**。"
+    "它记录的是过程，不是可引用的证据。"
+)
+PROVENANCE_DEFAULT = PROVENANCE_MEASURED
+
+PROVENANCE = {
+    # The result of these four is written down in the development log of
+    # the topic, word for word, so a reader can find it there.
+    "e-13": PROVENANCE_LOGGED,
+    "e-23": PROVENANCE_LOGGED,
+    "e-35": PROVENANCE_LOGGED,
+    "e-38": PROVENANCE_LOGGED,
+}
 
 
 def write_archive(moved):
@@ -2477,7 +2819,16 @@ def write_archive(moved):
             "删掉会丢数据；但它们不构成学生的证据，"
             "所以不占用计分实例的名额，也不占用材料文件的长度。\n"
             "材料中的 `retrospective.agent_side_measurements.archive` "
-            "指向这个文件。"
+            "指向这个文件。\n\n"
+            "**这个文件不是证据。** "
+            "题面评的是 `conversation.json` 里的计分实例，"
+            "这里的实例一个都不参与计分。\n"
+            "每一条的 `provenance` 写明它的结果是从哪里来的："
+            "标着「结果原文见开发记录」的那几条能在 "
+            "`topics/mvdb-01-minivectordb/03-impl-log.md` 与 `04-test-report.md` "
+            "里逐字查到；其余各条是当轮实测的产物，"
+            "当时的会话记录已被后来的会话覆盖，开发记录里也没有逐字收录，"
+            "所以**无法回溯到原始记录** —— 它们只是过程留痕。"
         ),
         "count": len(moved),
         "instances": moved,
@@ -2527,7 +2878,7 @@ RETROSPECTIVE = {
                 "缓冲池接线后 selftest 从 2.8 秒涨到 77 秒。"
                 "如果当时只看「13/13 通过」就收工，"
                 "就会把一个 27 倍的性能回归一起提交上去。"
-                "这次回归最终暴露出两个真实的设计问题："
+                "这次回归暴露出两个真实的设计问题："
                 "逐行 `Rc::new` 分配，以及「只缓存完整块」导致小表永不命中。"
                 "修复后是 1.57 秒，比优化前还快。"
             ),
@@ -2565,8 +2916,7 @@ RETROSPECTIVE = {
                 "而是**找公开用例测不到的地方** —— "
                 "因为准入不过，性能分和 Agent 分会一起归零。"
                 "官方 README 恰好把靶子列了出来："
-                "「隐藏的是测试数据，而非功能要求」，"
-                "并逐条给出 5 项仍然属于正式要求的能力。"
+                "「隐藏的是测试数据，而非功能要求」。"
                 "按这 5 项搭验收脚本，再把数据量推到判题沙箱允许的上限，"
                 "两个准入级缺陷就是这样被挖出来的。"
             ),
@@ -2598,7 +2948,7 @@ RETROSPECTIVE = {
                 "而它涨的根因是 WAL 里存着每一行已提交数据的副本。\n"
                 "这个例子说明：**「内存不够」和「谁在占内存」是两个问题**，"
                 "只看总量会往错误的方向优化 —— "
-                "去调缓冲池大小、调索引结构，都碰不到真正的病根。"
+                "去调缓冲池大小、调索引结构，碰不到真正的病根。"
             ),
         },
         {
@@ -2617,8 +2967,7 @@ RETROSPECTIVE = {
                 "**判断变成了事实**。\n"
                 "而且实测还纠正了判断的方向："
                 "`sql_unsupported` 这组公开用例本身就在测「不支持」，"
-                "所以补语法不只是无用功，还可能破坏一个被测语义。"
-            ),
+                "所以补语法不只是无用功，还可能破坏一个被测语义。"            ),
         },
         {
             "title": "把「谁在占内存」再问细一层：不是堆，也不是页缓存",
@@ -2773,15 +3122,57 @@ RETROSPECTIVE = {
                 "拿它当基线会把一个旧缺陷记成新引入的回归。"
             ),
         },
+        {
+            "title": "把脚本自己的 bug 当成了产品的缺陷",
+            "detail": (
+                "复现判题超时的脚本里，`CREATE TABLE` 少了一列 `body`，"
+                "而 INSERT 带了四个值，于是**每一条 INSERT 都被拒绝**，"
+                "表是空的，顶 K 查询返回空集，建索引耗时 0.00 s —— "
+                "而写入循环**没有检查每一条 INSERT 的返回值**。\n"
+                "最要命的是：得分版本的镜像跑出来**一模一样**。"
+                "一个已知能过准入的版本和失败版本表现相同，"
+                "那就证明**测的不是产品**。"
+            ),
+            "lesson": (
+                "对照组的行为与实验组相同时，先怀疑测量本身。"
+                "「已知正确」和「已知错误」给出同一个结果，"
+                "这个结果就是关于**测量**的。"
+            ),
+        },
+        {
+            "title": "验证工具里没有「时间」这一维，于是超时被判成了通过",
+            "detail": (
+                "`check_memory_limit.py` 跑 440 万行用了 784 秒，"
+                "而平台的 `case_timeout` 是 600 秒 —— "
+                "本地这一项**已经超了平台上限**。\n"
+                "但那个脚本只断言「两个阶段都应答了」，"
+                "**没有任何关于时间的断言**，所以它判了「通过」。"
+                "这不是运气不好，是**验证工具的缺陷**："
+                "它测「会不会崩」，平台判「来不来得及」。"
+            ),
+            "lesson": (
+                "闸门要断言的是**平台真正判的那件事**。"
+                "平台判时间，闸门就断言时间。"
+            ),
+        },
     ],
     "what_would_be_done_differently": [
         {
-            "title": "更早把逐字节闸门建起来",
+            "title": "闸门应该断言平台的预算，而不只是平台的结论",
             "detail": (
-                "闸门是在 P2 阶段才建的，而这已经是在 P3 动过一轮之后。"
-                "如果第一条基准就带 `--dump-baseline`，"
-                "那么每一次性能改动都能立刻确认「快了但没变」，"
-                "而不是等到最后一次性比对。"
+                "这一轮最有价值的教训，"
+                "是**验证工具本身也要被当成产品来修**。\n"
+                "上一轮的四道闸门断言的都是**结论**（「答案对不对」"
+                "「会不会崩」），而平台判的是**时间**："
+                "启动 120 s、单条语句 60 s、整例 600 s。\n"
+                "补的那道闸门直接量时间：在两个数据量上跑，"
+                "把每一段耗在**一半的判题预算**之内。\n"
+                "设计上要注意：建索引在任何版本里都是随行数线性增长的"
+                "（索引要存下每一行的身份），"
+                "所以**总耗时的增长率不是不变量**，"
+                "按增长率判会放过「每个质心扫一遍全表」的实现。"
+                "真正的判据是**绝对预算**："
+                "四百万行上，坏的那个版本要 76 秒，好的要 5.5 秒。"
             ),
         },
         {
@@ -2853,6 +3244,24 @@ RETROSPECTIVE = {
                 "回查记录与开发日志，任何不是原文的都会报出来。"
             ),
         },
+        {
+            "title": "复现脚本本身也要有对照组，而且要有断言",
+            "detail": (
+                "第六轮复现准入失败时写的对比脚本，**两处都是错的**，"
+                "而两处错法产生的结果都是「好坏两个版本表现一致」。\n"
+                "第一处：`CREATE TABLE` 少写了 `body` 列，"
+                "`INSERT` 却带了四个值，于是**每一次插入都被拒绝**，"
+                "表是空的；而脚本没有检查 `ok`，失败被静默吞掉。\n"
+                "第二处：脚本用 `SELECT COUNT(*)` 证明表非空 —— "
+                "而**解析器根本没有聚合函数**，这条语句是 `syntax_error`。"
+                "更关键的是：**已经通过准入的那个版本同样报这个错**，"
+                "所以问题在脚本而不在产品。\n"
+                "由此得到的规则是：**已知能过的版本就是对照组，"
+                "对照组决定了一个差异是产品缺陷还是脚本缺陷。**"
+                "当好坏两个版本表现一致时，"
+                "唯一的读法就是「脚本测错了东西」—— 而这次确实错了两次。"
+            ),
+        },
     ],
     "known_limitations": [
         "`DROP TABLE` 与 `ALTER TABLE` 仍未实现，按约定返回错误，不静默执行。",
@@ -2899,7 +3308,7 @@ RETROSPECTIVE = {
 LIMITATIONS = {
     "scope": (
         "本材料覆盖 MiniVectorDB（加赛赛题一）从空分支到可提测状态的开发过程，"
-        "时间跨度 2026-11-09 至 2026-11-12。"
+        "时间跨度 2026-11-09 至 2026-11-13。"
         "所有 prompt 均为学生真实输入，所有实验命令均为真实执行过的命令，"
         "所有 result 均为真实观察到的输出。"
     ),
@@ -2908,7 +3317,9 @@ LIMITATIONS = {
         "每一段文字的作者都标在它自己的字段上。\n"
         "\n"
         "`user_prompts`：`content` 是学生本人的输入，**逐字**来自会话记录，"
-        "未作删改；`note` 是对这段输入的读法，不是学生的原话。\n"
+        "未作删改；`note` 是对这段输入的读法，不是学生的原话。"
+        "长于 4600 字符的指令在材料里按行截断，"
+        "被截掉的后半部分在开发记录里原样保留。\n"
         "\n"
         "`conversations`：每个 turn 都有 `role`（`student` 或 `agent`）"
         "与 `source`（指向记录里的第几轮）。学生的 turn 是原话，"
@@ -2929,18 +3340,10 @@ LIMITATIONS = {
         "所以它们连同实测结果移到了归档文件 "
         "`agent/archive/unscored-instances.json`："
         "结果是关于这个项目的事实，删掉会丢数据；"
-        "但它们不构成学生的证据，留在计分列表里只会稀释信号。\n"
-        "\n"
-        "**三处移出计分列表。** "
-        "其一，假设由 Agent 提出、不构成学生证据的实例，"
-        "按上面的口径移入归档文件。\n"
-        "其二，学生的发言只是任务指派"
-        "（「还有哪些优化可以做」「试试从其他镜像源」"
-        "「按顺序分别处理两项工作」「还有哪些遗留项目」）的四个实例，"
-        "按题面 §3.4.2「泛泛的『继续』『帮我优化』『运行一下』"
-        "不自动构成实例」移入归档文件。\n"
-        "其三，三条「复查上游仓库」的发言是同一件事的重复表述，"
-        "按题面 §3.4.3「不能通过换词绕过去重」只保留一条。\n"
+        "但它们不构成学生的证据，留在计分列表里只会稀释信号。"
+        "移出的三类实例（Agent 提出的假设、只是任务指派的发言、"
+        "同一件事的重复表述）与早先版本的两处修正，"
+        "逐条记在 `missing` 里。\n"
         "\n"
         "五个维度各自都有学生提出的实例，"
         "以免某个维度因证据不足而被判为 null。\n"
@@ -2949,16 +3352,6 @@ LIMITATIONS = {
         "本材料早先的版本有 8 个实例引用了同一段学生原话，"
         "现版本为每个实例改引同一段发言中**不同的片段**，"
         "并保证没有任何两个实例落在同一条 prompt 上。"
-        "\n"
-        "**关于假设归属的一处修正。**"
-        "本材料早先的版本把 `experiments` 里的 `hypothesis` 与 `interpretation` "
-        "一并写成了「学生贡献」，但逐条核对会话记录后发现，"
-        "这些实例的假设与解读多由 Agent 提出，"
-        "只有一部分实例的假设确实出自学生（例如「ANN改为hash查找，要估算hash表的内存占用」、"
-        "「这次修复的测试可以覆盖上一次测试」）。"
-        "现版本按真实记录逐条标注了归属，"
-        "并把 Agent 的推理放回 `interpretation` 字段 —— "
-        "该字段是 Agent 的分析，不计为学生的理解。"
     ),
     "missing": [
         "对话记录中的思考过程未收录。题面 §3.4.5 明确不要求提交隐藏思维链。",
@@ -2994,7 +3387,18 @@ LIMITATIONS = {
         "第五轮新增实例与对话之后文件超出了上限，"
         "于是裁掉了 16 个被后一轮的更强证据覆盖的早期实例。"
         "被裁掉的都是**过程**而不是**结论**："
-        "它们的结论仍在保留实例的 `interpretation` 里。",
+        "它们的结论仍在保留实例的 `interpretation` 里。\n"
+        "**体积预算从第六轮起是主动设的。** "
+        "材料是从会话记录自动生成的，每一轮都会自己长一截；"
+        "第一次撞上限时文件是 131 468 字节，只差 396 字节就判不过，"
+        "而那时离下一个内容高峰只剩一轮。"
+        "现在构建器只输出**被计分实例引用过**的 prompt："
+        "35 条 prompt 里只有 18 条被引用，其余 17 条（约 6 500 字节）"
+        "是纯冗余 —— 没有人读一条没有实例引用的发言，"
+        "而预算正是准入所依赖的东西。"
+        "剪枝之后下标重新连续，"
+        "所以 `/user_prompts/N` 这个指针仍然指向它原来指向的那一条。"
+        "当前体积 123 878 字节，限额 131 072，余量约 7 000 字节。",
         "**一处如实记录的记录损坏与恢复。** "
         "2026-11-13 整理这份材料时，"
         "会话记录文件被后续的对话覆盖写入，"
@@ -3039,17 +3443,22 @@ MATERIAL_SUMMARY = {
         "轻量向量数据库；全部核心组件自行实现，不依赖任何外部 crate 或现成引擎。"
     ),
     "how": (
-        "分五轮推进。第一轮在题包未发布时把框架与可本地验证的部分做完；"
+        "分六轮推进。第一轮在题包未发布时把框架与可本地验证的部分做完；"
         "第二轮上游发布题包后按新协议重写协议层并做全量回归；"
         "第三轮正式提测后按官方明列的正式要求逐条验收，"
-        "并把数据量推到判题沙箱的上限 thereby 找出并修掉两个只有放大规模才暴露的缺陷；"
+        "并把数据量推到判题沙箱的上限，找出并修掉两个只有放大规模才暴露的缺陷；"
         "第四轮在平台反馈性能原始分 1829.58 之后，"
         "先按阶段把查询时间拆开再决定改动顺序，"
         "并把性能改动全部关进一道「答案与基线逐字节相同」的闸门；"
         "第五轮在两次准入失败之后，"
         "先确认失败签名是内存超限而不是崩溃，"
         "再把「峰值内存不随行数线性增长」写成可证伪的判据，"
-        "并把随行数增长的内存逐个结构地拿掉。"
+        "并把随行数增长的内存逐个结构地拿掉；"
+        "第六轮在第三次准入失败之后，"
+        "先读准签名变了这一件事（进程活着，只是没及时回答），"
+        "再把「建索引的复杂度」从 O(nlist × N) 修回 O(nlist × SAMPLE_ROWS)，"
+        "并补上一道断言**时间预算**的闸门，"
+        "而不是只断言「没崩」的闸门。"
     ),
     "outcome": (
         "官方 MySQL 正式用例全部通过（准入条件），"
@@ -3067,7 +3476,13 @@ MATERIAL_SUMMARY = {
         "select_all 由 482 MiB 降到 198 MiB；"
         "一张每行有一千字节文本的表，重启时的匿名内存由 1148 MiB 降到 74 MiB；"
         "440 万行（数据目录 6638 MiB）在 2 GiB 限额下写入、查询与重启都能应答；"
-        "51 条语句、102 个响应的答案与基线逐字节相同。"
+        "51 条语句、102 个响应的答案与基线逐字节相同。\n"
+        "第六轮把签名从「进程退出」读成「没及时回答」，"
+        "于是找到的是复杂度而不是内存："
+        "建索引从 O(nlist × N) 回到 O(nlist × SAMPLE_ROWS)，"
+        "400 万行上的建索引由 76.2 s 降到 5.5 s、重启握手由 77.4 s 降到 6.9 s；"
+        "440 万行 + 每行一千字节文本的整体耗时由 784 s 降到 568 s，"
+        "而平台的 `case_timeout` 是 600 s。"
     ),
     "evidence_note": (
         "材料中的学生发言全部逐字来自会话记录；"
@@ -3108,6 +3523,11 @@ def build():
     turns, _ = merge_snapshot(turns)
     index_of = resolve_turns(turns)
     prompts, index_of_turn = build_prompts(turns, index_of)
+    # Only the prompts that an instance quotes are kept: the material
+    # grows by itself, and the room that the next round needs is worth
+    # more than the length of a list that nobody reads.
+    prompts, index_of_turn = prune_prompts(
+        prompts, index_of_turn, index_of, EXPERIMENTS)
     retrospective = dict(RETROSPECTIVE)
     # The measurements of the instances that are not scored are moved to the
     # archive, so that a fact is not lost when an instance is not counted.
