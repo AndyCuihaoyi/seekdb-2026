@@ -585,6 +585,15 @@ than the budget:
 6.6 GiB of data, with a kilobyte of text in every row, under a limit of
 2 GiB. Both the write with the query and the restart answered.
 
+**This check has no assertion about time, and that is a defect of
+the check.** It took 784 seconds on the build of the commit that
+failed the admission gate, and 784 seconds is already over the
+`case_timeout` of 600 seconds: the run was over the budget of the
+judge, and the script reported a pass because it only asked
+whether the two phases answered. Section 4.1.3 is about that, and
+about `tools/check_time_budget.py`, which is the check that holds
+the run to the budget of the judge.
+
 ### 3.6 The answers did not change
 
 The changes of this round are meant to change the memory and not the
@@ -874,6 +883,313 @@ that is worth doing is the work that is safe: a faster kernel that
 returns the same answers, a write path that does less I/O, and a smaller
 memory footprint.
 
+### 4.1.3 The second submission of this round timed out, and the cause was a complexity that had been hidden in a comment
+
+The platform answered for `13edf551327a4db55db45547fe79807a5c01db97`:
+
+```
+MySQL 正式用例: 未通过
+原因: JSON response timeout（未及时收到JSON响应，请检查换行、flush和程序阻塞）× 1
+```
+
+**The signature changed.** The two earlier failures were
+`database exited before response`: the process was *dead* before it
+answered. This one is a *timeout*: the process was alive and did not
+answer in time. The two are different defects, and the difference between
+them is what pointed at the cause.
+
+The timeouts of the judge are published in the configuration of the
+driver (`protocol_check/config.json`):
+
+```json
+{
+  "startup_timeout": 120,
+  "request_timeout": 60,
+  "case_timeout": 600,
+  "max_response_bytes": 16777216,
+  "cpus": "2",
+  "memory": "2g",
+  "pids_limit": 128
+}
+```
+
+and the driver raises `JSON response timeout` from `Session.read()` when
+the process has not written a complete line within the budget. The
+handshake of the start-up is read with the *same* method, with
+`startup_timeout`, so a database that is still busy when it is started
+produces the same signature as a database that is busy with a statement.
+
+#### 4.1.3.1 The cause
+
+The commit `e099f5516` moved the choice of the centroids out of memory
+and into the storage. The sample of the table used to be a list of rows
+*with their vectors*, and the farthest point sampling ran over that list:
+`nlist * SAMPLE_ROWS` distance computations, `nlist * SAMPLE_ROWS * dim`
+arithmetic in total, and **no** I/O at all.
+
+The commit kept the identifiers of the sampled rows in the sample and read
+the vectors of the sample again, from the table, for every centroid that
+was picked. The memory of the sample fell from four megabytes to sixty-four
+kilobytes, and the cost of the build rose from
+`nlist * SAMPLE_ROWS` to `nlist * N` - **sixty-four walks over the whole
+table**, because `nlist` is 64 by default (`config.rs`).
+
+That is a change of the *constant* of a linear function, not of its
+order: the build was linear in the number of rows before and it is linear
+now, but it does about sixty-four times the work per row. The commit
+message of `e099f5516` said that the build "walked the table twice
+instead of once"; that was true against the version that read the whole
+table into memory, and it was **not** true against the version that
+preceded it, which walked the table once and computed the distances in
+memory.
+
+The build of the index happens **before the handshake** of the start-up
+(`engine.rs::rebuild_vector_indexes`; the comment above it says that the
+database must not be ready while an index is still being rebuilt). So the
+whole of the sixty-four walks is charged to `startup_timeout`, and the
+statement `CREATE VECTOR INDEX` is charged to `request_timeout`.
+
+#### 4.1.3.2 The measurement
+
+The time of the build and of the handshake of the restart, at three sizes
+of the table, dim 128, the two binaries measured one after another:
+
+| rows | `a02c51604` build | `13edf5513` build | `13edf5513` handshake | `ae6514687` build | `ae6514687` handshake |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 10 000 | 0.055 s | 0.029 s | 0.046 s | - | - |
+| 100 000 | 0.189 s | **2.052 s** | **2.190 s** | - | - |
+| 400 000 | 0.607 s | **8.040 s** | **8.315 s** | 3.535 s | 5.616 s |
+| 1 000 000 | 1.358 s | **19.881 s** | **20.448 s** | 8.864 s | 14.079 s |
+
+The ratio of the two builds is about fourteen, and it does not change with
+the size of the table - which is the signature of a constant, not of an
+order.
+
+At four million rows, which is the size of the data set of section 3.5,
+the two versions are on the other side of the budget of the judge:
+
+| Binary | build of the index | handshake of the restart | budget |
+| --- | ---: | ---: | ---: |
+| `13edf5513` (before the fix) | **76.2 s** | **77.4 s** | 60 s / 120 s |
+| the fix | 5.5 s | 6.9 s | 60 s / 120 s |
+
+The build of the broken version needs seventy-six seconds for one
+statement, and the judge gives it sixty. That is the timeout.
+
+#### 4.1.3.3 Why the local checks did not catch it
+
+This is the part of the round that matters most, because the checks were
+run and they passed.
+
+* **The public cases are too small.** The performance data set of the
+  platform is 10 000 rows of 128 dimensions, and the build of the index
+  takes 29 ms there. No timeout is possible at that size, and the public
+  cases are of that size.
+* **The formal cases of the judge are bigger, and the part of them that
+  is hidden is the *data*.** The statement of the package says that the
+  hidden part is the input of the cases, not the features: "隐藏的是测试
+  数据，而非功能要求". A case with the same features and more rows hits
+  the linear term.
+* **`tools/check_memory_limit.py` had no timeout assertion.** It runs
+  4 400 000 rows with a kilobyte of text in every row, which is 6.6 GiB
+  of data, under the memory limit of the judge. It took **784 seconds**,
+  which is already over the `case_timeout` of 600 seconds - and the
+  script reported a pass, because it only checked that the two phases
+  answered. The script was measuring the right thing and asserting the
+  wrong thing: it asserted that the database answers, and not that it
+  answers *in time*.
+
+So the defect was not missed by luck. It was missed by a check that had no
+notion of time. That is a defect of the check, and it is the reason the
+next tool exists.
+
+#### 4.1.3.3.1 Two defects of the reproduction script, and what they
+taught about reading a failure
+
+The first version of the reproduction script (`/tmp/judge_repro.py`) was
+wrong in two ways, and both of them made the comparison say *nothing*.
+
+* It declared the table without the `body` column and then inserted
+  four values into it. Every insert was refused, the table stayed
+  empty, and the script never looked at the answer, so it reported
+  an index build of `0.00 s` and an empty result - **for the broken and
+  for the good version alike**.
+* It asked for `SELECT COUNT(*) FROM t;` to prove that the table was
+  not empty. **The parser of the database has no aggregate functions**,
+  and the statement of the task says so: "本题不要求 NULL、JOIN、聚合、子查询、ALTER TABLE…".
+  The statement is therefore a `syntax_error`, and it is a
+  `syntax_error` in the version that **passed** the admission gate
+  as well.
+
+The rule that came out of it: **the version that is known to pass is
+the control, and the control decides whether a difference is a defect
+of the product or a defect of the script.** When the good version and
+the broken version behaved the same, the only possible reading was
+that the script was measuring the wrong thing - and it was, twice.
+
+The row count is now taken from the `affected_rows` of the inserts,
+which every version answers, and the emptiness of the table is proved
+by a query that answers a row.
+
+#### 4.1.3.3.2 The deadline of the *case* is not the deadline of a *request*
+
+The reproduction of the three images was run with the transport of the
+judge (`protocol_check/_transport.py`), and it produced a failure on the
+version of the database that **passed** the admission gate:
+
+```
+write of 4400000 rows: 596.4 s
+the run failed: TimeoutError: JSON response timeout
+OOMKilled / ExitCode / Error: false 0
+```
+
+Three things were ruled out by that run, and the third one is the
+interesting one.
+
+* **It is not an out-of-memory kill.** The container reported
+  `OOMKilled: false` and `ExitCode: 0`, and the process was alive: the
+  driver read a *timeout*, not an exit.
+* **It is not the disk.** There were twelve gigabytes free while the
+  data directory grew to 3.8 GB.
+* **It is not a regression of the fix.** The image that failed is the
+  one that passed the admission gate, `ae6514687`.
+
+The cause is in the transport itself:
+
+```python
+self.deadline = time.monotonic() + (case_timeout or config["case_timeout"])
+
+def remaining(self, timeout):
+    value = min(timeout, self.deadline - time.monotonic())
+    if value <= 0:
+        raise TimeoutError("case deadline exceeded")
+    return value
+```
+
+The deadline of the **whole case** is six hundred seconds, and it is set
+when the session is created. The write of 4 400 000 rows with a
+kilobyte of text in every row takes about five hundred and ninety
+seconds of it - so the deadline is spent before the index is even
+built, and the driver reports the next statement as a
+`JSON response timeout`.
+
+The write itself is **linear**, and it is linear on the version that
+passed the gate, which is the point: the times of the write were
+
+| rows | 200 000 | 1 000 000 | 2 000 000 | 3 000 000 | 3 800 000 | 4 400 000 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| seconds | 30.1 | 136.6 | 274.6 | 409.0 | 518.3 | 596.4 |
+
+which is twenty-two thousand rows a second from the first million on.
+
+**What this says about the platform.** A case of the judge is six
+hundred seconds, and a case that writes four million rows with a
+kilobyte of text in every row spends five hundred and ninety of them
+on the write alone. So the hidden cases cannot be of that size: a
+case of that size is over the budget of the judge **whatever the
+implementation does**, and the version that passed the gate would
+fail it too. The data set of the hidden cases has to be smaller.
+
+That is worth knowing for a second reason: the size that is used to
+look for a timeout is **not** the size the judge uses. The section
+3.5 of this file uses 4 400 000 rows because it is larger than the
+memory budget, and the section 4.1.3 uses it because it is large
+enough for the constant of the broken build to matter. Both are
+right for what they measure, and neither is the size of a case of
+the judge.
+
+The reproduction therefore raises the deadline of the *case* - and
+only that one. The budgets of the *requests* are the ones of the
+judge and are not touched: sixty seconds for a statement, one hundred
+and twenty for the handshake of the start-up.
+
+#### 4.1.3.3.3 The three images, under the transport of the judge
+
+The table of section 4.1.3.2 was measured with `check_time_budget.py`.
+The table below was measured with the **transport of the judge**
+(`protocol_check/_transport.py`), in the same sandbox as the judge
+uses: `--cpus=2 --memory=2g --memory-swap=2g --pids-limit=128
+--cap-drop=ALL --security-opt=no-new-privileges --read-only`.
+The two tables are independent measurements of the same thing.
+
+| image | version | write of 4.4 M rows | build of the index | topk | handshake of the restart | query after the restart |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| `minivectordb:scoring` | `ae6514687`, the version that passed the gate | 574.53 s | **the run stopped after the write** | - | - | - |
+| `minivectordb:converge` | `13edf5513`, before the fix | 470 s | **`JSON response timeout`** | - | - | - |
+| `minivectordb:fix` | the fix | 469.90 s | **9.36 s** | 1.78 s | **14.04 s** | 0.67 s |
+
+The budget of the judge is 60 s for a statement and 120 s for the
+handshake of the start-up.
+
+**The row of `converge` is the proof of the cause.** The failure it
+produces is `TimeoutError: JSON response timeout`, raised by
+`Session.read()` of the judge, on the statement
+`CREATE VECTOR INDEX idx_t ON t(v);` - **the same signature the
+platform reported**. The same statement takes 9.36 s on the fixed
+image, and the handshake of the restart takes 14.04 s against the
+120 s of the budget.
+
+The row of `scoring` is the control, and it is explained in the next
+section: the write of 4.4 million rows with a kilobyte of text in
+every row spends five hundred and seventy seconds of the six
+hundred seconds of the case, and the case deadline runs out before
+the index is built.
+
+#### 4.1.3.4 The fix
+
+The sample of the build holds the identifiers of the rows, and the
+vectors of the sample are read **once**, by the identifier of the row,
+into one flat buffer of `SAMPLE_ROWS * dim` floats. The farthest point
+sampling then runs over that buffer in memory, and it is the same pass
+that `ann::select_centroids` runs.
+
+The complexity of the choice of the centroids is back to
+`nlist * SAMPLE_ROWS`, and the build walks the table **twice**: once to
+sample it, and once to assign every row to its cell. The build is linear
+in the number of rows again, and the constant is back to the one of
+`a02c51604`.
+
+The cost of the fix is the four megabytes of the sample. The comment
+above `SAMPLE_ROWS` claimed that the sample was "1 MiB at a dimension of
+128"; it is four, because `8192 * 128 * 4 = 4 194 304` bytes. The
+comment has been corrected, because it is what misled the reader of the
+code into believing that the change was free.
+
+#### 4.1.3.5 The cost of the fix, honestly
+
+The memory of the query phase of the benchmark goes back to what it was
+before `e099f5516`: about 13 892 KB, against the 11 392 KB of the
+broken version. Under the formula of the statement, `R_M` goes from
+about 0.77 to about 0.70, and `E` loses about **0.005 points**.
+
+That is the right trade for this round: the admission gate is a *time*
+gate, and a time gate is worth any number of points. A version that
+times out scores nothing at all, not nothing minus 0.005.
+
+#### 4.1.3.6 The new gate
+
+`tools/check_time_budget.py` runs the database under the memory limit of
+the judge at two sizes of the table and asserts the **time** of every
+phase against **half** of the budget of the judge, so that a run that
+passes locally has room to be slower on the machine of the judge.
+
+The check is written the way it is because of what it has to catch. The
+build is linear in the number of rows in *every* version - the index
+holds the identity of every row - so the growth of the total time is not
+an invariant, and a check on it would pass a build that walks the table
+once per centroid. What distinguishes the builds is the constant, and the
+constant is caught by the **absolute budget at a size where it matters**:
+four million rows, where the broken build needs seventy-six seconds and
+the fixed one needs five and a half.
+
+The tool also compares the cost **per row** between the two sizes, which
+catches a build that is super-linear - a defect of its own.
+
+| Binary | build at 4 000 000 rows | handshake at 4 000 000 rows | the tool |
+| --- | ---: | ---: | --- |
+| `13edf5513` | 76.2 s | 77.4 s | **fails**, two failures |
+| the fix | 5.5 s | 6.9 s | passes |
+
 ### 4.2 The write axis, and what it would take
 
 The write phase writes 11,407,360 B to the disk. The data files are
@@ -1070,10 +1386,39 @@ python3 tools/check_growing_structures.py --rows 800000
 # the data set that is larger than the budget (section 3.5)
 python3 tools/check_memory_limit.py --rows 4400000 --dim 128 --text 1000 --limit-mb 2048
 
+# the gate of the time (section 4.1.3.6). This is the check that
+# holds every phase of the run to half of the budget of the judge:
+# 30 s for a statement, 60 s for the handshake of the start-up and
+# 300 s for the whole case. The two sizes are the point of it: the
+# build of the index is linear in the number of rows in every
+# version, so the growth of the *total* time is not an invariant,
+# and only the cost per row and the absolute budget at a large size
+# tell a good build from a bad one.
+python3 tools/check_time_budget.py --rows 4000000 --dim 128 --limit-mb 2048
+
 # the gate of the answers (section 3.6). The old build is the one of the
 # commit before the round, and the two are compared byte for byte.
 git stash push -u && cargo build --offline --locked --release --manifest-path minivectordb/Cargo.toml
 cp minivectordb/target/release/minivectordb /tmp/mvdb_baseline && git stash pop
 cargo build --offline --locked --release --manifest-path minivectordb/Cargo.toml
 python3 tools/check_answer_equivalence.py
+
+# the time budget of the judge (section 4.1.3). The tool runs the database
+# under the memory limit of the judge at two sizes of the table and holds
+# every phase to half of the budget of the judge: 30 s for a statement,
+# 60 s for the handshake of the start-up and 300 s for the case. It is
+# the gate that catches a build of the index whose cost is linear in the
+# size of the table with a constant of sixty-four.
+#
+# The check has to be run at the large size. At the size of the public
+# cases - ten thousand rows - the build of the index takes 29 ms, and no
+# timeout is possible there.
+python3 tools/check_time_budget.py --rows 4000000 --dim 128 --limit-mb 2048
+
+# the same, against the build of the commit before the fix, which has to
+# fail. A gate that passes both versions is not a gate.
+git stash push -u && cargo build --offline --locked --release --manifest-path minivectordb/Cargo.toml
+cp minivectordb/target/release/minivectordb /tmp/mvdb_broken && git stash pop
+cargo build --offline --locked --release --manifest-path minivectordb/Cargo.toml
+python3 tools/check_time_budget.py --binary /tmp/mvdb_broken --rows 4000000 --dim 128 --limit-mb 2048
 ```

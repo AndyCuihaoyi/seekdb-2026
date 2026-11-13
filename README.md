@@ -211,7 +211,16 @@ bash tools/smoke.sh                                          # the smoke tests
 bash tools/killtest.sh                                       # the crash recovery tests
 python3 tools/bench.py                                       # the performance measurement
 python3 tools/perf_compare.py --before A --after B           # the performance comparison
+python3 tools/check_time_budget.py --rows 4000000 --dim 128 --limit-mb 2048
 ```
+
+The last one holds every phase of the run to **half** of the budget of
+the judge: 30 s for a statement, 60 s for the handshake of the start-up
+and 300 s for the case. It is the check that catches a build of the index
+whose cost grows with the size of the table faster than it has to; see
+[docs/perf/ledger.md](docs/perf/ledger.md) §4.1.3. It has to be run at the
+large size: at the size of the public cases (ten thousand rows) the build
+of the index takes 29 ms and no timeout is possible there.
 
 The official checker of the test package can be run against the image as
 well:
