@@ -1008,7 +1008,55 @@ impl Engine {
         // a shared reference, so it lives in a cell.
         let cache: std::cell::RefCell<LiteralCache> = std::cell::RefCell::new(LiteralCache::new());
 
-        let use_index = self.mode == SearchMode::Ann && self.has_vector_index(table_id);
+        // Whether the approximate path is the one that answers the statement.
+        //
+        // The approximate path is only taken when the search is genuinely
+        // approximate, that is when the number of the visited cells is
+        // bounded. With no bound, the approximate search visits every cell
+        // and its answer is **the answer of the exact search** - the recall
+        // of the unlimited mode is 1.0000, measured by
+        // `tools/check_ann_recall.py` and recorded in
+        // `docs/perf/ledger.md`, section 4.1.3.7.
+        //
+        // So in the unlimited mode the two paths answer the same thing, and
+        // the exact path is the one to take, because it is the cheaper of
+        // the two: it walks the table block by block and decodes every block
+        // once, while the approximate path visits the rows cell by cell and
+        // decodes every block once **per cell** that holds one of its rows.
+        //
+        // The difference is not a small one. At four million rows with a
+        // kilobyte of text, the approximate path decoded 3 907 blocks for
+        // each of the 28 cells it visited - 183.9 GB of decoding - and the
+        // statement went over the sixty seconds of the judge. The exact path
+        // decodes the 3 907 blocks once: 2.4 GB, and the statement answers
+        // in under four seconds. The measurement is in
+        // `docs/perf/ledger.md`, section 4.1.3.9.
+        //
+        // The filter is what makes the difference so large, and the reason
+        // is worth writing down, because it is the mechanism of the failure:
+        //
+        // * the pruning of the index compares the distance bound of a cell
+        //   against the distance of the K-th row that **satisfies the
+        //   filter**;
+        // * the filter keeps one row in eight, so the K-th such row is much
+        //   farther away than the K-th row of the table: at four hundred
+        //   thousand rows the distance rises from 99.6 to 393.2, a factor of
+        //   3.95;
+        // * the largest radius of a cell is 327.8, which is **smaller** than
+        //   the distance the filter forces, so the bound of a cell cannot
+        //   exclude it unless its centroid is farther away than that;
+        // * the scan therefore visits 28 of the 64 cells instead of 2, and
+        //   each of them touches the whole table.
+        //
+        // A finite `nprobe` does **not** take this path: there the answer
+        // really depends on the cells, and the recall is below one by
+        // construction - 200 of 200 answers differ from the exact one at
+        // four cells (`docs/perf/ledger.md`, section 4.1.3.7). Those
+        // answers must keep coming from the approximate search.
+        let unlimited = self.config.ann_nprobe.is_none();
+        let use_index = self.mode == SearchMode::Ann
+            && self.has_vector_index(table_id)
+            && !unlimited;
         if use_index {
             // The approximate path: the index visits the rows through its
             // inverted lists. The pruning of the index is exact, so the
@@ -1081,6 +1129,63 @@ impl Engine {
                 state.index = Some(index);
             }
             scan?;
+            // The diagnostics of the scan: the number of cells it visited,
+            // the number of rows it measured, the number of the cells the
+            // pruning removed and the distance of the K-th accepted row.
+            //
+            // They are **off by default**, and they are off because a
+            // synchronous write to stderr costs real time: a benchmark of a
+            // thousand queries would pay a thousand writes, and the time of
+            // the queries is two thirds of the weight of the score. The
+            // environment variable `MINIVECDB_DIAG` turns them on.
+            //
+            // The gate is not a convenience. A caller that reads the
+            // standard error of the database through a pipe and does not
+            // drain it - which is what `tools/check_ann_nprobe_equivalence.py`
+            // does - would block the database on the full pipe, and the
+            // database would stop answering. That happened, and the fix is
+            // that the database is silent unless it is asked to speak.
+            if crate::diag::enabled() {
+                if let Some(state) = self.tables.get(&key) {
+                    if let Some(index) = state.index.as_ref() {
+                        let stats = index.stats();
+                        eprintln!(
+                            "minivectordb: ann scan cells={} rows={} max_radius={:.4} \
+                             radius_sum={:.4} largest_cell={}",
+                            stats.last_scan_cells,
+                            stats.last_scan_rows,
+                            stats.max_radius,
+                            stats.radius_sum,
+                            stats.largest_cell,
+                        );
+                        eprintln!(
+                            "minivectordb: ann scan pruned_cells={} best_len={} \
+                             kth_dist={:.6} rows_visited={} fetch_some={}",
+                            stats.last_scan_pruned,
+                            stats.last_scan_best_len,
+                            stats.last_scan_kth_dist,
+                            stats.last_scan_rows_visited,
+                            stats.last_scan_rows,
+                        );
+                        eprintln!(
+                            "minivectordb: ann scan would_prune={} best_bound={:.6}",
+                            stats.last_scan_would_prune,
+                            stats.last_scan_best_bound,
+                        );
+                    }
+                    // The number of blocks that the query had to decode. The
+                    // approximate scan visits the rows cell by cell, so it
+                    // decodes a block for every cell that holds one of its
+                    // rows; the exact scan walks the table block by block and
+                    // decodes each block once.
+                    eprintln!(
+                        "minivectordb: ann scan scalar_decodes={} hits={} vector_decodes={}",
+                        state.store.scalar_decodes.get(),
+                        state.store.scalar_hits.get(),
+                        state.store.vector_decodes.get(),
+                    );
+                }
+            }
             if let Some(e) = scan_error {
                 return Err(e);
             }

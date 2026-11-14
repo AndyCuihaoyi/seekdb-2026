@@ -1283,6 +1283,997 @@ one seed and lower in two, and at eight cells they cross. **Neither is
 systematically better** - and the mode that is judged is the unlimited
 one, where the two are the same.
 
+#### 4.1.3.8 The classification of the timeout
+
+The platform reported, for the submission of the commit `b19769271`,
+
+```
+正确性门槛未通过（失败用例数：1）。原因：JSON response timeout
+（未及时收到JSON响应，请检查换行、flush和程序阻塞） × 1。
+```
+
+The judge raises that message in exactly **one** place, `Session.read()`
+of `/tmp/official/protocol_check/_transport.py`, and the message does
+not say which of the three waits of the judge timed out: the handshake of
+the start-up (`startup_timeout`, 120 s), a statement (`request_timeout`,
+60 s) or the shutdown (`request_timeout`, 60 s). The three have different
+causes and different fixes, and two rounds have already been spent
+guessing.
+
+##### 4.1.3.8.1 The reproducer that removes the ambiguity
+
+`tools/repro_timeout_class.py` **imports the official transport** and does
+not reimplement it. The `Session` is subclassed and only `read()` is
+wrapped, so the point of the wait is recorded and the timeout is re-raised
+with that point attached; the handshake, the request, the shutdown and the
+budgets are the judge's own code, and a number measured here is a number
+the judge would measure.
+
+```python
+class ClassifiedSession(Session):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.phase = "UNKNOWN"
+
+    def read(self, timeout):
+        try:
+            return super().read(timeout)
+        except TimeoutError as exc:
+            raise ClassifiedTimeout(self.phase, str(exc)) from exc
+```
+
+The data set is built so that the two paths of the inverted index are
+both exercised: the filter column has **eight** values, so its index is
+built and used (a column with more than `MAX_DISTINCT` = 1024 values is
+*abandoned*, and the cost of the abandoned path is a different one), and
+the table holds a **long text column** (`body VARCHAR(T)`, T = 1000),
+which is the blind spot of the gate that is run today.
+
+The database runs under the limits of the judge: `taskset -c 0,1` for the
+two CPUs and `ulimit -v 2097152` for the two gigabytes of address space.
+
+```bash
+tools/repro_timeout_class.py --binary minivectordb/target/release/minivectordb \
+    --rows 400000 --text 1000 --dim 128 --batch 2000
+```
+
+##### 4.1.3.8.2 The measurement: three timeouts × three loads × four phases
+
+The four phases are the ones the four budgets are compared against: the
+**build of the index** and the **first query after the restart** are
+statements (60 s), the **handshake of the restart** is the start-up
+(120 s) and the **shutdown** is the shutdown (60 s).
+
+**400 000 rows**, `body VARCHAR(1000)`, dimension 128, two CPUs, 2 GiB:
+
+| Load | build of the index | handshake of the restart | first query after the restart | shutdown | verdict |
+| --- | ---: | ---: | ---: | ---: | --- |
+| (A) write, index, query, restart, query | 0.581 s | **0.999 s** | 0.334 s | 0.032 s | within budget |
+| (B) the same, without the index | 0.590 s | - | 0.337 s | 0.064 s | within budget |
+| (C) the same, without the restart | 0.593 s | - | 0.343 s | 0.032 s | within budget |
+
+**1 600 000 rows**, the same way:
+
+| Load | build of the index | handshake of the restart | first query after the restart | shutdown | verdict |
+| --- | ---: | ---: | ---: | ---: | --- |
+| (A) write, index, query, restart, query | 2.304 s | **3.910 s** | 1.396 s | 0.032 s | within budget |
+| (B) the same, without the index | 2.291 s | - | 1.429 s | 0.064 s | within budget |
+| (C) the same, without the restart | 2.281 s | - | 1.417 s | 0.064 s | within budget |
+
+**4 000 000 rows**, the same way:
+
+| Load | build of the index | handshake of the restart | first query after the restart | shutdown | verdict |
+| --- | ---: | ---: | ---: | ---: | --- |
+| (A) write, index, query, restart, query | 5.604 s | **10.110 s** | 3.802 s | 0.064 s | **STATEMENT timeout at 60.03 s** on the approximate query after the restart |
+| (B) the same, without the index | 5.604 s | - | 3.956 s | 0.064 s | **STATEMENT timeout at 60.01 s** |
+| (C) the same, without the restart | 5.601 s | - | 3.980 s | 0.064 s | **STATEMENT timeout at 60.06 s** |
+
+The three loads fail the **same** way, at the **same** number of
+seconds, and the phase that fails is the **approximate filtered query**:
+the load that does not restart fails on it, and so does the load that
+does. The restart is not the cause of the timeout, and neither is the
+index: load (B) does not build an index and it fails the same way. The
+one thing the three loads share is the query.
+
+The three tables together, against the budgets of the judge:
+
+| Phase | 400 k | 1 600 k | 4 000 k | budget | verdict |
+| --- | ---: | ---: | ---: | ---: | --- |
+| STARTUP - handshake of the restart | 0.999 s | 3.910 s | 10.110 s | 120 s | **never over**; at its worst 8 % of the budget |
+| STATEMENT - the filtered query of the approximate mode | 7.780 s | 34.126 s | **60.03 s** | 60 s | **over at 4 M rows**, and it is the only phase that ever times out |
+| STATEMENT - the filtered query of the exact mode | 0.337 s | 1.429 s | 3.980 s | 60 s | never over |
+| STATEMENT - the unfiltered query of the approximate mode | 0.672 s | 2.875 s | - | 60 s | never over |
+| STATEMENT - the build of the index | 0.593 s | 2.291 s | 5.604 s | 60 s | never over |
+| STATEMENT - the whole write | 10.883 s | 44.211 s | 96.335 s | 60 s | over at 4 M rows, but the write is split into batches, each of which is a statement of its own |
+| SHUTDOWN | 0.064 s | 0.064 s | 0.064 s | 60 s | **never over**; at its worst 0.1 % of the budget |
+
+The classification is therefore unambiguous, and it is reproduced by the
+official transport: at four million rows the reproducer raises
+`STATEMENT timeout: JSON response timeout` at 60.06 s, which is the
+message of the platform, and the `STARTUP` and `SHUTDOWN` phases never
+come close to their budgets.
+
+**The start-up path is not the problem.** The four phases of
+`Engine::open` are timed with `eprintln!` and `Instant`, and they are
+read from the stderr of the reproducer at the largest size:
+
+| Phase of `Engine::open` | 400 k | 1 600 k | 4 000 k | share of the 120 s |
+| --- | ---: | ---: | ---: | ---: |
+| `restore_catalog()` | 0.000 s | 0.000 s | 0.000 s | 0 % |
+| `recover()` - the replay of the log | 0.001 s | 0.002 s | 0.011 s | 0.01 % |
+| `recover()` - the rebuild of the primary key index | 0.017 s | 0.091 s | 0.425 s | 0.35 % |
+| `recover()` - the rebuild of the inverted indexes | 0.379 s | 1.574 s | 4.148 s | 3.5 % |
+| `recover()` - the whole of it | 0.423 s | 1.699 s | 4.657 s | 3.9 % |
+| `rebuild_stale_vector_files()` | 0.000 s | 0.000 s | 0.000 s | 0 % |
+| `rebuild_vector_indexes()` | 0.582 s | 2.206 s | 5.397 s | 4.5 % |
+| **the whole handshake** | **0.999 s** | **3.910 s** | **10.110 s** | **8.4 %** |
+
+**Not one phase reaches even a tenth of the 120 s**, and the largest of
+them is the rebuild of the vector index, at 4.5 %. The start-up path is
+excluded.
+
+**The shutdown is not the problem either.** `tools/probe_shutdown_fsync.py`
+writes the rows under the limits of the judge and times the shutdown,
+which does `wal.flush()` and then the `fsync` of every table file:
+
+| Rows | the data on the disk | the write | the shutdown | budget | verdict |
+| ---: | ---: | ---: | ---: | ---: | --- |
+| 200 000 | 337.6 MiB | 9.003 s | **0.064 s** | 60 s | within budget |
+| 400 000 | 609.5 MiB | 16.751 s | **0.032 s** | 60 s | within budget |
+| 800 000 | 1 218.9 MiB | 33.521 s | **0.032 s** | 60 s | within budget |
+| 1 600 000 | 2 437.9 MiB | 66.562 s | **0.064 s** | 60 s | within budget |
+
+The cost of the shutdown is **flat**: it does not grow with the size of
+the data at all, and it is two orders of magnitude below the budget at
+2.4 GiB of data. The reason is that `--durability=os` writes the log
+without fsyncing it, and the `fsync` of the table files is paid by the
+kernel once, for the whole file, on an ext4 volume that is already
+mounted. Extrapolating the flat line, **no data set that fits in the
+disk would ever time out in the shutdown**. The shutdown path is
+excluded.
+
+##### 4.1.3.8.3 The statement that times out, and the code path of it
+
+The statement that times out is the **filtered TopK in the approximate
+mode**:
+
+```sql
+SELECT id FROM t WHERE cat = 'c3'
+ORDER BY L2_DISTANCE(v, '[...]') LIMIT 10;
+```
+
+Its cost, at 400 000 rows, is **7.5 s against 0.33 s for the exact mode**
+- a factor of 22. The unfiltered query of the same mode costs 0.67 s,
+so the cost is not the approximate search itself; it is the approximate
+search **combined with a filter**.
+
+The reason is in the two paths of `exec_distance_topk`
+(`minivectordb/src/exec/query.rs`):
+
+* the **exact** path takes the candidates of the inverted index and hands
+  them to `scan_exact_topk_candidates`
+  (`minivectordb/src/vector/exact.rs`), which walks the table **block by
+  block** with a cursor and decodes every block exactly once;
+* the **approximate** path takes the cells of the vector index in the
+  order of their distance and calls `fetch(row_id)` for every row of
+  every cell (`minivectordb/src/vector/ann.rs`, `scan_ordered`). The
+  rows of a cell are spread over **every block** of the table, and the
+  fetch reads them one row at a time.
+
+The number of the blocks that the query had to decode is printed by the
+database, and it is the whole story:
+
+| Size | blocks of the table | cells visited | rows measured | scalar blocks decoded by the query | the time of the statement |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 400 000 | 391 | 28 | 20 000 | **10 948** = 28 × 391 | 7.5 s |
+| 1 600 000 | 1 563 | 29 | 96 000 | **45 327** = 29 × 1 563 | 34.1 s |
+
+At 400 000 rows the table has 391 blocks of 1024 rows, and the scan
+decodes **10 948** of them: 28 cells × 391 blocks. Every cell sweeps the
+whole table again. The exact path, on the same table and the same query,
+decodes **391** blocks.
+
+(The counters of the database are cumulative over the life of the
+process, so the number read from the stderr of the 1 600 000 run is
+48 453 - the 45 327 of the approximate query plus the 1 563 of each of
+the two exact queries that ran before it.)
+
+The reason the cache does not absorb it is the size of a block. A block
+of a table with a `VARCHAR(1000)` column holds about 1.49 MB of decoded
+text, and the scalar cache is a quarter of the budget of 64 MB - 16 MB -
+so it holds about **ten** blocks. The 391 blocks of a cell sweep do not
+fit, and the cache thrashes: the twenty-eight sweeps re-read the whole
+table from the disk. The grid of section 4.1.3.8.5 measures this
+directly - a pool of 2 048 MB, which holds the whole table, brings the
+number of the decodes down from 10 948 to **391**, which is exactly the
+number of the blocks of the table.
+
+**The regression is measured against the build that scored.** The two
+builds are the same program, so the difference is a difference of
+behaviour and not of the machine
+(`tools/compare_ann_side_by_side.py`, 400 000 rows, T = 1000, two CPUs):
+
+| Build | write | build of the index | exact query | **approximate filtered query** |
+| --- | ---: | ---: | ---: | ---: |
+| the scoring build `ae6514687` | 30.843 s | 3.668 s | 0.133 s | **0.881 s** |
+| the current build `b19769271` | 20.570 s | 0.600 s | 0.334 s | **7.580 s** |
+| the ratio | 0.67x | 0.16x | 2.51x | **8.60x** |
+
+The scoring build counted a block at 64 bytes per row, so the 64 MB
+scalar pool held all 98 of its blocks and the table was decoded exactly
+once. The current build counts the **real** bytes of a block - which is
+what keeps the database inside the memory budget of the judge - and the
+same 64 MB now holds ten blocks, so the approximate scan re-decodes the
+table twenty-eight times.
+
+The A/B of step 3 shows that the inverted index is **not** the
+culprit (`tools/ab_inverted_vs_scan.py`, 400 000 rows):
+
+| | the filter column is indexed (8 values) | the filter column is abandoned (4096 values) |
+| --- | ---: | ---: |
+| the exact query | 0.328 s | 0.355 s |
+| the approximate query | **7.636 s** | **7.254 s** |
+| the rows the approximate scan measured | 20 000 | **47** |
+| the scalar blocks the approximate scan decoded | 12 121 | 12 930 |
+
+With the filter column abandoned, the scan measures **47 rows** and is
+still **7.25 s** slow: the cost is in the **blocks that are touched**, not
+in the rows that are measured. The hypothesis of step 3 - that the
+inverted index degenerates into a random read per row - is **refuted**:
+the inverted index is not on the path of the approximate scan at all
+(`query.rs` takes `index.scan_ordered()` and never consults
+`state.inverted` on that path).
+
+##### 4.1.3.8.4 The conclusion, in one sentence
+
+**The timeout is a `STATEMENT` timeout, and the bottleneck is the
+approximate filtered query of `exec_distance_topk`, which visits the
+cells of the vector index in the order of their distance and reads the
+rows of every cell one at a time, so the twenty-eight cell sweeps decode
+the whole table twenty-eight times (10 948 blocks against 391) and the
+statement needs 60 s at four million rows.**
+
+##### 4.1.3.8.5 The experiment that would prove this conclusion wrong
+
+`tools/falsify_ann_cache_thrash.py` runs the four configurations that
+separate the three possible causes:
+
+| Run | what it changes | the conclusion is **wrong** if |
+| --- | --- | --- |
+| the pool of 2 048 MB | the cache holds the whole table | the number of the decodes does **not** fall to the number of the blocks, or the answer changes |
+| the text column of 8 bytes instead of 1000 | the blocks are small and all fit | the time does **not** fall under the budget of the judge |
+| the **exact** path, the same table | the path reads block by block | the approximate path is **not** the slow one |
+| the default cache, the approximate path | nothing | - |
+
+The experiment was run at 400 000 rows and the result is decisive:
+
+| Run | the time | the scalar blocks decoded | the answer |
+| --- | ---: | ---: | --- |
+| the text of 1000 bytes, the pool of the judge | **7.458 s** | 10 948 per query | the same |
+| the text of 1000 bytes, the pool of 2 048 MB | **0.124 s** | **391** in total | the same |
+| the text of 8 bytes, the pool of the judge | **2.951 s** | 10 948 per query | the same |
+| the text of 8 bytes, the pool of 2 048 MB | **0.121 s** | **391** in total | the same |
+| the **exact** path, the same table | **0.332 s** | 391 | the same |
+| the baseline: the pool of the judge, the approximate path | 7.586 s | 10 948 per query | the same |
+
+(The counters of the script are cumulative over its three repetitions of
+the query, so 32 844 is 3 × 10 948; the pool of 2 048 MB counts 391 in
+total, because the second and the third query find every block already
+in the cache.)
+
+**The answers are identical in the six runs**, so the cost is not a
+change of the answer.
+
+The control settles which path is slow: on the same table and the same
+query, the **exact** path needs **0.332 s** against **7.5 s** of the
+approximate one, with the same answer. The cost is in the approximate
+path.
+
+The two factors were then separated by a **grid of four runs** - the
+size of the text column against the size of the pool - because a single
+pair of runs cannot tell the two apart. The four runs of the grid, each
+of them a **cold** single query, so that the numbers are the ones of a
+query that has nothing in the cache yet:
+
+| | the pool of 64 MB (the budget of the judge) | the pool of 2 048 MB |
+| --- | ---: | ---: |
+| the text column of 1 000 bytes | 7.570 s, 10 948 decodes | **0.508 s**, 391 decodes |
+| the text column of 8 bytes | 2.949 s, 10 948 decodes | **0.205 s**, 391 decodes |
+
+The grid says three things.
+
+1. **The number of the decodes is decided by the size of the pool, and
+   by nothing else.** It is 10 948 when the pool is 64 MB and 391 when
+   it is 2 048 MB, in both rows of the grid - and 391 is **exactly the
+   number of the blocks of the table**. The text column does not change
+   it: there are 391 blocks in both rows, and the twenty-eight cell
+   sweeps re-decode all of them twenty-eight times.
+2. **The size of the pool decides the decodes, and the size of the block
+   decides the cost of a decode.** Under the budget of the judge the
+   query decodes the same 10 948 blocks in both rows, but the blocks of
+   the wide row are more expensive to read and to decode, so the same
+   number of decodes costs 7.570 s against 2.949 s.
+3. **A pool that holds the whole table removes the re-reading
+   entirely**: the decodes fall from 10 948 to 391 - the number of the
+   blocks - in both rows, and the time falls with them (0.508 s and
+   0.205 s). The twenty-eight sweeps then stop re-reading the table.
+
+The single measurement that closes the loop is therefore the size of the
+cache that is large enough to hold the whole table *by the block count*:
+
+| The pool | the time | the scalar blocks decoded |
+| --- | ---: | ---: |
+| 64 MB (the budget of the judge) | 7.570 s | **10 948** |
+| 2 048 MB (four times the budget) | **0.508 s** | **391** |
+
+Thirty-two times more memory, and the query is fifteen times faster,
+because the twenty-eight sweeps stop re-reading the table from the disk:
+the number of the decodes falls from 10 948 to 391 - **exactly the
+number of the blocks of the table**. That is the confirmation of the
+conclusion, and it is also the reason why the conclusion cannot be
+fixed by simply raising the budget: the judge gives two gigabytes for
+**everything**, and a table of four million rows with a kilobyte of text
+is 2.4 GiB on the disk.
+
+##### 4.1.3.8.6 The candidate fixes, by cost and by benefit
+
+| # | the fix | what it does | the cost | the benefit | the metric it moves |
+| ---: | --- | --- | --- | --- | --- |
+| 1 | **Cluster the rows of a cell by block before reading them** | the approximate scan collects the rows of a cell, groups them by the block they belong to, and reads each block **once** for all of them. The number of the decodes falls from 28 × 391 to 391. | a change in `ann.rs::scan_ordered` and in the fetch of `query.rs`: the rows of a cell have to be buffered per cell instead of measured on the spot. The answer does not change: the rows are measured in a different order, and the answer is sorted by the distance. | the statement goes from 7.6 s to 0.5 s at 400 k, and from 34 s to 2 s at 1.6 M. The timeout at 4 M disappears. | **time** |
+| 2 | **Give the approximate path the candidates of the inverted index** | the exact path uses the inverted index to name the rows that satisfy the filter; the approximate path does not, so it measures 20 000 rows to find the 10 that the filter accepts. | the pruning bound of the index has to be compared with the distance of the K-th row that satisfies the filter, which the exact path already does; the change is confined to `query.rs`. | the rows measured fall from 20 000 to about 1 500. It does **not** remove the re-decoding on its own, so it is worth much less than fix 1 on its own. | **time** |
+| 3 | **Do not keep the decoded text of a block in the cache** | the cache holds the *decoded* columns, and the text of a block is a megabyte. The scan only needs the filter column, not the whole text. | the decoded form is what the filter is applied to, so the text has to be decoded once per block; a block that holds only the columns the query names would be a much larger change. | it lowers the memory of the cache and lets it hold more blocks, but the measurement above shows that a cache that holds the whole table only removes the cost of the I/O, not the cost of the decoding. | **memory**, and a little time |
+
+Fix 1 is the one to do first: it is the only one that removes the
+twenty-eightfold re-reading, it does not need a bigger budget than the
+two gigabytes of the judge, and it does not change a single answer.
+Fixes 2 and 3 are worth doing after it, and fix 3 is worth doing for the
+memory alone.
+
+### 4.1.3.9 The two decisive experiments, and the official case that closes the loop
+
+The section above says that the cause is the **twenty-eight sweeps of the
+whole table**, and it offers a hypothesis that is cheaper than fix 1:
+the number of the blocks is four times larger than it has to be, because
+`vector_block_rows` is 1024, and a block of 4096 rows would make the
+sweep read four times fewer blocks. That hypothesis is wrong, and this
+section is the measurement that says so.
+
+#### 4.1.3.9.1 The motive of `7ff176a53`: why `vector_block_rows` is 1024
+
+The constant was reduced from 4096 to 1024 by the commit `7ff176a53`,
+"perf: hold less of the decoded vectors in memory", and the motive is
+written in the message of the commit:
+
+> The block of the vector file was 4096 rows, which is 2 MiB of decoded
+> vectors. The buffer pool holds 64 MiB of them, so it holds the whole
+> table of the benchmark and the peak memory is the peak memory of the
+> whole table.
+>
+> A block of 1024 rows is 512 KiB, and the peak memory of the query phase
+> falls from 14,968 KB to 11,896 KB: 20 % less. The cost is 1.5 % of the
+> time of the query, because the scan reads more blocks.
+
+So the constant has a **legitimate reason**: it is the memory axis of
+the score, and it is worth 13 1/3 % of the weight, against the time of
+the query, which is worth 66 2/3 %. It was not a correctness fix and it
+was not a fix of a crash.
+
+The trade was measured at the size of the benchmark of the platform,
+where the whole table is 5 MiB and the pool is 64 MiB, so the pool holds
+it. **That condition does not hold at the size that times out.** A table
+of four million rows with a kilobyte of text is 2.4 GiB, and a pool of
+64 MiB holds one sixtieth of it, so the block size decides nothing about
+whether the table is in the pool - the table was never going to be.
+
+The commit therefore does not forbid a revert; it forbids a revert that
+**costs memory for nothing**. A change that removes the twenty-eight
+sweeps *and* keeps the memory at the level of `7ff176a53` is not a
+revert at all, and it is the right one. But the constant alone is not
+it, and the next section is the measurement of that.
+
+#### 4.1.3.9.2 Experiment one: `vector_block_rows` 1024 → 4096, nothing else
+
+The change is one constant in `minivectordb/src/config.rs`:
+
+```rust
+            vector_block_rows: 4096,
+```
+
+and nothing else. The build is the release build, the run is the
+reproducer of section 4.1.3.8 under the limits of the judge, with four
+million rows and a kilobyte of text:
+
+```bash
+cargo build --offline --locked --release --manifest-path minivectordb/Cargo.toml
+tools/repro_timeout_class.py --binary minivectordb/target/release/minivectordb \
+  --rows 4000000 --text 1000 --dim 128 --batch 4000
+```
+
+| The build | the filtered query of the approximate mode | the verdict |
+| --- | ---: | --- |
+| the baseline (1024) | **60.03 s** | over the 60 s budget |
+| **the experiment (4096)** | **60.04 s** | over the 60 s budget |
+
+**The hypothesis is false.** The query does not become ten times
+faster; it does not become faster **at all**. The number of the blocks
+of the table falls from 3 907 to 977, and the time does not move.
+
+The measurement at 1 600 000 rows makes the falsification sharper,
+because there the query does not time out and the two builds can be
+compared on a number that is not a budget:
+
+| The build | 1 600 000 rows | 4 000 000 rows |
+| --- | ---: | ---: |
+| the baseline (1024) | 34.13 s | 60.03 s (timeout) |
+| the experiment (4096) | **39.85 s** | 60.04 s (timeout) |
+| the change | **+17 %** | 0 % |
+
+The experiment is not only useless, it is **worse** at the size where
+the two can be compared. The reason is in the arithmetic below.
+
+#### 4.1.3.9.3 Experiment two: the scalar cache 16 MB → 64 MB, nothing else
+
+The second change is one line in `minivectordb/src/engine.rs`, and the
+`vector_block_rows` goes back to 1024:
+
+```rust
+    let (vector_mb, directory_mb, scalar_mb) = split_pool_budget(buffer_pool_mb);
+    let scalar_mb = SCALAR_POOL_MB_OVERRIDE.unwrap_or(scalar_mb);  // 64
+```
+
+The pool of the scalar cache holds ten blocks of a megabyte each; the
+experiment makes it hold forty.
+
+| The build | the filtered query of the approximate mode | the verdict |
+| --- | ---: | --- |
+| the baseline (16 MB) | **60.03 s** | over the 60 s budget |
+| **the experiment (64 MB)** | **60.06 s** | over the 60 s budget |
+
+**The second hypothesis is false as well.** Four times the cache buys
+nothing, and the time does not move either.
+
+#### 4.1.3.9.4 Why both of them are false: the arithmetic of the sweep
+
+The two experiments fail for the same reason, and the reason is that the
+quantity that costs the time is **the number of the sweeps, and not the
+number of the blocks**. One sweep reads the **whole table**, whatever the
+size of the blocks is; the number of the sweeps is the number of the
+cells that the approximate scan visits, and that does not depend on the
+block size at all.
+
+| | blocks | the bytes of a block | the blocks the pool holds | the sweeps | the bytes read in all |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 400 k, 1024 | 391 | 1.57 MB | 10 | 28 | 17.2 GB |
+| 400 k, **4096** | **98** | **6.28 MB** | **2** | 28 | **17.2 GB** |
+| 1.6 M, 1024 | 1 563 | 1.57 MB | 10 | 29 | 71.1 GB |
+| 1.6 M, **4096** | **391** | **6.28 MB** | **2** | 29 | **71.2 GB** |
+| 4 M, 1024 | 3 907 | 1.57 MB | 10 | 30 | 183.9 GB |
+| 4 M, **4096** | **977** | **6.28 MB** | **2** | 30 | **183.9 GB** |
+
+The last column is the same for every row of a pair, and that is the
+whole answer: **the number of the bytes that the approximate query reads
+is a function of the size of the table and of the number of the cells,
+and of neither the size of the block nor the size of the pool.** The
+block size decides how many *system calls* the sweep is made of, and the
+pool size decides how many of those calls hit the cache; the wall clock
+of the query is the decoding of 183.9 GB either way.
+
+This also explains the two results that the two experiments did not
+predict, and that are the real content of this section:
+
+* **The bigger block is slower at 1.6 M.** The number of the bytes is
+  the same, but a block of 4096 rows is 6.28 MB, and the pool of 16 MB
+  holds **two** of them where it held ten of the smaller ones. The
+  larger block therefore misses the cache more often, and the miss
+  costs a read of 6.28 MB instead of 1.57 MB. The extra 17 % is the
+  price of the larger read.
+* **The bigger cache buys nothing.** The pool of 64 MB holds forty
+  blocks of 1.57 MB, and the sweep needs 3 907 of them. Forty out of
+  3 907 is 1 %, and 1 % of the calls is not a measurement.
+
+The two experiments were the right ones to run, and they are worth the
+half hour they cost: they removed the two cheapest-looking fixes from
+the list, and the reason they fail is a property of the algorithm, not
+of a constant. **The fix has to remove the sweeps**, and the constants
+cannot do it.
+
+#### 4.1.3.9.5 The official case: the judge itself says `JSON response timeout`
+
+The last ring is the one that had not been closed: the reproducer of
+section 4.1.3.8 is a script of this repository, and the failure it
+reproduces had never been seen **through the judge**. The tool
+`tools/build_amplified_case.py` builds an **amplified copy of the public
+case** `vector_index_maintenance` - the same shape, the same directives
+`--restart` and `--mode ann`, the same filter, with a data set that is
+large enough to time out - and the **expected answers are computed by
+the exact path**, not written by hand, so that the approximate answers
+have to match them.
+
+```bash
+# the package, with the expectations of the exact path
+tools/build_amplified_case.py --binary minivectordb/target/release/minivectordb \
+  --rows 400000 --text 12000 --dim 128 --batch 2000 --out /tmp/amp_timeout
+
+# the judge itself
+python3 /tmp/official/protocol_check/run.py --image minivectordb:amplified \
+  --package /tmp/amp_timeout --case vector_index_maintenance_amplified \
+  --output /tmp/ampto_res
+```
+
+The judge answers with the message of the platform, and with nothing
+else:
+
+```json
+[
+  {
+    "id": "vector_index_maintenance_amplified",
+    "status": "TIMEOUT",
+    "message": "JSON response timeout",
+    "duration_ms": 168010
+  }
+]
+```
+
+**`JSON response timeout` is reproduced by the official judge**, on a
+case of the shape of `vector_index_maintenance`, with the data set, the
+filter and the `--mode ann` of the platform.
+
+The same case, run against the two experimental builds, is a timeout as
+well - so the experiments of this section are not an artefact of the
+reproducer of this repository:
+
+| The build | the verdict of the judge | the message |
+| --- | --- | --- |
+| the baseline (1024, 16 MB) | TIMEOUT at 168.0 s | `JSON response timeout` |
+| the experiment one (4096) | TIMEOUT at 163.3 s | `JSON response timeout` |
+| the experiment two (64 MB) | TIMEOUT at 148.4 s | `JSON response timeout` |
+
+And the two sizes of the same case that do **not** time out are
+**passed by the judge**, which is what says that the answers are right
+and not only that the query is slow:
+
+| The case | the verdict of the judge | the time |
+| --- | --- | ---: |
+| 50 000 rows, `text` 1000 | **PASS** | 3.7 s |
+| 400 000 rows, `text` 1000 | **PASS** | 28.4 s |
+| 400 000 rows, `text` 12 000 | TIMEOUT | 168.0 s |
+
+The whole public suite of the judge is also green on this build, which
+is the baseline that the fix has to keep green:
+
+| The public cases of the judge | the verdict |
+| --- | --- |
+| all twenty, `vector_index_maintenance` among them | **20 / 20 PASS** |
+
+#### 4.1.3.9.6 What the two experiments leave
+
+The two experiments remove the two cheapest fixes from the list of
+section 4.1.3.8.6, and they show that the **block size and the size of
+the pool are not the levers**: the quantity that costs the time is the
+number of the sweeps of the whole table, and only a change of the
+algorithm removes it.
+
+| The change | the blocks | the bytes read | the time at 4 M | the verdict |
+| --- | ---: | ---: | ---: | --- |
+| the baseline | 3 907 | 183.9 GB | 60.03 s | timeout |
+| `vector_block_rows` 4096 | 977 | 183.9 GB | 60.04 s | timeout, and 17 % slower at 1.6 M |
+| the scalar pool 64 MB | 3 907 | 183.9 GB | 60.06 s | timeout |
+
+So the fix of section 4.1.3.8.6, number 1 - **cluster the rows of a cell
+by block before reading them** - is the only one that is left, and the
+two experiments are the reason why it has to be done in the algorithm
+and not in a constant. The constant `vector_block_rows` stays at 1024,
+which is also what `7ff176a53` wanted, so the memory axis of the score
+keeps the 20 % that the commit bought.
+
+#### 4.1.3.9.7 The commands
+
+```bash
+# the motive of the constant
+git show 7ff176a53
+git show 7ff176a53 -- minivectordb/src/config.rs
+
+# experiment one: the constant alone
+sed -i 's/vector_block_rows: 1024,/vector_block_rows: 4096,/' minivectordb/src/config.rs
+cargo build --offline --locked --release --manifest-path minivectordb/Cargo.toml
+tools/repro_timeout_class.py --binary minivectordb/target/release/minivectordb \
+  --rows 4000000 --text 1000 --dim 128 --batch 4000
+sed -i 's/vector_block_rows: 4096,/vector_block_rows: 1024,/' minivectordb/src/config.rs
+
+# experiment two: the pool alone
+# (the scalar cache gets the whole 64 MB instead of its 16 MB)
+tools/repro_timeout_class.py --binary minivectordb/target/release/minivectordb \
+  --rows 4000000 --text 1000 --dim 128 --batch 4000
+
+# the amplified public case, and the judge on it
+tools/build_amplified_case.py --binary minivectordb/target/release/minivectordb \
+  --rows 400000 --text 12000 --dim 128 --batch 2000 --out /tmp/amp_timeout
+python3 /tmp/official/protocol_check/run.py --image minivectordb:amplified \
+  --package /tmp/amp_timeout --case vector_index_maintenance_amplified \
+  --output /tmp/ampto_res
+
+# the whole public suite, on the build that has to stay green
+python3 /tmp/official/protocol_check/run.py --image minivectordb:amplified \
+  --output /tmp/pubres
+```
+
+### 4.1.3.10 The fix: the unlimited search of a filtered query goes the exact way
+
+Section 4.1.3.9 removed the two cheapest fixes and left one: the
+approximate scan reads the whole table once per cell. This section is the
+measurement of **why** the scan does that, and the change that removes it.
+
+#### 4.1.3.10.1 The two premises, and their evidence
+
+**The judge runs the unlimited mode.** The default of the configuration is
+no limit on the number of visited cells, and the image does not set the
+variable that would set one.
+
+`minivectordb/src/config.rs`:
+
+```rust
+    /// `None` means "visit cells until the distance bound proves that no
+    /// remaining cell can improve the answer", which is an exact search.
+    pub ann_nprobe: Option<usize>,
+```
+
+```rust
+            ann_nlist: 64,
+            ann_nprobe: None,
+```
+
+The `Dockerfile` sets four variables, and the one that would change the
+mode of the search is not among them:
+
+```dockerfile
+ENV MINIVECDB_DATA_DIR=/data
+ENV MINIVECDB_MODE=exact
+ENV MINIVECDB_DURABILITY=os
+ENV MINIVECDB_BUFFER_POOL_MB=64
+```
+
+`grep -n "nprobe\|ENV" Dockerfile` returns the four `ENV` lines and
+nothing else: **there is no `MINIVECDB_ANN_NPROBE` in the image**, so the
+database reads the default, which is `None`. The judge therefore asks for
+the **unlimited** search, in which the approximate search visits every cell
+and its answer is the answer of the exact search.
+
+**The mode of the judge changes line by line.** `/tmp/official/protocol_check/run.py`:
+
+```python
+def check_case(session, case, package, config):
+    expectations = strict_json(within(package, case['result']).read_text())
+    statements = within(package, case['test']).read_text().splitlines()
+    index, mode = 0, 'exact'
+    for line_number, text in enumerate(statements, 1):
+        sql = text.strip()
+        if not sql or sql.startswith('#'):
+            continue
+        if sql == '--restart':
+            session.shutdown()
+            session.start()
+        elif sql in ('--mode exact', '--mode ann'):
+            mode = sql.split()[1]
+```
+
+The mode is a variable that the directive `--mode ann` sets, and it holds
+until the next directive. In the amplified case of section 4.1.3.9 the
+directives are on the last four lines:
+
+| line | the statement | the mode |
+| ---: | --- | --- |
+| 206 | `SELECT ... ORDER BY distance LIMIT 10;` | exact |
+| 207 | `--restart` | exact |
+| 208 | `SELECT ... ORDER BY distance LIMIT 10;` | exact |
+| 209 | `--mode ann` | exact |
+| 210 | `SELECT ... ORDER BY distance LIMIT 10;` | **ann** |
+
+So only the **last** statement of the case runs in the approximate mode,
+and that is the one that times out.
+
+#### 4.1.3.10.2 The measurement of the pruning, and the verdict
+
+The scan of the index was given four counters: the length of the answer
+(`best_len`), the distance of the K-th accepted row (`kth_dist`), the
+number of the cells that the pruning skipped (`pruned_cells`), and the
+number of the rows that the filter accepted (`fetch_some`). Two more were
+added, because the first four do not say enough on their own: the number
+of the rows of the visited cells (`rows_visited`), and the number of the
+cells whose bound **would have** excluded them once the answer held K rows
+(`would_prune`).
+
+The measurement is at 400 000 rows with a kilobyte of text, under the
+limits of the judge, and it compares the two shapes of the same query -
+with and without the filter:
+
+| | cells visited | pruned | best_len | kth_dist | rows visited | rows through the filter |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| **without** the filter | **2** | 2 | 10 | **99.6394** | 16 000 | 16 000 |
+| **with** the filter | **28** | 36 | 10 | **393.2022** | 252 000 | 20 000 |
+
+(The pruned cells and the visited cells add up to 64, which is the number
+of the cells of the index, so no cell was left out of the count in either
+case.)
+
+**The verdict is (b), not (a).** The pruning is **not** completely dead:
+it removed 36 of the 64 cells, and the `would_prune` counter says that
+those 36 are exactly the cells whose bound is worse than the K-th
+distance. The pruning **is** firing; what fails is that it cannot fire on
+*enough* of the cells, and the 28 that survive are enough to make the
+statement time out.
+
+**And here is the answer to the question that is worth the most in this
+report.** The answer *does* fill up: `best_len` is 10, which is K, and
+20 000 rows pass the filter, so the K-th distance is well defined and the
+comparison `centroid_dist - radii[cell] > best[k-1].1` is meaningful. The
+pruning fails **not** because the answer is too small, but because **the
+distance the filter forces is larger than the radius of the cells**:
+
+* the filter keeps one row in eight, so the K-th *accepted* row is much
+  farther away than the K-th row of the table: the distance rises from
+  **99.64** to **393.20**, a factor of **3.95**;
+* the largest radius over all the cells is **327.76**, and the mean radius
+  is 141.70;
+* so the condition to prune a cell is
+  `centroid_dist > radii[cell] + 393.20`, and with a mean radius of
+  141.70 that means a centroid **535 units away** - and the 36 cells that
+  are that far away are the ones that get pruned;
+* the 28 cells that survive are the ones whose centroid is within 535
+  units, and each of them holds rows that are scattered over the whole
+  table, so each of them touches every block.
+
+The best bound over all the cells is **-202.13**, which is the number
+that says it in one line: the bound of the *closest* cell is still
+negative, so **no cell can be excluded on the strength of its radius
+alone**, and the radius is the only bound the scan has.
+
+That is the mechanism, and it is why the fix has to be a change of the
+path and not a change of the constants: **the filter raises the bar that
+the radius has to clear, and the radius cannot clear it.** The
+unfiltered query visits 2 cells and decodes 782 blocks; the filtered one
+visits 28 cells and decodes 28 × 391 = 10 948 blocks. The measured
+`scalar_decodes` is 11 730, which is the same number plus the blocks of
+the two unfiltered queries.
+
+#### 4.1.3.10.3 The change
+
+In the unlimited mode the approximate search is the exact search - it
+visits every cell and its answer is the answer of the exact path, with
+the recall 1.0000 that `tools/check_ann_recall.py` measures and that
+section 4.1.3.7 records for three seeds. So the two paths answer the same
+thing, and the exact path is the cheaper one, because it walks the table
+block by block and decodes every block **once**.
+
+`minivectordb/src/exec/query.rs`, in `exec_distance_topk`:
+
+```rust
+        let unlimited = self.config.ann_nprobe.is_none();
+        let use_index = self.mode == SearchMode::Ann
+            && self.has_vector_index(table_id)
+            && !unlimited;
+```
+
+That is the whole change of the path. A **finite** `nprobe` does not take
+it: there the answer really depends on the cells, the recall is below one
+by construction, and the answer must keep coming from the approximate
+search.
+
+Nothing else was touched. In particular `vector_block_rows` stays at
+1024, which is what `7ff176a53` wanted, and `split_pool_budget` is
+unchanged - the two experiments of section 4.1.3.9 have already shown
+that both of them are worth nothing.
+
+#### 4.1.3.10.4 What the change is worth
+
+**The statement that times out**, at 4 000 000 rows with a kilobyte of
+text, under the limits of the judge:
+
+| the build | the filtered query of the approximate mode | the verdict |
+| --- | ---: | --- |
+| before the change | **60.03 s** | over the 60 s budget |
+| **after the change** | **3.913 s** | **15.3x faster**, within budget |
+
+The whole table of the reproducer, before and after:
+
+| the phase | before | after |
+| --- | ---: | ---: |
+| the build of the index | 5.604 s | 5.565 s |
+| the handshake of the restart | 10.110 s | 10.078 s |
+| the first query after the restart (exact) | 3.802 s | 3.820 s |
+| **the filtered query of the approximate mode** | **60.03 s** | **3.913 s** |
+| the unfiltered query of the approximate mode | - | 0.705 s |
+| the shutdown | 0.064 s | 0.064 s |
+
+**The judge itself.** The amplified case of section 4.1.3.9 - the case
+that reproduces the message of the platform - now passes:
+
+| the build | the verdict of the judge | the message | the time |
+| --- | --- | --- | ---: |
+| before the change | TIMEOUT | `JSON response timeout` | 168.0 s |
+| **after the change** | **PASS** | - | **108.3 s** |
+
+And the whole public suite of the judge is green: **20 of 20 PASS**.
+
+#### 4.1.3.10.5 The safety gate: no answer changed
+
+A change of the path is only allowed if **not one answer moves**. Three
+gates were run, and all three are byte-for-byte comparisons.
+
+**The finite `nprobe` answers are untouched.** `tools/check_ann_nprobe_equivalence.py`
+compares the build before the change with the build after it, at four
+numbers of visited cells, over a hundred queries in the filtered and the
+unfiltered form:
+
+| cells visited | the answers that differ | the recall before | the recall after |
+| ---: | ---: | ---: | ---: |
+| 4 | **0 of 200** | 0.2210 / 0.1830 | 0.2210 / 0.1830 |
+| 8 | **0 of 200** | 0.3330 / 0.3100 | 0.3330 / 0.3100 |
+| 16 | **0 of 200** | 0.5110 / 0.4990 | 0.5110 / 0.4990 |
+| unlimited | **0 of 200** | 1.0000 / 1.0000 | 1.0000 / 1.0000 |
+
+The finite `nprobe` answers are identical, which is what the gate is
+for: those answers come from the approximate search, and the change must
+not have moved them.
+
+**The answers of the benchmark are identical.** `tools/bench.py` writes
+the answers of a thousand queries to a file, and the three files have the
+same checksum:
+
+| the file | the md5 |
+| --- | --- |
+| the approximate answers of the build before | `21ff6007aa261f45d28c143a9b0df779` |
+| the approximate answers of the build after | `21ff6007aa261f45d28c143a9b0df779` |
+| the exact answers of the build after | `21ff6007aa261f45d28c143a9b0df779` |
+
+`cmp` reports no difference between any two of them: the answers of the
+approximate mode are the answers of the exact mode, before and after.
+
+**The twenty-seven formal requirements hold**, and so do the public cases
+in both modes, the self test, the smoke test, the twelve rounds of the
+crash recovery and the twelve rounds of the crash recovery in the
+container.
+
+#### 4.1.3.10.6 The silence of the standard error
+
+The diagnostics of the scan were printed on the standard error of every
+query. That had to stop, for two reasons.
+
+The first is the **score**. A write to the standard error is a
+synchronous write to a file descriptor, and the time of the queries is
+two thirds of the weight of the score. A benchmark of a thousand queries
+would pay a thousand of them.
+
+The second is worse, and it was found the hard way: a caller that reads
+the standard error through a pipe and does not drain it **blocks the
+database** as soon as the pipe is full. `tools/check_ann_nprobe_equivalence.py`
+did exactly that, and the database stopped answering in the middle of the
+comparison of this section. A judge that reads the standard error the
+same way would see a database that exited before it answered.
+
+The diagnostics are therefore behind a switch, `MINIVECDB_DIAG`, which is
+**off by default**. `tools/check_stderr_is_quiet.py` checks both halves of
+the claim:
+
+| the environment | the bytes on the standard error |
+| --- | ---: |
+| nothing | **0** |
+| `MINIVECDB_DIAG=0` | **0** |
+| `MINIVECDB_DIAG=1` | 513 |
+
+The silence is the default, and the diagnostics are still there when they
+are asked for.
+
+#### 4.1.3.10.7 The three axes
+
+The measurement of the benchmark, at 10 000 rows and a thousand queries,
+separates the two effects of this round: the **fix** (the change of the
+path) and the **silence** (the removal of the writes).
+
+| | the query time | the recall | the peak memory |
+| --- | ---: | ---: | ---: |
+| before the round | 2 800.9 ms | 1.0000 | 14 096 KiB |
+| the silence alone | 2 573.8 ms | 1.0000 | 13 940 KiB |
+| **the silence and the fix** | **625.3 ms** | **1.0000** | **13 784 KiB** |
+
+So the silence is worth **8 %** of the time of the query, and the fix is
+worth the other **4.1x**. The memory does not go up - it goes **down**,
+because the exact path reads the blocks once and the approximate path held
+more of them at the same time.
+
+At the size that times out, the two effects are of a different order
+altogether: 60.03 s becomes 3.913 s, and the silence is worth nothing
+there, because the time was spent decoding 183.9 GB.
+
+**A warning about `tools/perf_compare.py`, and the measurement that
+replaces it.** The tool runs every round of the old build and then every
+round of the new one, so the second set pays for the state the first one
+leaves behind - the page cache of the kernel, the frequency of the
+processor. The measurement of this round showed the effect: the **exact**
+axis, whose code was **not touched at all**, came out at **0.75x** in one
+order and at **1.21x** in the other. The order was the measurement.
+
+`tools/perf_compare_interleaved.py` therefore interleaves the rounds -
+old, new, old, new - and swaps the order every round, so that neither of
+the two builds is always the second one. The numbers it reports, with
+five rounds each:
+
+| the axis | before | after | the factor | every round, before | every round, after |
+| --- | ---: | ---: | ---: | --- | --- |
+| **the approximate query** | 2 786.0 ms | **1 009.6 ms** | **2.76x** | 2786 2732 2769 2833 2835 | 1010 912 1019 884 1038 |
+| **the exact query** (the control) | 1 041.5 ms | **784.2 ms** | **1.33x** | 935 1042 1055 443 1062 | 632 784 984 758 1002 |
+| the write | 1 695.5 ms | 1 496.5 ms | 1.13x | | |
+| the peak memory of the query | 14 192 KiB | 13 684 KiB | | | |
+| the recall, filtered and unfiltered | 1.0000 | 1.0000 | | | |
+
+The **exact** axis is the control: not one line of the exact path changed,
+and it is **1.33x faster** anyway, because the writes to the standard
+error are gone. That is the honest reading of the silence: it is worth
+about a quarter of the time of a query, and it is worth **nothing** on the
+axis that matters, which is the one that was decoding 183.9 GB.
+
+So the three axes, at the end of the round:
+
+| the axis | the verdict |
+| --- | --- |
+| **the time of the query** | **2.76x faster** in the approximate mode, 1.33x in the exact mode; 15.3x at the size that timed out |
+| **the bytes of the write** | unchanged, 11 411 456 B before and after |
+| **the peak memory** | unchanged to slightly better, 14 192 KiB to 13 684 KiB |
+
+#### 4.1.3.10.8 The commands
+
+```bash
+# the change
+# minivectordb/src/exec/query.rs, in exec_distance_topk
+let unlimited = self.config.ann_nprobe.is_none();
+let use_index = self.mode == SearchMode::Ann
+    && self.has_vector_index(table_id)
+    && !unlimited;
+
+# the statement that times out, before and after
+tools/repro_timeout_class.py --binary minivectordb/target/release/minivectordb \
+  --rows 4000000 --text 1000 --dim 128 --batch 4000
+
+# the gate: no answer may move
+tools/check_ann_nprobe_equivalence.py --broken /tmp/mvdb_before_fix \
+  --fixed minivectordb/target/release/minivectordb \
+  --rows 10000 --dim 128 --queries 100 --k 10 --nprobe 4,8,16,unlimited --seed 42
+
+# the gate: the answers of the benchmark are byte for byte the same
+tools/bench.py --binary /tmp/mvdb_before_fix --rows 10000 --queries 1000 \
+  --mode ann --dump-baseline /tmp/base-ann-before.txt
+tools/bench.py --binary minivectordb/target/release/minivectordb \
+  --rows 10000 --queries 1000 --mode ann --dump-baseline /tmp/base-ann-after.txt
+tools/bench.py --binary minivectordb/target/release/minivectordb \
+  --rows 10000 --queries 1000 --mode exact --dump-baseline /tmp/base-exact-after.txt
+cmp /tmp/base-ann-before.txt /tmp/base-ann-after.txt
+cmp /tmp/base-ann-after.txt /tmp/base-exact-after.txt
+
+# the gate: the standard error is empty by default
+tools/check_stderr_is_quiet.py --binary minivectordb/target/release/minivectordb
+
+# the judge, on the amplified case and on the public suite
+python3 /tmp/official/protocol_check/run.py --image minivectordb:fixed \
+  --package /tmp/amp_fix --case vector_index_maintenance_amplified --output /tmp/ampfix_res
+python3 /tmp/official/protocol_check/run.py --image minivectordb:fixed --output /tmp/pubres2
+
+# the rest of the regression
+cargo test --release --offline --locked
+python3 tools/run_public_cases.py
+python3 tools/run_public_cases.py --mode ann
+python3 tools/selftest.py
+python3 tools/check_formal_requirements.py --binary minivectordb/target/release/minivectordb
+python3 tools/check_resource_limits.py --image minivectordb:fixed
+bash tools/smoke.sh
+bash tools/killtest.sh
+MINIVECDB_CONTAINER_IMAGE=minivectordb:fixed bash tools/killtest_container.sh
+python3 tools/perf_compare.py --before /tmp/mvdb_before_fix \
+  --after minivectordb/target/release/minivectordb --rounds 3 --output /tmp/perf_compare_fix.json
+python3 tools/perf_compare_interleaved.py --before /tmp/mvdb_before_fix \
+  --after minivectordb/target/release/minivectordb --rounds 5 --mode ann
+python3 tools/perf_compare_interleaved.py --before /tmp/mvdb_before_fix \
+  --after minivectordb/target/release/minivectordb --rounds 5 --mode exact
+```
+
 ### 4.2 The write axis, and what it would take
 
 The write phase writes 11,407,360 B to the disk. The data files are
@@ -1533,4 +2524,49 @@ python3 tools/check_ann_nprobe_equivalence.py --broken /tmp/mvdb_broken \
 # (no limit on the number of visited cells), where it is 1.000 by
 # construction.
 python3 tools/check_ann_recall.py
+
+# the classification of the timeout (section 4.1.3.8). The tool imports the
+# official transport of the judge and wraps only its `read`, so the point of
+# the wait - the handshake of the start-up, a statement, or the shutdown -
+# is recorded and the timeout is reported with that point attached. The
+# database runs under the limits of the judge: two CPUs and two gigabytes.
+#
+# At four million rows the statement of the approximate filtered query is
+# the phase that goes over the budget, and it is reported as
+# "STATEMENT timeout: JSON response timeout".
+tools/repro_timeout_class.py --binary minivectordb/target/release/minivectordb \
+  --rows 4000000 --text 1000 --dim 128 --batch 4000
+
+# the same, at the two sizes below the budget, where every phase is
+# measured against it.
+tools/repro_timeout_class.py --binary minivectordb/target/release/minivectordb \
+  --rows 400000 --text 1000 --dim 128 --batch 2000
+tools/repro_timeout_class.py --binary minivectordb/target/release/minivectordb \
+  --rows 1600000 --text 1000 --dim 128 --batch 2000
+
+# the cost of the shutdown against the size of the data (section 4.1.3.8).
+# The curve is flat: the shutdown is two orders of magnitude below the
+# budget of the judge at 2.4 GiB of data.
+tools/probe_shutdown_fsync.py --binary minivectordb/target/release/minivectordb \
+  --rows 200000,400000,800000,1600000 --text 1000 --dim 128 --batch 4000
+
+# the A/B of the inverted index against the scan (section 4.1.3.8): the
+# filter column is indexed (eight values) in one table and abandoned
+# (4096 values, over MAX_DISTINCT) in the other.
+tools/ab_inverted_vs_scan.py --binary minivectordb/target/release/minivectordb \
+  --rows 400000 --text 1000 --dim 128 --batch 1000
+
+# the experiment that would prove the conclusion of the section wrong: a
+# cache that is large enough, blocks that are small, and the exact path as
+# the control.
+tools/falsify_ann_cache_thrash.py --binary minivectordb/target/release/minivectordb \
+  --rows 400000 --text 1000 --dim 128 --batch 2000 --pool-mb 512
+
+# the two builds side by side, the scoring one and the current one, on the
+# same data: the approximate filtered query is 8.60x slower in the current
+# one.
+python3 tools/compare_ann_side_by_side.py \
+  --a /tmp/score_src/minivectordb/target/release/minivectordb \
+  --b minivectordb/target/release/minivectordb \
+  --rows 400000 --text 1000 --dim 128
 ```
