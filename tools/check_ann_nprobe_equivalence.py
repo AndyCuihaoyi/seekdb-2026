@@ -62,20 +62,28 @@ def start(binary, data_dir, nprobe):
         env["MINIVECDB_ANN_NPROBE"] = str(nprobe)
     else:
         env.pop("MINIVECDB_ANN_NPROBE", None)
+    # The standard error is a file, not a pipe.
+    #
+    # A pipe would fill up: the database writes its diagnostics to the
+    # standard error, and a reader that does not drain it - which is what
+    # this script used to do - blocks the database as soon as the pipe is
+    # full, and the database stops answering. A file has no such limit, so
+    # the diagnostics of a build that prints them cannot break the
+    # comparison.
+    log = open(os.path.join(os.path.dirname(data_dir.rstrip("/")), "stderr.log"), "w")
     proc = subprocess.Popen(
         [binary, "--data-dir", data_dir],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=log,
         env=env,
         text=True,
         bufsize=1,
     )
     ready = proc.stdout.readline()
     if not ready:
-        raise RuntimeError(
-            "the database closed its output: %s" % proc.stderr.read()[-1500:]
-        )
+        proc.wait(timeout=30)
+        raise RuntimeError("the database closed its output")
     return proc
 
 
@@ -88,7 +96,7 @@ def run(proc, sql, mode="exact", timeout=120.0):
         raise RuntimeError("the database did not answer %r" % sql)
     line = proc.stdout.readline()
     if not line:
-        raise RuntimeError("the database exited: %s" % proc.stderr.read()[-1500:])
+        raise RuntimeError("the database exited before it answered")
     return json.loads(line)
 
 

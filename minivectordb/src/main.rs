@@ -9,6 +9,7 @@
 
 mod catalog;
 mod config;
+mod diag;
 mod engine;
 mod error;
 mod exec;
