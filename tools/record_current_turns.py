@@ -34,16 +34,41 @@ RECORD = os.path.expanduser(
 # fourth is the turn that the working session has not written yet: its
 # text is taken out of the message of the supervising session that
 # carries it.
+#
+# The turns of the round that fixed the timeout are the ones that make the
+# material and the code agree. They are named by a piece of their text:
+#
+# * `platform-fail-4` is the report of the platform about the commit
+#   `b19769271`, the one that failed with `JSON response timeout`;
+# * `localise-timeout` is the instruction to localise the failure;
+# * `prioritise-suspects` is the instruction to look at the suspects in
+#   the order of their likelihood;
+# * `experiments-ab` is the instruction to run the two decisive
+#   experiments, the block size and the cache size;
+# * `deliver-fix` is the instruction that opened the round of the fix;
+# * `supervise-close` is the question of the supervising session that
+#   found the gap between the material and the code.
 TURNS = (
     ("remeasure-axes", "有一项性能数据需要重测"),
     ("admission-gate", "# 任务：为提测做准入验证"),
-    ("platform-fail-3", "commit :13edf551327a4db55db45547fe79807a5c01db97"),
+    ("platform-fail-3", "Agent Prompt 原始分:正确性门槛未通过（失败用例数：1）。原因：JSON response timeout（未及时收到JSON响应，请检查换行、flush和程序阻塞） × 1。未执行Agent Prompt评测。"),
     ("fix-complexity", "# 任务：完成复杂度回归的修复收尾"),
+    ("platform-fail-4", "commit：b19769271ef0e54db9f5e49385dc37a9c804bb65还是没有通过"),
+    ("localise-timeout", "【本轮要交付的东西：一份定位报告，不是一个补丁】"),
+    ("prioritise-suspects", "按照怀疑的优先级进行排查和测试"),
+    ("experiments-ab", "先做一个 30 分钟的决定性实验"),
+    ("deliver-fix", "【本轮要交付的东西：一个可提测的修复 + 一份闭环的证据链】"),
+    ("supervise-close", "agent-transcripts/299dedb6-ef18-49d7-bff5-86e687e2d7f5/299dedb6-ef18-49d7-bff5-86e687e2d7f5.jsonl 问题似乎已经闭环"),
 )
 
 # The prompt that the supervising session wrote and the working session
 # has not received yet is inside a block of markdown in the message.
-RELAY = re.compile(r"````markdown\n(.*?)\n````", re.S)
+#
+# The fence of the block is three or four backticks, and the name of the
+# language is optional: the messages of the supervising session use both
+# forms, and the block is taken as it is, word for word, whichever form it
+# is written with.
+RELAY = re.compile(r"`{3,4}(?:markdown)?\n(.*?)\n`{3,4}", re.S)
 
 
 def read_events():

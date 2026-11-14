@@ -1859,10 +1859,20 @@ algorithm removes it.
 | `vector_block_rows` 4096 | 977 | 183.9 GB | 60.04 s | timeout, and 17 % slower at 1.6 M |
 | the scalar pool 64 MB | 3 907 | 183.9 GB | 60.06 s | timeout |
 
-So the fix of section 4.1.3.8.6, number 1 - **cluster the rows of a cell
-by block before reading them** - is the only one that is left, and the
-two experiments are the reason why it has to be done in the algorithm
-and not in a constant. The constant `vector_block_rows` stays at 1024,
+These two experiments rule out the two cheapest fixes, and that is what
+forces the fix to be made at the level of the algorithm: the two
+experiments of section 4.1.3.8.6, number 1 (**cluster the rows of a
+cell by block before reading them**) and number 2 (the size of the
+scalar pool), were both tried, and both of them were falsified by the
+measurements above.
+
+What the fix actually turned out to be is section 4.1.3.10: in the
+unlimited mode the approximate search is routed to the exact path, so
+the number of the sweeps of the whole table is no longer the number of
+the cells that survive the pruning. **After that change, clustering the
+rows of a cell by block is no longer required**: the finite nprobe
+search visits only `nprobe` cells, and the number of the sweeps falls
+from 28 to `nprobe`. The constant `vector_block_rows` stays at 1024,
 which is also what `7ff176a53` wanted, so the memory axis of the score
 keeps the 20 % that the commit bought.
 

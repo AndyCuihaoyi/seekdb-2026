@@ -244,8 +244,15 @@ TURN_MARKERS = {
     "supervise-oom": "上一次成功得分的commit为什么没有内存OOM问题",
     "remeasure-axes": "有一项性能数据需要重测",
     "admission-gate": "# 任务：为提测做准入验证",
-    "platform-fail-3": "commit :13edf551327a4db55db45547fe79807a5c01db97",
+    "platform-fail-3": "反馈：\ncommit :13edf551327a4db55db45547fe79807a5c01db97",
     "fix-complexity": "# 任务：完成复杂度回归的修复收尾",
+    # The round that localised the timeout of the platform and fixed it.
+    "platform-fail-4": "commit：b19769271ef0e54db9f5e49385dc37a9c804bb65还是没有通过",
+    "localise-timeout": "【本轮要交付的东西：一份定位报告，不是一个补丁】",
+    "prioritise-suspects": "按照怀疑的优先级进行排查和测试",
+    "experiments-ab": "先做一个 30 分钟的决定性实验",
+    "deliver-fix": "【本轮要交付的东西：一个可提测的修复 + 一份闭环的证据链】",
+    "supervise-close": "agent-transcripts/299dedb6-ef18-49d7-bff5-86e687e2d7f5/299dedb6-ef18-49d7-bff5-86e687e2d7f5.jsonl 问题似乎已经闭环",
 }
 
 # The turns that the record may be without. A turn of this list is not the
@@ -376,6 +383,12 @@ PROMPT_DAYS = {
     "admission-gate": "2026-11-13T10:55:00+08:00",
     "platform-fail-3": "2026-11-13T11:50:00+08:00",
     "fix-complexity": "2026-11-13T12:55:00+08:00",
+    "platform-fail-4": "2026-11-13T18:52:00+08:00",
+    "localise-timeout": "2026-11-13T19:36:00+08:00",
+    "prioritise-suspects": "2026-11-13T20:14:00+08:00",
+    "experiments-ab": "2026-11-13T21:02:00+08:00",
+    "deliver-fix": "2026-11-14T09:40:00+08:00",
+    "supervise-close": "2026-11-14T13:41:00+08:00",
 }
 
 # What the prompt shows, in one line. The text is what the student wrote;
@@ -435,6 +448,20 @@ PROMPT_NOTES = {
     "fix-complexity": "指出这一轮的取舍：宁可让 E 损失 0.005 分，"
                       "也不能冒着被一票否决的风险；"
                       "并要求在拿到三格对比数据之前不得提交。",
+    "platform-fail-4": "第四次准入失败：`JSON response timeout`。"
+                       "要求先做完整调查、阅读官方测试门槛要求、检查 corner cases，"
+                       "而不是直接改代码。",
+    "localise-timeout": "要求先把「超时」这个二义词消掉："
+                        "写一个能区分握手 / 语句 / 关闭三种超时的复现器，"
+                        "先定位再谈修法。",
+    "prioritise-suspects": "要求按怀疑的优先级排查，"
+                           "锁定问题后在保证准入门槛的前提下修改与优化。",
+    "experiments-ab": "指定两个各只改一个常量的决定性实验，"
+                      "并要求用真正的 case 文件、官方判题器本身来验证。",
+    "deliver-fix": "根因锁定之后，本轮只做修复、回归与提测，"
+                   "要求把结论写进 ledger 并给出闭环的证据链。",
+    "supervise-close": "回头核对材料与代码是否对齐："
+                       "根因锁定了没有，下一步怎么解决。",
 }
 
 # The prompt that only carries the instruction to implement a plan. It
@@ -508,12 +535,21 @@ def build_prompts(turns, index_of):
         seen_text.add(text)
         index = len(out)
         index_of_turn[turn_index] = index
+        content = keep(text, PROMPT_LIMITS.get(marker, MAX_PROMPT_CHARS))
+        # The text of the student that the material keeps, without the
+        # marker of the cut: the marker is a note of the material and not
+        # a word of the student, so no excerpt of evidence carries it.
+        kept = content.split(CUT_MARKER)[0]
         prompt = {
             "id": "up-%02d" % (index + 1),
             "time": PROMPT_DAYS.get(marker, "2026-11-10T14:23:00+08:00"),
-            "content": keep(text, PROMPT_LIMITS.get(marker, MAX_PROMPT_CHARS)),
+            "content": content,
             "source": "student",
-            "excerpt": excerpt_of(text),
+            # The excerpt is a verbatim part of the text of the student,
+            # and it is taken out of the text that the material keeps, so
+            # that the reviewer can locate it in the prompt in front of
+            # them and not only in the record.
+            "excerpt": excerpt_of(kept),
         }
         note = PROMPT_NOTES.get(marker)
         if note:
@@ -542,11 +578,35 @@ def build_prompts(turns, index_of):
 MAX_PROMPT_CHARS = 3200
 
 PROMPT_LIMITS = {
-    # The excerpt of the instance of this turn is at 1568.
-    "admission-gate": 1620,
-    # The excerpt of the instance of this turn is at 4275.
-    "fix-complexity": 4310,
+    # The excerpt of the instance of this turn is at 301. The rest of the
+    # prompt is the detail of the three stages, and the detail is in the
+    # development record.
+    "localise-timeout": 302,
+    # The excerpt of the instance of this turn is at 152. The rest of the
+    # prompt is the table of the axes, which is in the development record.
+    "remeasure-axes": 154,
+    # The excerpt of the instance of this turn is at 130.
+    "platform-fail-3": 174,
+    # The excerpt of the instance of this turn is at 60. The rest of the
+    # prompt is the detail of the two experiments, and the detail is in
+    # the development record.
+    "experiments-ab": 182,
+    # The excerpt of the instance of this turn is at 125.
+    "seal-and-push": 126,
+    # The excerpt of the instance of this turn is at 178.
+    "platform-fail-2": 179,
+    # The excerpt of the instance of this turn is at 187.
+    "diff-against-scoring": 207,
+    # The excerpt of the instance of this turn is at 150.
+    "platform-feedback": 193,
+    # The excerpt of the instance of this turn is at 1417.
+    "admission-gate": 1419,
+    # The excerpt of the instance of this turn is at 490.
+    "fix-complexity": 491,
 }
+
+
+CUT_MARKER = "\n\n[… 该条消息的后续部分见开发记录 …]"
 
 
 def keep(text, limit=MAX_PROMPT_CHARS):
@@ -557,7 +617,7 @@ def keep(text, limit=MAX_PROMPT_CHARS):
     end = cut.rfind("\n")
     if end > 0:
         cut = cut[:end]
-    return cut + "\n\n[… 该条消息的后续部分见开发记录 …]"
+    return cut + CUT_MARKER
 
 
 def is_a_prompt(text):
@@ -623,7 +683,7 @@ CONVERSATIONS = [
         "dimension": "问题理解与自主拆解",
         "turns": [
             ("read-docs", "student", None, None, None),
-            ("read-docs", "agent", None, None, None),
+            ("read-docs", "agent", 0, 0, 700),
         ],
     },
     {
@@ -632,7 +692,7 @@ CONVERSATIONS = [
         "dimension": "独立验证与质疑",
         "turns": [
             ("docker-question", "student", None, None, None),
-            ("docker-question", "agent", 0, 0, 500),
+            ("docker-question", "agent", 0, 0, 350),
         ],
     },
     {
@@ -668,7 +728,7 @@ CONVERSATIONS = [
         "dimension": "问题理解与自主拆解",
         "turns": [
             ("inventory", "student", None, None, None),
-            ("inventory", "agent", 0, 0, 1100),
+            ("inventory", "agent", 0, 0, 700),
         ],
     },
     {
@@ -756,7 +816,7 @@ CONVERSATIONS = [
         "dimension": "独立验证与质疑",
         "turns": [
             ("hidden-cases", "student", None, None, None),
-            ("hidden-cases", "agent", 8, 0, 300),
+            ("hidden-cases", "agent", 8, 0, 220),
         ],
     },
     {
@@ -774,7 +834,7 @@ CONVERSATIONS = [
         "dimension": "技术理解与迁移",
         "turns": [
             ("supervise-oom", "student", None, None, None),
-            ("supervise-oom", "agent", 5, 0, 700),
+            ("supervise-oom", "agent", 5, 0, 500),
         ],
     },
     {
@@ -1297,16 +1357,14 @@ EXPERIMENTS = [
             "1. 哈希表每行约 28 字节，一百万行 34 MB；\n"
             "2. 而 ANN 索引里那份向量副本每行 552 字节，一百万行 **550 MB** —— "
             "是哈希表的 20 倍；\n"
-            "3. 更好的消息是 `row_id` 在本引擎中**始终稠密**"
+            "3. `row_id` 在本引擎中**始终稠密**"
             "（`next_row_id` = 已提交行数 + 暂存数），"
-            "所以根本不需要哈希表，稠密数组按 `row_id` 直接下标就行，"
-            "每行 8 字节，比哈希表还省 3.5 倍、免去哈希计算。\n"
+            "所以根本不需要哈希表：稠密数组按 `row_id` 直接下标，每行 8 字节，"
+            "比哈希表还省 3.5 倍、免去哈希计算。\n"
             "于是同一个问题的答案，因为先算了账而完全不同："
             "从「把哈希表换小」变成「让 ANN 索引不再持有向量副本」。\n"
-            "**同一套推理随后被迁移到另一个场景**："
-            "两百万行时内存撞上 2 GiB 限额，"
-            "第一反应也是「实现占内存太多」，"
-            "于是去看缓冲池与索引 —— 同样是往错的方向优化。"
+            "**同一套推理随后被迁移到另一个场景**：两百万行时内存撞上 2 GiB 限额，"
+            "第一反应也是「实现占内存太多」，于是去看缓冲池与索引 —— 同样是往错的方向优化。"
             "**「内存不够」和「谁在占内存」是两个问题**，"
             "这个区分在两个相隔很远的场景里各用了一次。"
         ),
@@ -2478,7 +2536,7 @@ EXPERIMENTS = [
         "dimension": "实验与反馈迭代",
         "hypothesis_author": "student",
         "student_turn": "admission-gate",
-        "student_excerpt": "任何一项不满足 → **立刻停止，不要提测**",
+        "student_excerpt": "判据（**不是「没崩」，是这三个字段**）",
         "hypothesis": (
             "准入失败过两次，而两次的本地检查都是全绿，"
             "所以问题不在「有没有检查」，"
@@ -2536,7 +2594,7 @@ EXPERIMENTS = [
         "dimension": "取舍与反思",
         "hypothesis_author": "student",
         "student_turn": "fix-complexity",
-        "student_excerpt": "准入是时间门槛，性能分是次要的",
+        "student_excerpt": "今天只剩 **1 次**正式提测额度",
         "hypothesis": (
             "这一轮要在两个方向里挑一个："
             "**降样本量**（更简单、内存更低、性能分可能更高），"
@@ -2574,6 +2632,155 @@ EXPERIMENTS = [
             "同一轮里还有第二个同性质的判断："
             "**在拿到三个镜像的对比数据之前不许提交**。"
             "两次都是在「急着要那一点分」和「先把门槛守住」之间选了后者。"
+        ),
+    },
+    {
+        "id": "e-53",
+        "name": "把平台的一句报错，交给官方判题器自己复现",
+        "dimension": "独立验证与质疑",
+        "hypothesis_author": "student",
+        "student_turn": "platform-fail-4",
+        "student_excerpt": "先做完整调查，阅读官方测试门槛要求，检查corner cases",
+        "hypothesis": (
+            "此前所有对超时的定位都是用自研脚本做的，平台的判题器从来没有被复现过；"
+            "所以「本地能过」不足以说明「平台会过」。"
+            "把公开用例 `vector_index_maintenance` 放大（同样的 `--mode ann`、"
+            "同样的 `--restart`、同样的过滤，只是数据变大），"
+            "交给**官方的 run.py + 官方的 _transport.py + 官方的 config.json** 跑，"
+            "平台的报错就应当能被逐字复现。"
+        ),
+        "command": (
+            "tools/build_amplified_case.py --binary minivectordb/target/release/minivectordb "
+            "--rows 400000 --text 12000 --dim 128 --batch 2000 --out /tmp/amp_timeout\n"
+            "python3 /tmp/official/protocol_check/run.py --image minivectordb:amplified "
+            "--package /tmp/amp_timeout --case vector_index_maintenance_amplified "
+            "--output /tmp/ampto_res"
+        ),
+        "result": (
+            "修复前：{\"id\": \"vector_index_maintenance_amplified\", \"status\": \"TIMEOUT\", "
+            "\"message\": \"JSON response timeout\", \"duration_ms\": 168010}\n"
+            "修复后：{\"id\": \"vector_index_maintenance_amplified\", \"status\": \"PASS\", "
+            "\"message\": \"\", \"duration_ms\": 108298}"
+        ),
+        "result_excerpt": (
+            "\"status\": \"TIMEOUT\", \"message\": \"JSON response timeout\", "
+            "\"duration_ms\": 168010}\n"
+            "修复后：{\"id\": \"vector_index_maintenance_amplified\", \"status\": \"PASS\", "
+            "\"message\": \"\", \"duration_ms\": 108298}"
+        ),
+        "interpretation": (
+            "这一条把「平台说超时」变成了一句可以自己验证的话。\n"
+            "**第一，它质疑的是自己之前的全部定位工作**："
+            "此前所有测量都出自自研脚本，判题器一次都没有被跑过，"
+            "于是「本地不超时」和「平台会过」之间没有任何证据链。\n"
+            "**第二，平台本身是被完整复用的**：判题器的 run.py、_transport.py、"
+            "config.json（60s 语句预算、120s 启动预算、600s 整例预算）"
+            "都是官方的那一份，所以超时抛在什么地方、抛的是什么字符串，都不是仿造的。\n"
+            "**第三，这个 case 检验的是正确性而不只是速度**："
+            "期望答案是用**精确路径**算出来的，不是手写的常量，"
+            "所以近似路径的答案必须自己对得上；修好了速度却算错了答案，一样会判 FAIL。\n"
+            "**第四，同一个 case、同一个判题器，修复前 TIMEOUT、修复后 PASS**——"
+            "这是本轮唯一的、端到端的、不含自研成分的验收。"
+        ),
+    },
+    {
+        "id": "e-54",
+        "name": "「超时」这两个字，先拆成三个可以分别测的阶段",
+        "dimension": "问题理解与自主拆解",
+        "hypothesis_author": "student",
+        "student_turn": "localise-timeout",
+        "student_excerpt": "造一个能区分三种超时的本地复现器",
+        "hypothesis": (
+            "平台只给了「JSON response timeout」这一句话，"
+            "而判题器源码里这个异常只在一个地方抛、那个地方被三处调用："
+            "握手、单条语句、shutdown。整例超时是另一条消息，进程死掉是第三条——"
+            "既然报的不是那两条，超时就必然发生在某一条具体语句上，只是不知道是哪一条。"
+            "那么先写一个复现器把三段分别测出来，再谈修什么。"
+        ),
+        "command": (
+            "python3 tools/repro_timeout_class.py "
+            "--binary minivectordb/target/release/minivectordb "
+            "--rows 4000000 --text 1000 --dim 128 --batch 4000"
+        ),
+        "result": (
+            "STARTUP（重启握手）  400k 0.999s / 1.6M 3.910s / 4M 10.110s，预算 120s，从不超时\n"
+            "SHUTDOWN             0.064s（曲线平坦），预算 60s，从不超时\n"
+            "STATEMENT（近似模式过滤 TopK）  7.780s / 34.126s / 60.03s，预算 60s，4M 时超时\n"
+            "STATEMENT（精确模式同查询）      0.337s / 1.429s / 3.980s，从不超时\n"
+            "复现器在 4M 行抛出 \"STATEMENT timeout: JSON response timeout\"（60.06s）"
+        ),
+        "result_excerpt": (
+            "STATEMENT（近似模式过滤 TopK）  7.780s / 34.126s / 60.03s，预算 60s，4M 时超时\n"
+            "STATEMENT（精确模式同查询）      0.337s / 1.429s / 3.980s，从不超时"
+        ),
+        "interpretation": (
+            "这一步把一句模糊的反馈变成了一张三个阶段的表，"
+            "而且它是**用判题器自己的代码测出来的**："
+            "复现器直接 import 官方的 _transport.py 的 Session，只在 read() 外面包一层，"
+            "把三处等待分别标记成 STARTUP / STATEMENT / SHUTDOWN，再按官方 config.json 的预算跑。\n"
+            "**结论是排他的**：只有 STATEMENT 超时，而且只有「近似模式 + 过滤」这一条语句；"
+            "同一张表还顺带排除了两种量级不同的可能——"
+            "4M 行时握手只要 10.1s（预算 120s），精确模式的同一条查询只要 3.98s（预算 60s）。\n"
+            "所以定位不是「数据库慢」，而是「**近似模式的过滤查询**慢」，"
+            "而精确模式的对照把变量的范围缩到了「近似路径 + 过滤」这一个交集上。"
+        ),
+    },
+    {
+        "id": "e-55",
+        "name": "两个最像样的修法都被自己的实验否掉了",
+        "dimension": "取舍与反思",
+        "hypothesis_author": "student",
+        "student_turn": "experiments-ab",
+        "student_excerpt": "先做一个 30 分钟的决定性实验：把 vector_block_rows 从 1024 改成 4096",
+        "hypothesis": (
+            "拿到根因方向之后，最像样的两个修法是「把块调大」和「把缓存调大」，"
+            "两者都是只动一个常量的单变量实验。"
+            "如果有一个有效，修复就只需要改一个常量加一次回归；"
+            "如果两个都无效，那就说明瓶颈不在常量上，而在算法的性质上。"
+        ),
+        "command": (
+            "# 实验一：只改一个常量\n"
+            "sed -i 's/vector_block_rows: 1024,/vector_block_rows: 4096,/' "
+            "minivectordb/src/config.rs\n"
+            "# 实验二：只改一行\n"
+            "# let scalar_mb = SCALAR_POOL_MB_OVERRIDE.unwrap_or(scalar_mb);  // 64"
+        ),
+        "result": (
+            "基线（1024 块 / 16MB 池）   4M 行 ANN 过滤  60.03 s   1.6M 行 34.13 s\n"
+            "实验一（4096 块）            4M 行             60.04 s   1.6M 行 39.85 s（+17%，更慢）\n"
+            "实验二（scalar 池 64MB）     4M 行             60.06 s\n"
+            "修复后（走精确路径）          4M 行              3.913 s\n"
+            "\n"
+            "400k/1024 : 391 块 × 1.57MB，池装 10 块，28 遍扫描，读 17.2 GB\n"
+            "400k/4096 :  98 块 × 6.28MB，池装  2 块，28 遍扫描，读 17.2 GB\n"
+            "4M/1024   : 3907 块 × 1.57MB，池装 10 块，30 遍扫描，读 183.9 GB\n"
+            "4M/4096   :  977 块 × 6.28MB，池装  2 块，30 遍扫描，读 183.9 GB"
+        ),
+        "result_excerpt": (
+            "400k/1024 : 391 块 × 1.57MB，池装 10 块，28 遍扫描，读 17.2 GB\n"
+            "400k/4096 :  98 块 × 6.28MB，池装  2 块，28 遍扫描，读 17.2 GB\n"
+            "4M/1024   : 3907 块 × 1.57MB，池装 10 块，30 遍扫描，读 183.9 GB\n"
+            "4M/4096   :  977 块 × 6.28MB，池装  2 块，30 遍扫描，读 183.9 GB"
+        ),
+        "interpretation": (
+            "两个实验都做了，**两个都无效**，而且无效的方式是可以算出来的。\n"
+            "看那张算术表的最后一列：**每一对的最后一列相同**。"
+            "决定耗时的是「对全表扫了几遍」，而遍数 = 近似扫描访问的 cell 数，"
+            "**与块大小和池大小都无关**——块变大只是让每次读到的字节变多、让缓存少装几块；"
+            "池变大只是让缓存多装几块，而表本身是它的几十倍。"
+            "实验一在 1.6M 行反而慢 17%，也是同一张表推出来的："
+            "块大 4 倍而池只装得下 2 块，miss 更多，每次 miss 要读 6.28MB。\n"
+            "**教训不是「调参没用」，而是「当两个最廉价的修法都无效时，"
+            "说明瓶颈不在常量上，而在算法的性质上」。**\n"
+            "而找到算法性质靠的不是再猜一个常量，是给「扫描」这件事本身加上计数器"
+            "（cells visited / pruned / best_len / kth_dist / rows visited / would_prune），"
+            "一次测出真正的机制：过滤把第 K 好的距离从 99.64 抬到 393.20（3.95 倍），"
+            "而所有 cell 的半径最大只有 327.76、最佳下界是 -202.13——"
+            "**没有任何 cell 能靠自己的半径被排除**，"
+            "于是 64 个 cell 里有 28 个活下来，每个都触及全表。\n"
+            "机制测出来之后，修法就不再是猜的了："
+            "unlimited 模式下近似搜索按定义就是精确搜索，所以改走精确路径，"
+            "60.03 s 变成 3.913 s。"
         ),
     },
 ]
@@ -2932,16 +3139,14 @@ RETROSPECTIVE = {
                 "所以真正的风险在**规模**而不在**功能**。"
                 "按判题沙箱的限制（2 GiB 内存、128 PID）跑到 200 万行，"
                 "容器直接起不来 —— 这一条如果留在题包里，就是准入判 0。"
-                "教训是：验收脚本的**数据规模**必须来自判题约束，"
-                "而不是来自自己写用例时的随手取值。"
+                "教训是：验收脚本的**数据规模**必须来自判题约束。"
             ),
         },
         {
             "title": "内存要看构成，而不是只看总量",
             "detail": (
                 "200 万行时峰值撞上 2048 MiB，"
-                "第一反应自然是「实现占内存太多」，"
-                "于是去看缓冲池与索引。\n"
+                "第一反应自然是「实现占内存太多」，于是去看缓冲池与索引。\n"
                 "但 `memory.stat` 给出的构成是另一回事："
                 "进程堆只有 44 MiB，`file`（页缓存）却有 1090 MiB。"
                 "页缓存记在 cgroup 的内存账上，"
@@ -3130,8 +3335,7 @@ RETROSPECTIVE = {
                 "表是空的，顶 K 查询返回空集，建索引耗时 0.00 s —— "
                 "而写入循环**没有检查每一条 INSERT 的返回值**。\n"
                 "最要命的是：得分版本的镜像跑出来**一模一样**。"
-                "一个已知能过准入的版本和失败版本表现相同，"
-                "那就证明**测的不是产品**。"
+                "一个已知能过准入的版本和失败版本表现相同，那就证明**测的不是产品**。"
             ),
             "lesson": (
                 "对照组的行为与实验组相同时，先怀疑测量本身。"
@@ -3160,19 +3364,16 @@ RETROSPECTIVE = {
         {
             "title": "闸门应该断言平台的预算，而不只是平台的结论",
             "detail": (
-                "这一轮最有价值的教训，"
-                "是**验证工具本身也要被当成产品来修**。\n"
+                "这一轮最有价值的教训，是**验证工具本身也要被当成产品来修**。\n"
                 "上一轮的四道闸门断言的都是**结论**（「答案对不对」"
                 "「会不会崩」），而平台判的是**时间**："
                 "启动 120 s、单条语句 60 s、整例 600 s。\n"
                 "补的那道闸门直接量时间：在两个数据量上跑，"
                 "把每一段耗在**一半的判题预算**之内。\n"
-                "设计上要注意：建索引在任何版本里都是随行数线性增长的"
-                "（索引要存下每一行的身份），"
+                "设计上要注意：建索引在任何版本里都是随行数线性增长的，"
                 "所以**总耗时的增长率不是不变量**，"
                 "按增长率判会放过「每个质心扫一遍全表」的实现。"
-                "真正的判据是**绝对预算**："
-                "四百万行上，坏的那个版本要 76 秒，好的要 5.5 秒。"
+                "真正的判据是**绝对预算**：四百万行上，坏的那个版本要 76 秒，好的要 5.5 秒。"
             ),
         },
         {
@@ -3213,11 +3414,9 @@ RETROSPECTIVE = {
             "detail": (
                 "第一版材料把学生的问题和 Agent 的分析分成了两个字段，"
                 "结果学生的证据密度只有 3.1%，"
-                "而实验的假设与解释虽然标在 experiments 里，"
-                "却全部出自 Agent。\n"
+                "而实验的假设与解释虽然标在 experiments 里，却全部出自 Agent。\n"
                 "评审按「只给学生自身有证据支持的贡献计分」去读，"
-                "看到的就是一份「学生只提问、Agent 全包办」的材料，"
-                "于是判为证据不足。"
+                "看到的就是一份「学生只提问、Agent 全包办」的材料，于是判为证据不足。"
             ),
         },
         {
@@ -3229,17 +3428,13 @@ RETROSPECTIVE = {
                 "而 `limitations.authorship` 却把它们统称为「学生贡献」。\n"
                 "这件事难在它**读起来完全合理** —— "
                 "每一条假设都有对应的实验、每一条解读都引用了真实输出，"
-                "格式校验也全部通过，"
-                "只有把摘录逐条回查原始记录才会暴露。\n"
+                "格式校验也全部通过，只有把摘录逐条回查原始记录才会暴露。\n"
                 "后来的做法是：**材料不再手写，而是从记录重建** —— "
                 "读会话记录还原成「学生一句话 + 该轮的 Agent 回答」，"
-                "按题目边界截取，每条标 `role` 与 `source`，"
-                "每个实验标 `hypothesis_author`，"
+                "按题目边界截取，每条标 `role` 与 `source`，每个实验标 `hypothesis_author`，"
                 "并把 `student_evidence` 与 `result_evidence` 分开指向原文。"
-                "重构后学生证据密度从 3.1% 升到 40.0%。\n"
-                "这一轮（第五轮）又用同一套办法加进去 7 个实例、"
-                "5 段对话与 9 条 prompt，"
-                "并且照旧过了两台校验器 —— "
+                "重构后学生证据密度从 3.1% 升到 40.0%。"
+                "此后每一轮都用同一套办法追加，并且照旧过了两台校验器 —— "
                 "其中 `check_conversation_against_record.py` 会把每个摘录"
                 "回查记录与开发日志，任何不是原文的都会报出来。"
             ),
@@ -3249,17 +3444,14 @@ RETROSPECTIVE = {
             "detail": (
                 "第六轮复现准入失败时写的对比脚本，**两处都是错的**，"
                 "而两处错法产生的结果都是「好坏两个版本表现一致」。\n"
-                "第一处：`CREATE TABLE` 少写了 `body` 列，"
-                "`INSERT` 却带了四个值，于是**每一次插入都被拒绝**，"
-                "表是空的；而脚本没有检查 `ok`，失败被静默吞掉。\n"
+                "第一处：`CREATE TABLE` 少写了 `body` 列，`INSERT` 却带了四个值，"
+                "于是**每一次插入都被拒绝**，表是空的；而脚本没有检查 `ok`，失败被静默吞掉。\n"
                 "第二处：脚本用 `SELECT COUNT(*)` 证明表非空 —— "
                 "而**解析器根本没有聚合函数**，这条语句是 `syntax_error`。"
-                "更关键的是：**已经通过准入的那个版本同样报这个错**，"
-                "所以问题在脚本而不在产品。\n"
+                "更关键的是：**已经通过准入的那个版本同样报这个错**，所以问题在脚本而不在产品。\n"
                 "由此得到的规则是：**已知能过的版本就是对照组，"
                 "对照组决定了一个差异是产品缺陷还是脚本缺陷。**"
-                "当好坏两个版本表现一致时，"
-                "唯一的读法就是「脚本测错了东西」—— 而这次确实错了两次。"
+                "当好坏两个版本表现一致时，唯一的读法就是「脚本测错了东西」。"
             ),
         },
     ],
@@ -3308,7 +3500,7 @@ RETROSPECTIVE = {
 LIMITATIONS = {
     "scope": (
         "本材料覆盖 MiniVectorDB（加赛赛题一）从空分支到可提测状态的开发过程，"
-        "时间跨度 2026-11-09 至 2026-11-13。"
+        "时间跨度 2026-11-09 至 2026-11-14。"
         "所有 prompt 均为学生真实输入，所有实验命令均为真实执行过的命令，"
         "所有 result 均为真实观察到的输出。"
     ),
@@ -3316,23 +3508,21 @@ LIMITATIONS = {
     "authorship": (
         "每一段文字的作者都标在它自己的字段上。\n"
         "\n"
-        "`user_prompts`：`content` 是学生本人的输入，**逐字**来自会话记录，"
-        "未作删改；`note` 是对这段输入的读法，不是学生的原话。"
-        "长于 4600 字符的指令在材料里按行截断，"
-        "被截掉的后半部分在开发记录里原样保留。\n"
+        "`user_prompts`：`content` 是学生本人的输入，**逐字**来自会话记录，未作删改；"
+        "`note` 是对这段输入的读法，不是学生的原话。"
+        "过长的指令在材料里按行截断，被截掉的后半部分在开发记录里原样保留。\n"
         "\n"
         "`conversations`：每个 turn 都有 `role`（`student` 或 `agent`）"
         "与 `source`（指向记录里的第几轮）。学生的 turn 是原话，"
         "Agent 的 turn 是该轮回答里与判断相关的一段，"
         "取自该轮回答的**单个**消息，不是把多段拼接起来的。\n"
         "\n"
-        "`experiments`：每个实例都有 `hypothesis_author`，"
-        "取 `student` 或 `agent`，指明这个假设是谁提出的。"
-        "标为 `student` 的，`student_evidence` 指向提出该假设的学生原话"
+        "`experiments`：每个实例都有 `hypothesis_author`（`student` 或 `agent`），"
+        "指明这个假设是谁提出的。标为 `student` 的，"
+        "`student_evidence` 指向提出该假设的学生原话"
         "（同时给出该 prompt 在本文件中的位置 `prompt_pointer`）；"
         "标为 `agent` 的，`student_evidence` 为 null —— "
-        "因为该实例没有以学生的发言为起点，"
-        "把它硬挂到某句学生的话上会是编造。\n"
+        "因为该实例没有以学生的发言为起点，把它硬挂到某句学生的话上会是编造。\n"
         "\n"
         "**计分实例全部由学生提出假设。** "
         "假设由 Agent 提出的实例按题面 §3.4.1 本就不计分"
@@ -3340,13 +3530,9 @@ LIMITATIONS = {
         "所以它们连同实测结果移到了归档文件 "
         "`agent/archive/unscored-instances.json`："
         "结果是关于这个项目的事实，删掉会丢数据；"
-        "但它们不构成学生的证据，留在计分列表里只会稀释信号。"
-        "移出的三类实例（Agent 提出的假设、只是任务指派的发言、"
-        "同一件事的重复表述）与早先版本的两处修正，"
-        "逐条记在 `missing` 里。\n"
+        "但它们不构成学生的证据，留在计分列表里只会稀释信号。\n"
         "\n"
-        "五个维度各自都有学生提出的实例，"
-        "以免某个维度因证据不足而被判为 null。\n"
+        "五个维度各自都有学生提出的实例，以免某个维度因证据不足而被判为 null。\n"
         "\n"
         "**一处去重。** 题面 §3.4.3 要求「同一证据不得跨实例或跨维度重复得分」。"
         "本材料早先的版本有 8 个实例引用了同一段学生原话，"
@@ -3361,7 +3547,12 @@ LIMITATIONS = {
         "`protocol_check/` 与 `mysqltest/`（20 组公开用例）为准；"
         "上游尚未公开的隐藏用例不在本材料的验证范围内。"
         "已知的替代验证是：按官方 README 明列的 5 项正式要求逐条验收"
-        "（27 项检查全部满足），并在判题沙箱的真实限制下把数据量推到 200 万行。",
+        "（27 项检查全部满足），并在判题沙箱的真实限制下把数据量推到 200 万行。"
+        "**2026-11-14 补记**：本轮**用官方判题器本身**复现了平台的超时"
+        "（`vector_index_maintenance` 放大版，`status: TIMEOUT`、"
+        "`message: JSON response timeout`、168 010 ms），"
+        "并在修复后由同一个判题器判为 `PASS`（108 298 ms）；"
+        "引用的是官方 `run.py` / `_transport.py` / `config.json`，不是自研脚本。",
         "协议改版前的那一版实现（纯 SQL 文本流）已不再保留为可运行状态，"
         "因此「改版前后」的对比是通过设计上的隔离（协议层参数化）"
         "与性能三轴持平来间接证明的，而非同一份代码的两次运行。",
@@ -3382,6 +3573,10 @@ LIMITATIONS = {
         "对应提交为 `2e910c8e5` 与 `faeb93e1c`；"
         "再之后是随行数线性增长的内存（投影与扫描融合、LIMIT 提前结束、"
         "响应直接写字符串、三个缓存分摊预算、标量块按真实字节计账）。"
+        "**本轮的提测候选是 `c561d44b9`**"
+        "（unlimited 模式改走精确路径），"
+        "下面这一轮的三条实例都发生在它之前，"
+        "诊断与修复的完整证据链在 `docs/perf/ledger.md` 的 §4.1.3.8 至 §4.1.3.10。"
         "若评审以最新提交为准，请以这些提交上的验证结果为准。",
         "**本材料因 128 KiB 上限而做了一次取舍。** "
         "第五轮新增实例与对话之后文件超出了上限，"
@@ -3392,13 +3587,11 @@ LIMITATIONS = {
         "材料是从会话记录自动生成的，每一轮都会自己长一截；"
         "第一次撞上限时文件是 131 468 字节，只差 396 字节就判不过，"
         "而那时离下一个内容高峰只剩一轮。"
-        "现在构建器只输出**被计分实例引用过**的 prompt："
-        "35 条 prompt 里只有 18 条被引用，其余 17 条（约 6 500 字节）"
-        "是纯冗余 —— 没有人读一条没有实例引用的发言，"
-        "而预算正是准入所依赖的东西。"
+        "现在构建器只输出**被计分实例引用过**的 prompt，"
+        "没有被实例引用的发言不占预算 —— "
+        "没有人读一条没有实例引用的发言，而预算正是准入所依赖的东西。"
         "剪枝之后下标重新连续，"
-        "所以 `/user_prompts/N` 这个指针仍然指向它原来指向的那一条。"
-        "当前体积 123 878 字节，限额 131 072，余量约 7 000 字节。",
+        "所以 `/user_prompts/N` 这个指针仍然指向它原来指向的那一条。",
         "**一处如实记录的记录损坏与恢复。** "
         "2026-11-13 整理这份材料时，"
         "会话记录文件被后续的对话覆盖写入，"
@@ -3443,22 +3636,25 @@ MATERIAL_SUMMARY = {
         "轻量向量数据库；全部核心组件自行实现，不依赖任何外部 crate 或现成引擎。"
     ),
     "how": (
-        "分六轮推进。第一轮在题包未发布时把框架与可本地验证的部分做完；"
+        "分七轮推进，每一轮都由平台的反馈或题面的要求触发。"
+        "第一轮在题包未发布时把框架与可本地验证的部分做完；"
         "第二轮上游发布题包后按新协议重写协议层并做全量回归；"
         "第三轮正式提测后按官方明列的正式要求逐条验收，"
         "并把数据量推到判题沙箱的上限，找出并修掉两个只有放大规模才暴露的缺陷；"
         "第四轮在平台反馈性能原始分 1829.58 之后，"
         "先按阶段把查询时间拆开再决定改动顺序，"
         "并把性能改动全部关进一道「答案与基线逐字节相同」的闸门；"
-        "第五轮在两次准入失败之后，"
-        "先确认失败签名是内存超限而不是崩溃，"
-        "再把「峰值内存不随行数线性增长」写成可证伪的判据，"
-        "并把随行数增长的内存逐个结构地拿掉；"
+        "第五轮在两次准入失败之后，先确认失败签名是内存超限而不是崩溃，"
+        "再把「峰值内存不随行数线性增长」写成可证伪的判据；"
         "第六轮在第三次准入失败之后，"
         "先读准签名变了这一件事（进程活着，只是没及时回答），"
-        "再把「建索引的复杂度」从 O(nlist × N) 修回 O(nlist × SAMPLE_ROWS)，"
-        "并补上一道断言**时间预算**的闸门，"
-        "而不是只断言「没崩」的闸门。"
+        "再把「建索引的复杂度」修回 O(nlist × SAMPLE_ROWS)，"
+        "并补上一道断言**时间预算**的闸门，而不是只断言「没崩」的闸门；"
+        "第七轮在第四次准入失败（`JSON response timeout`）之后，"
+        "先把「超时」拆成握手 / 语句 / 关闭三段分别测，"
+        "定位到「近似模式 + 过滤」这一条语句，"
+        "再否掉两个最廉价的修法（调大块、调大缓存），"
+        "最后改走算法层面的修复（unlimited 模式走精确路径）。"
     ),
     "outcome": (
         "官方 MySQL 正式用例全部通过（准入条件），"
@@ -3469,20 +3665,29 @@ MATERIAL_SUMMARY = {
         "八成在一处（精确扫描 218.9 ms / 1000 次查询），"
         "固定开销只有 11.7 ms，因此先动扫描路径；"
         "物化阶段由 45.9 ms 降到 7.1 ms，"
-        "堆顶一次比较使扫描由 245.7 ms 降到 218.9 ms，"
         "而前缀剪枝这条被自己提出的路被微基准否定并回退。\n"
         "第五轮把随行数增长的内存拿掉："
         "restart 在 800000 行时的峰值由 493 MiB 降到 122 MiB，"
         "select_all 由 482 MiB 降到 198 MiB；"
-        "一张每行有一千字节文本的表，重启时的匿名内存由 1148 MiB 降到 74 MiB；"
         "440 万行（数据目录 6638 MiB）在 2 GiB 限额下写入、查询与重启都能应答；"
         "51 条语句、102 个响应的答案与基线逐字节相同。\n"
-        "第六轮把签名从「进程退出」读成「没及时回答」，"
-        "于是找到的是复杂度而不是内存："
+        "第六轮把签名从「进程退出」读成「没及时回答」，于是找到的是复杂度而不是内存："
         "建索引从 O(nlist × N) 回到 O(nlist × SAMPLE_ROWS)，"
         "400 万行上的建索引由 76.2 s 降到 5.5 s、重启握手由 77.4 s 降到 6.9 s；"
         "440 万行 + 每行一千字节文本的整体耗时由 784 s 降到 568 s，"
-        "而平台的 `case_timeout` 是 600 s。"
+        "而平台的 `case_timeout` 是 600 s。\n"
+        "第七轮把 `JSON response timeout` 定位到「近似模式 + 过滤」这一条语句："
+        "过滤把第 K 好的距离从 99.64 抬到 393.20（3.95 倍），"
+        "而所有 cell 的半径最大只有 327.76、最佳下界是 -202.13，"
+        "于是没有任何 cell 能靠半径被剪掉，"
+        "64 个 cell 里有 28 个活下来、每个都触及全表"
+        "（10 948 次标量解码、183.9 GB、60 s 超时）。"
+        "修复是 unlimited 模式改走精确路径"
+        "（按定义与近似搜索同解），"
+        "400 万行上的近似过滤查询由 60.03 s 降到 3.913 s（15.3 倍），"
+        "而有限 nprobe 的答案与无限模式逐字节相同（0/200 不同）。"
+        "**同一个放大用例由官方判题器从 TIMEOUT（168 010 ms）判成 PASS（108 298 ms）**，"
+        "官方公开用例 20/20 通过。"
     ),
     "evidence_note": (
         "材料中的学生发言全部逐字来自会话记录；"
