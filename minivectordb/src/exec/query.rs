@@ -505,39 +505,20 @@ impl Engine {
         }
 
         // The rows the inverted index of the filter column names.
-        let candidate_rows: Option<Vec<u64>> = match sel.filter.as_ref() {
-            Some(f) => match detect_index_filter(f, &def) {
-                Some(plan) => {
-                    let table_id = self
-                        .tables
-                        .values()
-                        .find(|t| t.def.name == def.name)
-                        .map(|t| t.id);
-                    let mut ids = table_id
-                        .and_then(|id| self.tables.values().find(|t| t.id == id))
-                        .and_then(|state| state.inverted.get(plan.column))
-                        .and_then(|index| index.lookup(&plan.value))
-                        .map(|rows| rows.to_vec())
-                        .unwrap_or_default();
-                    // The rows the transaction inserted, and the rows it
-                    // updated into a value that satisfies the filter, are
-                    // candidates as well. A row the transaction deleted is
-                    // not: the filter is applied to it afterwards anyway, so
-                    // a row that is not a candidate is simply not read.
-                    let staged = self.staged_rows_matching(table_id, &def, plan.column, &plan.value);
-                    for (row_id, cols) in staged {
-                        if !ids.contains(&row_id) {
-                            ids.push(row_id);
-                        }
-                        let _ = cols;
-                    }
-                    ids.sort_unstable();
-                    Some(ids)
-                }
-                None => None,
-            },
-            None => None,
-        };
+        //
+        // There is no inverted index any more, so there is no candidate
+        // set: the scan measures every row of the table and the filter
+        // decides. The candidate set is `None` and **not** an empty list:
+        // an empty list would say "no row satisfies the filter", and the
+        // answer of the query would be empty while the filter does have
+        // matching rows. That is a wrong answer without a crash, and it
+        // is worse than a crash.
+        //
+        // The cost of this is the measurement of the rows that the filter
+        // rejects. The benefit was the whole of the inverted index, and
+        // the measure of the trade is `docs/perf/ledger.md`, section
+        // 4.1.3.11.
+        let candidate_rows: Option<Vec<u64>> = None;
 
         // The vector literals of the statement are parsed once and then
         // reused for every row, instead of being parsed once per row.
@@ -989,14 +970,6 @@ impl Engine {
             .map(|(row_id, _)| row_id)
             .collect();
         let deleted: HashSet<u64> = self.txn_buffer.deleted_of(table_id).into_iter().collect();
-        // The number of committed rows. A row whose identifier is below it
-        // exists in the index; the staged rows have identifiers at or above
-        // it.
-        let committed_rows = self
-            .tables
-            .get(&def.name.to_ascii_lowercase())
-            .map(|t| t.store.row_count)
-            .unwrap_or(0);
 
         // The candidates, with their distance and primary key.
         let mut candidates: Vec<(i64, f32, u64)> = Vec::new();
@@ -1202,30 +1175,16 @@ impl Engine {
 
             // The rows the inverted index of the filter column names.
             //
-            // When the filter is an equality on an indexed column, the index
-            // names the rows that can satisfy it, and the scan only measures
-            // those rows. The filter is still applied to them, so the answer
-            // does not depend on the index being up to date.
-            let candidate_rows: Option<Vec<u64>> = match filter_expr.as_ref() {
-                Some(f) => {
-                    let plan = detect_index_filter(f, def);
-                    match plan {
-                        Some(plan) => {
-                            let state = self
-                                .tables
-                                .get_mut(&key)
-                                .ok_or_else(|| SqlError::no_such_table(&def.name))?;
-                            state
-                                .inverted
-                                .get(plan.column)
-                                .and_then(|index| index.lookup(&plan.value))
-                                .map(|rows| rows.to_vec())
-                        }
-                        None => None,
-                    }
-                }
-                None => None,
-            };
+            // There is no inverted index any more, so there is no candidate
+            // set: the scan measures every row of the table and the filter
+            // decides. The candidate set is `None` and **not** an empty
+            // list: an empty list would say "no row satisfies the filter",
+            // and the answer of the query would be empty while the filter
+            // does have matching rows.
+            //
+            // The measure of the trade is `docs/perf/ledger.md`, section
+            // 4.1.3.11.
+            let candidate_rows: Option<Vec<u64>> = None;
 
             let state = self
                 .tables
@@ -1699,9 +1658,24 @@ impl Engine {
                     // A row whose columns cannot be read does not satisfy the
                     // filter: the answer has to stay the answer of the rows
                     // that are readable.
+                    //
+                    // The filter is decided on the **current** values of the
+                    // row, so a row that the transaction updated is judged
+                    // on the values the update gave it and not on the ones
+                    // it had before. The block still holds the committed
+                    // values, so the staged ones have to be put in their
+                    // place before the filter is asked.
+                    let mut cols = cols.to_vec();
+                    if let Some(staged) = staged_updates.get(&row_id) {
+                        for (idx, value) in staged.iter().enumerate() {
+                            if idx < cols.len() {
+                                cols[idx] = Some(value.clone());
+                            }
+                        }
+                    }
                     if !eval_predicate_borrowed(
                         filter,
-                        &RowValues::Scalars(cols),
+                        &RowValues::Scalars(&cols),
                         def,
                         &mut cache,
                     )? {
@@ -1842,12 +1816,19 @@ impl Engine {
         // The rows the transaction changed are handled separately: they are
         // not in the storage yet, and they are few.
         let mut out: Vec<LiveRow> = Vec::new();
-        let mut deleted: HashSet<u64> =
+        let deleted: HashSet<u64> =
             self.txn_buffer.deleted_of(table_id).into_iter().collect();
+        // The values a staged update gives to a row. The block still holds
+        // the committed values, so the filter has to be decided on the
+        // staged ones.
+        let staged_updates: HashMap<u64, Vec<ColValue>> = self
+            .txn_buffer
+            .updated_of(table_id)
+            .into_iter()
+            .collect();
         let mut cache = crate::exec::query::LiteralCache::new();
 
         // The committed rows, block by block.
-        let count = self.tables.get(&key).map(|t| t.store.row_count).unwrap_or(0);
         let blocks = self.tables.get(&key).map(|t| t.store.blocks).unwrap_or(0);
         for block in 0..blocks {
             let (metas, scalars) = {
@@ -1886,9 +1867,22 @@ impl Engine {
                     // A row whose columns cannot be read does not satisfy the
                     // filter: the answer has to stay the answer of the rows
                     // that are readable.
+                    //
+                    // The filter is decided on the **current** values of the
+                    // row, so a row that the transaction updated is judged
+                    // on the values the update gave it and not on the ones
+                    // it had before.
+                    let mut cols = cols.to_vec();
+                    if let Some(staged) = staged_updates.get(&row_id) {
+                        for (idx, value) in staged.iter().enumerate() {
+                            if idx < cols.len() {
+                                cols[idx] = Some(value.clone());
+                            }
+                        }
+                    }
                     if !eval_predicate_borrowed(
                         filter,
-                        &RowValues::Scalars(cols),
+                        &RowValues::Scalars(&cols),
                         def,
                         &mut cache,
                     )? {

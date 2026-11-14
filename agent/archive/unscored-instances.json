@@ -23,7 +23,7 @@
       "provenance": "本轮实测的产物：命令在当轮真实执行过，输出如上，原文一字未改。当时的会话记录已被后来的会话覆盖，开发记录里也没有逐字收录这一条，所以这条摘录**无法回溯到原始记录**。它记录的是过程，不是可引用的证据。",
       "command": "python3 tools/perf_compare.py --before <基线二进制> --after minivectordb/target/release/minivectordb --rounds 3",
       "result": "== exact ==\n  query_t_ms                    29106.1 ->         1121.4  (25.95x)\n  query_io_bytes           5811434332.0 ->      7204332.0  (806.66x)\n  query_peak_rss_kb             17160.0 ->        14932.0  (1.15x)\n  write_t_ms                     2036.4 ->         2240.8  (0.91x)\n  write_io_bytes             28240725.0 ->     23080741.0  (1.22x)\n== ann ==\n  query_t_ms                    57447.0 ->         2949.9  (19.47x)\n  query_io_bytes           5811434332.0 ->      7204332.0  (806.66x)\n  query_peak_rss_kb             16676.0 ->        14948.0  (1.12x)\n  recall filtered 1.0, unfiltered 1.0",
-      "result_excerpt": "  query_t_ms                    29106.1 ->         1121.4  (25.95x)\n  query_io_bytes           5811434332.0 ->      7204332.0  (806.66x)",
+      "result_excerpt": "  query_t_ms                    29106.1 ->         1121.4  (25.95x)",
       "interpretation": "查询耗时降 26 倍、I/O 降 807 倍，而内存反而降了 —— 说明块缓存没有把内存撑起来，因为缓存的是**解码后**的块而且有界。写入耗时略降（0.91x）说明写入路径没有被这次改动拖慢。"
     },
     {
@@ -35,7 +35,7 @@
       "provenance": "结果原文见开发记录 `topics/mvdb-01-minivectordb/03-impl-log.md` 与 `04-test-report.md`，逐字可查。",
       "command": "python3 tools/run_public_cases.py",
       "result": "FAIL  sql_primary_key        3: statement 3 (INSERT INTO docs VALUES (1, '重复');): the statement failed: {'code': 'duplicate_key', ...}\nFAIL  transaction_failed_insert 5: statement 5 (INSERT INTO docs VALUES (4,'新','四','[0,0]'),(2,'新','重复','[0,0]');): the statement failed: {'code': 'duplicate_key', ...}\nFAIL  transaction_autocommit_atomic 3: statement 3 (INSERT INTO docs VALUES (4,'新','四','[0,0]'),(5,'新','错误','[0]');): the statement failed: {'code': 'dimension_mismatch', ...}\n4 check(s) failed\nok    sql_crud\nok    sql_comparisons\nok    sql_ordering",
-      "result_excerpt": "FAIL  transaction_failed_insert 5: statement 5 (INSERT INTO docs VALUES (4,'新','四','[0,0]'),(2,'新','重复','[0,0]');): the statement failed: {'code': 'duplicate_key', ...}",
+      "result_excerpt": "FAIL  transaction_failed_insert 5: statement 5 (INSERT INTO docs VALUES",
       "interpretation": "这两条失败不是协议格式问题，是**真的语义缺陷**，而且是此前 5 组公开用例没能暴露的那一类：`transaction_failed_insert` 期望失败的 INSERT 只撤销自己、保留同一事务里先前 UPDATE 的结果；`transaction_autocommit_atomic` 期望多行 INSERT 里有一行非法时**整条语句都不生效**。旧实现两处都不满足：语句失败时清空整个事务缓冲，于是把先前语句的修改也一起撤销了；多行 INSERT 是逐行插入的，第一行已经落盘。修法是把事务缓冲从「三张表」改成「一条有序日志」，失败时按位置截断，只撤销本语句；多行 INSERT 则先把整句求值完再统一暂存。"
     },
     {
@@ -275,7 +275,7 @@
       "provenance": "本轮实测的产物：命令在当轮真实执行过，输出如上，原文一字未改。当时的会话记录已被后来的会话覆盖，开发记录里也没有逐字收录这一条，所以这条摘录**无法回溯到原始记录**。它记录的是过程，不是可引用的证据。",
       "command": "python3 tools/check_memory_limit.py --rows 4400000 --dim 128 --text 1000 --limit-mb 2048",
       "result": "{\n  \"data_directory_mib\": 6638.3,\n  \"data_larger_than_the_budget\": true,\n  \"dim\": 128,\n  \"limit_mb\": 2048,\n  \"phases\": {\"restart\": \"answered\", \"write_and_query\": \"answered\"},\n  \"rows\": 4400000\n}",
-      "result_excerpt": "\"data_larger_than_the_budget\": true,\n  \"dim\": 128,\n  \"limit_mb\": 2048,\n  \"phases\": {\"restart\": \"answered\", \"write_and_query\": \"answered\"}",
+      "result_excerpt": "\"data_larger_than_the_budget\": true,\n  \"dim\": 128,\n  \"limit_mb\": 2048,",
       "interpretation": "这是本轮的**准入判据**，而不是性能判据：\n440 万行 × 128 维 × 1000 字节文本，数据目录 6638 MiB —— 是 2 GiB 限额的 3.2 倍，而在 `RLIMIT_AS` 2048 MiB 下，写入加查询与重启**都答了话**。\n值得对照的是平台报的错：`database exited before response`，而本地复现出来的正是 `memory allocation of 512 bytes failed` —— 同一个签名。\n所以这一轮的结论不是「内存变小了」，而是**那个让两轮提测归零的签名被复现并被消掉了**。"
     }
   ]

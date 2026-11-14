@@ -59,6 +59,25 @@ TURNS = (
     ("experiments-ab", "先做一个 30 分钟的决定性实验"),
     ("deliver-fix", "【本轮要交付的东西：一个可提测的修复 + 一份闭环的证据链】"),
     ("supervise-close", "agent-transcripts/299dedb6-ef18-49d7-bff5-86e687e2d7f5/299dedb6-ef18-49d7-bff5-86e687e2d7f5.jsonl 问题似乎已经闭环"),
+    # The turns of the round that removed the inverted indexes.
+    #
+    # * `shape-no-where` is the turn that changed the object of the
+    #   diagnosis: the official case has no WHERE clause at all, so the
+    #   inverted index bought nothing on the case that is judged;
+    # * `whole-case-budget` is the same turn, read at the point where it
+    #   separates the budget of the case from the budget of one statement;
+    # * `remove-inverted` is the instruction to remove the inverted index
+    #   and to do nothing else.
+    #
+    # The two last turns are the same message of the supervising session,
+    # so they are read from it with two different markers of the block.
+    ("shape-no-where", "【平台在修复生效的情况下仍然失败。上一轮的诊断对象错了，本轮换对象】"),
+    ("whole-case-budget", "第 2 步（必做，40 分钟）：在整例 600 秒的尺度上量"),
+    ("remove-inverted", "【去掉倒排索引。目标是收敛到能过门槛，不要再做新实验】"),
+    # The two turns of the student about this round, in their own words.
+    ("student-timeout-reading", "按照官方文档的timeout报错口径，哪些优化会导致超时呢"),
+    ("student-drop-inverted", "如果舍弃倒排索引，其他的优化是不是无效了"),
+    ("student-converge-gate", "我觉得先去掉倒排索引，通过门槛比较重要"),
 )
 
 # The prompt that the supervising session wrote and the working session

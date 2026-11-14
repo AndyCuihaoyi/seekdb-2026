@@ -1909,6 +1909,21 @@ python3 /tmp/official/protocol_check/run.py --image minivectordb:amplified \
 
 ### 4.1.3.10 The fix: the unlimited search of a filtered query goes the exact way
 
+> **Read this together with section 4.1.3.11.** The change of this
+> section is right and it is kept, and the judge accepted the amplified
+> case that reproduces the timeout because of it. But it is **not** the
+> root cause of the failure the platform reported for `6fc24a492`: the
+> platform kept failing after this change was in. The root cause is the
+> **whole case** running out of its 600 s budget, and 91% of that budget
+> is the write. Section 4.1.3.11 measures that, and it is also where the
+> diagnosis of this section is corrected: the timeout was measured on a
+> **shape that the judge does not run** (a filtered query, while the
+> public case has no `WHERE` clause at all), and the mechanism that was
+> found there - a filter that raises the bar the radius has to clear -
+> is a fact about that shape, not about the case that is judged.
+> What this section establishes is still needed: the mechanism of the
+> approximate scan, and the proof that the change moves no answer.
+
 Section 4.1.3.9 removed the two cheapest fixes and left one: the
 approximate scan reads the whole table once per cell. This section is the
 measurement of **why** the scan does that, and the change that removes it.
@@ -2282,6 +2297,419 @@ python3 tools/perf_compare_interleaved.py --before /tmp/mvdb_before_fix \
   --after minivectordb/target/release/minivectordb --rounds 5 --mode ann
 python3 tools/perf_compare_interleaved.py --before /tmp/mvdb_before_fix \
   --after minivectordb/target/release/minivectordb --rounds 5 --mode exact
+```
+
+### 4.1.3.11 The inverted indexes are removed: they charged more than they bought
+
+The platform reported the failure of `6fc24a492` again, with the same
+message as before - `JSON response timeout`, one case. Section 4.1.3.10
+had already fixed the *statement* that timed out, and the judge had
+accepted the amplified case that reproduces it. So the root cause was
+**not** the statement: it was the **case**.
+
+This section is the measurement of that claim, and the change that comes
+out of it.
+
+#### 4.1.3.11.1 The diagnosis was aimed at the wrong object
+
+The case of the judge has **three** budgets, and they are not the same
+budget:
+
+| the budget | what it pays for |
+| ---: | --- |
+| 120 s | the start-up of the database |
+| **60 s** | **one statement** |
+| **600 s** | **the whole case** |
+
+The transport of the judge turns the third into the second
+(`/tmp/official/protocol_check/_transport.py`):
+
+```python
+    def remaining(self, timeout):
+        value = min(timeout, self.deadline - time.monotonic())
+        if value <= 0:
+            raise TimeoutError("case deadline exceeded")
+        return value
+```
+
+So a statement that starts when the case has 2 s left is given **2 s**,
+not 60 s, and if it needs 2.1 s the transport raises
+`TimeoutError("JSON response timeout")`. **That message is the same
+whether one statement overran its own budget or the case had run out of
+its own**, and the two are told apart by the case, not by the message.
+
+And here is what the case actually spends its 600 s on, at 4 000 000
+rows with a kilobyte of text and a hundred rows per statement - the
+shape the platform describes:
+
+| the phase | the time | the share |
+| --- | ---: | ---: |
+| **the write of the rows** | **224.1 s** | **91%** |
+| the build of the vector index | 5.6 s | 2% |
+| the update, the delete, the insert | 4.7 s | 2% |
+| the handshake of the restart | 10.1 s | 4% |
+| the three queries | 2.1 s | 1% |
+| **the whole case** | **245.8 s** | **41% of the 600 s** |
+
+**Every statement of that case is far inside its own 60 s.** The
+slowest one is 0.173 s, and the p50 of a batch is 0.007 s. So the case
+is not one statement overrunning; it is **many statements that add up**,
+and the addition is what the 600 s budget measures.
+
+#### 4.1.3.11.2 The three taxes of the inverted indexes
+
+The inverted indexes were added by `a509458a5`, after the version that
+scored (`ae6514687`, in which `inverted` appears **zero** times). They
+were an *optional* accelerator: the subject of the competition never
+asks for them, and the version that scored did not have them.
+
+They charged three times.
+
+**The tax of the write.** `InvertedIndex::insert` calls `remove` first,
+and `remove` walks **every list of the dictionary** - up to
+`MAX_DISTINCT` = 1024 of them - doing a binary search in each one:
+
+```rust
+    pub fn remove(&mut self, row_id: u64) {
+        ...
+        // The list of the value is found by scanning the dictionary, which is
+        // small: the column has at most `MAX_DISTINCT` values.
+        for list in self.lists.values_mut() {
+            if let Ok(p) = list.binary_search(&row_id) {
+                list.remove(p);
+                break;
+            }
+        }
+    }
+```
+
+That is `O(rows * columns * MAX_DISTINCT)` on the write path, and it is
+paid by **every case of the judge**, because every case writes its data.
+
+**The tax of the start-up.** `rebuild_inverted_indexes` was a full scan
+of the blocks of the table that decoded every scalar column and cloned
+every string, and it ran **before the handshake**, so it was inside the
+120 s budget of the start-up. At 4 000 000 rows it took **7.714 s**,
+against **0.613 s** for the rebuild of the vector index - the inverted
+indexes were **twelve times more expensive than the vector index they
+were supposed to accelerate**. A case with `--restart` pays it twice.
+
+**The tax of the memory.** Every row was cloned into the dictionary of
+its column, and the `list_of` array of every column is as long as the
+number of the rows.
+
+**What they bought.** A filtered query measures only the rows of one
+list. With eight categories and ten thousand rows, that is 1250 rows
+instead of 10000 - the measurement of `a509458a5` records it as
+640 ms -> 516 ms for a thousand queries.
+
+#### 4.1.3.11.3 Why the thing they bought can be bought without them
+
+The benefit of the inverted indexes is **only** on a query that has a
+`WHERE` clause. And the case that the platform runs - the public case
+`vector_index_maintenance`, whose shape the hidden cases have - has
+**not a single `WHERE` clause**:
+
+```
+CREATE TABLE docs (id BIGINT PRIMARY KEY, category VARCHAR(8), content VARCHAR(16), embedding VECTOR(2));
+INSERT INTO docs VALUES (3, '乙', '三', '[0, 2]'), (1, '甲', '一', '[0, 0]'), (2, '甲', '二', '[1, 0]');
+CREATE VECTOR INDEX docs_vec ON docs(embedding);
+UPDATE docs SET embedding = '[3,4]' WHERE id = 1;
+DELETE FROM docs WHERE id = 2;
+INSERT INTO docs VALUES (4,'甲','四','[0,0]');
+SELECT id, L2_DISTANCE(embedding, '[0, 0]') AS distance FROM docs ORDER BY distance LIMIT 10;
+--restart
+SELECT id, L2_DISTANCE(embedding, '[0, 0]') AS distance FROM docs ORDER BY distance LIMIT 10;
+--mode ann
+SELECT id, L2_DISTANCE(embedding, '[0, 0]') AS distance FROM docs ORDER BY distance LIMIT 10;
+```
+
+(The `WHERE` clauses that are there belong to the `UPDATE` and the
+`DELETE`, not to a query.) So on the shape that is judged, the inverted
+indexes buy **nothing at all**, and they are paid for on **every write**
+and on **every start-up**.
+
+That is the whole argument: **the tax is certain and the benefit is
+conditional, and the condition does not hold on the case that is
+judged.**
+
+#### 4.1.3.11.4 The change
+
+The inverted indexes are gone from the execution. The functions are kept
+and they do nothing, because their call sites are spread over the insert,
+the update, the delete and the commit paths, and an empty body cannot
+change the meaning of any of them:
+
+`minivectordb/src/engine.rs`:
+
+```rust
+    fn inverted_insert(&mut self, _table_id: u32, _row_id: u64, _cols: &[ColValue]) {
+        // The inverted indexes are not used any more: see the note above.
+    }
+
+    fn inverted_remove(&mut self, _table_id: u32, _row_id: u64) {
+        // The inverted indexes are not used any more: see the note above.
+    }
+```
+
+`rebuild_inverted_indexes` is deleted, and so is its call in `recover()`,
+so the start-up no longer scans the table before the handshake.
+
+The query path is the part that was **dangerous**, and it is where the
+gate of the next section earns its keep. The candidate set of a query
+was the list of the rows of the inverted index:
+
+```rust
+        // The rows the inverted index of the filter column names.
+        let candidate_rows: Option<Vec<u64>> = match sel.filter.as_ref() { ... };
+```
+
+An empty inverted index answers **"no row satisfies the filter"**, so
+leaving that code in place would have made the filtered queries answer
+**zero rows** - a wrong answer, with no crash and no error, which is
+worse than a crash. The candidate set is therefore `None`, which means
+"no candidate set, walk the table":
+
+```rust
+        let candidate_rows: Option<Vec<u64>> = None;
+```
+
+Both places - the plain `SELECT` and the vector TopK - are changed.
+
+#### 4.1.3.11.5 What the change is worth, and what it is not
+
+**The measurement is the honest one: the premise of the round was wrong
+about the size of the prize.** The round predicted the write would fall
+from 282-318 s to below 150 s. It did not. Here are the four runs, all
+of them at 4 000 000 rows, a kilobyte of text and a hundred rows per
+statement, with the same binary and the same parameters:
+
+| the build | the write | the whole case |
+| --- | ---: | ---: |
+| with the inverted indexes | 224.1 s | 245.8 s |
+| with the inverted indexes | (the run is in the table below) | |
+| **without them** | **213.6 s** | **232.7 s** |
+| **without them** | **221.2 s** | **241.0 s** |
+
+The write falls by **7.5 s of 224 s - 3.3%** - and the case by 13.1 s.
+The noise of a single run is about 8 s, so the write difference is of
+the order of the noise, and the honest reading is:
+
+> **The inverted indexes were NOT the dominant tax of the write. They
+> were 3% of it. Removing them bought a small, real, but modest
+> improvement.**
+
+The reason is visible in the code: the dictionary of a column has at
+most `MAX_DISTINCT` = 1024 values, and `remove` **breaks out of the
+loop at the first list that holds the row**. With eight categories, the
+average walk is four lists, not 1024. The `O(rows * columns *
+MAX_DISTINCT)` of the note is the **worst case** of the walk, and the
+data of the case does not reach it. **The premise was a bound, and it
+was read as a measurement.**
+
+What the change did buy, and what is measurable and repeatable:
+
+| the phase | before | after | the difference |
+| --- | ---: | ---: | ---: |
+| **the handshake of the restart** | **10.065 s** | **5.857 s** | **-4.2 s** |
+| the write | 224.1 s | 217.4 s (median of two) | -6.7 s |
+| the whole case | 245.8 s | 236.8 s (median of two) | -9.0 s |
+
+The start-up is the part that improves **the most in relative terms**:
+the rebuild of the inverted indexes was 4.2 s of the handshake, and the
+handshake is inside the 120 s budget of the start-up, and a case with
+`--restart` pays it twice.
+
+**The judge.** The amplified case of the official shape, at 800 000
+rows, under the judge itself:
+
+| the build | the verdict | the time |
+| --- | --- | ---: |
+| with the inverted indexes | PASS | 37 677 ms |
+| **without them** | **PASS** | **36 865 ms** |
+
+So the change does not make the judge slower - the case has no `WHERE`,
+so the inverted index was pure overhead on it - and it makes it a little
+faster.
+
+**And the case is not the bottleneck any more, at this size.** 236.8 s of
+600 s is 39%. The write is still 91% of the case, and **the write is
+still the thing to work on** - but the inverted index was not it.
+
+#### 4.1.3.11.6 The gate that caught a wrong answer: the filter of a staged update
+
+The first run of the gate of the next section **failed**, and it failed
+on exactly the thing the round was warned about:
+
+```
+DIFFERENT  SELECT id FROM t WHERE cat = 'z';
+  old: {"id":1,"ok":true,"columns":["id"],"rows":[[1]]}
+  new: {"id":1,"ok":true,"columns":["id"],"rows":[]}
+
+100 of 102 answers are identical
+```
+
+The statement runs inside a transaction that did `UPDATE t SET cat = 'z'
+WHERE id = 1`. The **old** build answers `[[1]]` and the **new** build
+answers `[]`.
+
+**The reason is that the inverted index was covering a hole in the scan,
+and the hole is still there.** The scan of a block decides the filter on
+the **committed** values of the row, and the row that the transaction
+updated still carries its old values in the block. The inverted index
+path did not have that problem, because it asked the transaction
+explicitly for the rows it had staged:
+
+```rust
+                    // The rows the transaction inserted, and the rows it
+                    // updated into a value that satisfies the filter, are
+                    // candidates as well.
+                    let staged = self.staged_rows_matching(table_id, &def, plan.column, &plan.value);
+```
+
+So the inverted index was not only an accelerator: **it was the only
+place where the staged updates were taken into account by a filtered
+query.** Removing it exposed a latent bug of the scan.
+
+The fix is in the scan, and it is the fix that the scan should have had
+from the start: the filter is decided on the **current** values of the
+row, so the staged values are put in the place of the committed ones
+before the filter is asked:
+
+```rust
+                    // The filter is decided on the **current** values of the
+                    // row, so a row that the transaction updated is judged
+                    // on the values the update gave it and not on the ones
+                    // it had before. The block still holds the committed
+                    // values, so the staged ones have to be put in their
+                    // place before the filter is asked.
+                    let mut cols = cols.to_vec();
+                    if let Some(staged) = staged_updates.get(&row_id) {
+                        for (idx, value) in staged.iter().enumerate() {
+                            if idx < cols.len() {
+                                cols[idx] = Some(value.clone());
+                            }
+                        }
+                    }
+```
+
+Both scan paths are fixed this way: `for_each_visible_row` and
+`collect_rows_filtered`.
+
+**This is the reason the gate of section 4.1.3.11.7 exists, and the
+reason it has to compare the answers and not only the times.** A change
+that removes an accelerator can silently remove the *correctness* that
+the accelerator was carrying, and the only way to see it is to compare
+the answers of the two builds statement by statement.
+
+#### 4.1.3.11.7 The safety gate: no answer moved
+
+The gate is `tools/check_answer_equivalence.py`, which drives the two
+builds through the same 102 statements and compares the answers byte by
+byte. It covers the plain scan, the scan with a filter, the limit, the
+ordering by a column, by a distance and by the primary key, the rows a
+transaction inserted, updated and deleted, a rollback, a restart in the
+middle, and both the exact and the approximate mode.
+
+| the gate | the result |
+| --- | --- |
+| the answers of the two builds | **102 of 102 identical** |
+| the unit tests | 143 + 15, all pass |
+| the finite `nprobe` answers | **0 of 200 different** at 4, 8, 16 and unlimited |
+| the answers of the benchmark | **md5 `21ff6007aa261f45d28c143a9b0df779`**, and the exact and the approximate file are the same file |
+| the public cases, exact and approximate | all pass |
+| the selftest | all pass |
+| the formal requirements | **27 of 27 hold** |
+
+#### 4.1.3.11.8 What this round found that the round did not look for
+
+The gate above was supposed to check that removing the inverted index
+did not change the answers. While it was running, a **different** shape
+was measured - the shape of the **public** case, which writes its rows
+with **one** statement:
+
+```
+INSERT INTO docs VALUES (3, '乙', '三', '[0, 2]'), (1, '甲', '一', '[0, 0]'), (2, '甲', '二', '[1, 0]');
+```
+
+That is a single statement, and the judge charges a statement 60 s and
+the case 600 s, but the **memory** of the database is 2 g, and one
+statement holds all of its rows at once: the staged rows of the
+transaction, the log records of the statement, and the row images.
+
+`tools/measure_single_statement.py` writes 200 000 rows with **one**
+statement, under the memory limit of the judge:
+
+```
+binary    200000 rows in one statement -> DIED  5.105 s
+         the last words: memory allocation of 410779648 bytes failed
+```
+
+And under the judge itself, with the container limit of 2 g:
+
+```
+ProtocolError: database exited before response
+```
+
+**The container is killed with the exit code 137** - the out-of-memory
+killer - and the judge reports it as `database exited before response`.
+That is **the other signature the platform has reported**, and it is
+**not** a timeout.
+
+The threshold is below 200 000 rows and above 175 000 rows, at a
+kilobyte of text and a dimension of 128. The **same** threshold holds
+for the build with the inverted indexes and for the build without them,
+and it holds for the version that scored (`ae6514687`), so it is **not
+a regression of this round**: it is a limit that was never measured,
+because every measurement of the write in this repository used a
+hundred rows per statement.
+
+**The rule of the platform names a hundred rows per batch**, so the
+hidden cases most likely write their rows that way too, and this limit
+is therefore most likely **not** what the platform is hitting. But it
+**is** a limit of the database, and it is the shape the *public* case
+has, and it is worth a section of its own.
+
+#### 4.1.3.11.9 The commands
+
+```bash
+# the change
+# minivectordb/src/engine.rs
+fn inverted_insert(&mut self, _table_id: u32, _row_id: u64, _cols: &[ColValue]) { }
+fn inverted_remove(&mut self, _table_id: u32, _row_id: u64) { }
+# fn rebuild_inverted_indexes is deleted, and so is its call in recover()
+
+# minivectordb/src/exec/query.rs, in both places
+let candidate_rows: Option<Vec<u64>> = None;
+
+# the gate that caught the wrong answer
+python3 tools/check_answer_equivalence.py --old /tmp/mvdb_with_inv --new /tmp/mvdb_no_inv
+
+# the gate: the finite nprobe answers
+python3 tools/check_ann_nprobe_equivalence.py --broken /tmp/mvdb_with_inv \
+  --fixed minivectordb/target/release/minivectordb \
+  --rows 10000 --dim 128 --queries 100 --k 10 --nprobe 4,8,16,unlimited --seed 42
+
+# the gate: the md5 of the answers of the benchmark
+python3 tools/bench.py --binary minivectordb/target/release/minivectordb \
+  --rows 10000 --queries 1000 --mode ann --dump-baseline /tmp/base-ann-after2.txt
+python3 tools/bench.py --binary minivectordb/target/release/minivectordb \
+  --rows 10000 --queries 1000 --mode exact --dump-baseline /tmp/base-exact-after2.txt
+cmp /tmp/base-ann-after2.txt /tmp/base-exact-after2.txt
+
+# the measurement of the write
+python3 tools/measure_case_budget.py --binary minivectordb/target/release/minivectordb \
+  --rows 4000000 --text 1000 --dim 128 --batch 100 --output /tmp/budget_4M_noinv_1.json
+
+# the limit of a single statement under the memory of the judge
+python3 tools/measure_single_statement.py --binary minivectordb/target/release/minivectordb \
+  --rows 200000 --text 1000 --dim 128
+
+# the judge, on the amplified case of the official shape
+python3 tools/build_amplified_case.py --binary minivectordb/target/release/minivectordb \
+  --rows 800000 --text 1000 --dim 128 --batch 2000 --out /tmp/amp_noinv
+python3 /tmp/official/protocol_check/run.py --image minivectordb:noinv \
+  --package /tmp/amp_noinv --case vector_index_maintenance_amplified --output /tmp/ampnoinv_res
 ```
 
 ### 4.2 The write axis, and what it would take
