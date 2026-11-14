@@ -90,6 +90,62 @@ pub struct IvfIndex {
     /// It makes the removal of a row a constant time operation: the last
     /// entry of the cell takes the place of the removed one.
     pos_of: Vec<u32>,
+    /// The number of cells that the last scan visited.
+    ///
+    /// It is a diagnostic. The cost of the approximate scan is decided by
+    /// the number of cells it visits and by the number of rows of those
+    /// cells, so the two numbers make the effect of a change of the
+    /// centroids visible.
+    ///
+    /// It is a `Cell`, because the scan takes the index by a shared
+    /// reference and the diagnostic must not change that.
+    pub last_scan_cells: std::cell::Cell<usize>,
+    /// The number of rows that the last scan measured.
+    pub last_scan_rows: std::cell::Cell<usize>,
+    /// The number of cells that the last scan skipped by their radius.
+    ///
+    /// It is a diagnostic. A cell is skipped when its own radius proves
+    /// that it cannot hold a better answer, so the number of the skipped
+    /// cells is the number of the cells the pruning of the index removed.
+    pub last_scan_pruned: std::cell::Cell<usize>,
+    /// The length of the answer of the last scan, before the truncation to
+    /// `k`.
+    ///
+    /// It is a diagnostic. The pruning compares a cell against the
+    /// distance of the K-th accepted row, so it can only prune once the
+    /// answer holds K rows.
+    pub last_scan_best_len: std::cell::Cell<usize>,
+    /// The distance of the K-th accepted row of the last scan.
+    ///
+    /// It is a diagnostic. It is the number that the bound of a cell is
+    /// compared against, so it is the number that says whether the pruning
+    /// can fire at all.
+    pub last_scan_kth_dist: std::cell::Cell<f32>,
+    /// The number of the rows of the visited cells, whether the filter
+    /// accepted them or not.
+    pub last_scan_rows_visited: std::cell::Cell<usize>,
+    /// The number of the cells whose bound is better than the K-th
+    /// distance of the answer of the last scan.
+    pub last_scan_would_prune: std::cell::Cell<usize>,
+    /// The best bound over the cells of the last scan: the smallest
+    /// distance that a point of some cell can have.
+    pub last_scan_best_bound: std::cell::Cell<f32>,
+    /// The largest radius over all the cells.
+    ///
+    /// It is a diagnostic: the scan prunes a cell by its radius, so the
+    /// largest radius is the bound that stops the scan the latest.
+    pub max_radius: f32,
+    /// The sum of the radii of all the cells.
+    ///
+    /// It is a diagnostic: the cells are not pruned by their own radius
+    /// alone, so the sum is a measure of how much of the table they cover.
+    pub radius_sum: f32,
+    /// The number of rows of the largest cell.
+    ///
+    /// It is a diagnostic: the rows of a cell are spread over the blocks of
+    /// the table, so a cell with many rows makes the scan decode many
+    /// blocks.
+    pub largest_cell: usize,
 }
 
 /// A callback that measures the distance of a row to the query.
@@ -98,6 +154,42 @@ pub struct IvfIndex {
 /// not belong to the answer - because it was changed by the transaction, or
 /// because it does not satisfy the filter of the query.
 pub type DistanceFetcher<'a> = &'a mut dyn FnMut(u64) -> SqlResult<Option<f32>>;
+
+/// The diagnostics of an index.
+///
+/// The numbers are the ones that decide the cost of the approximate
+/// scan, so they are what a change of the centroids is measured with.
+#[derive(Debug, Clone, Copy)]
+pub struct IndexStats {
+    /// The number of cells.
+    pub cells: usize,
+    /// The number of rows in the index.
+    pub rows: usize,
+    /// The largest radius over all the cells.
+    pub max_radius: f32,
+    /// The sum of the radii of all the cells.
+    pub radius_sum: f32,
+    /// The number of rows of the largest cell.
+    pub largest_cell: usize,
+    /// The number of cells the last scan visited.
+    pub last_scan_cells: usize,
+    /// The number of rows the last scan measured.
+    pub last_scan_rows: usize,
+    /// The number of cells the last scan skipped by their radius.
+    pub last_scan_pruned: usize,
+    /// The length of the answer of the last scan, before the truncation.
+    pub last_scan_best_len: usize,
+    /// The distance of the K-th accepted row of the last scan.
+    pub last_scan_kth_dist: f32,
+    /// The number of rows of the visited cells, whether the filter accepted
+    /// them or not.
+    pub last_scan_rows_visited: usize,
+    /// The number of the cells whose bound is better than the K-th distance
+    /// of the answer of the last scan.
+    pub last_scan_would_prune: usize,
+    /// The best bound over the cells of the last scan.
+    pub last_scan_best_bound: f32,
+}
 
 impl IvfIndex {
     /// Build an index over the given rows.
@@ -118,6 +210,17 @@ impl IvfIndex {
             radii: Vec::new(),
             cell_of: vec![NO_CELL; max_id + 1],
             pos_of: vec![NO_CELL; max_id + 1],
+            last_scan_cells: std::cell::Cell::new(0),
+            last_scan_rows: std::cell::Cell::new(0),
+            last_scan_pruned: std::cell::Cell::new(0),
+            last_scan_best_len: std::cell::Cell::new(0),
+            last_scan_kth_dist: std::cell::Cell::new(0.0),
+            last_scan_rows_visited: std::cell::Cell::new(0),
+            last_scan_would_prune: std::cell::Cell::new(0),
+            last_scan_best_bound: std::cell::Cell::new(0.0),
+            max_radius: 0.0,
+            radius_sum: 0.0,
+            largest_cell: 0,
         };
         if rows.is_empty() {
             index.centroids = vec![vec![0.0f32; dim]; nlist];
@@ -157,6 +260,17 @@ impl IvfIndex {
             centroids,
             cell_of: Vec::new(),
             pos_of: Vec::new(),
+            last_scan_cells: std::cell::Cell::new(0),
+            last_scan_rows: std::cell::Cell::new(0),
+            last_scan_pruned: std::cell::Cell::new(0),
+            last_scan_best_len: std::cell::Cell::new(0),
+            last_scan_kth_dist: std::cell::Cell::new(0.0),
+            last_scan_rows_visited: std::cell::Cell::new(0),
+            last_scan_would_prune: std::cell::Cell::new(0),
+            last_scan_best_bound: std::cell::Cell::new(0.0),
+            max_radius: 0.0,
+            radius_sum: 0.0,
+            largest_cell: 0,
         }
     }
 
@@ -306,6 +420,28 @@ impl IvfIndex {
         // distance.
         let mut best: Vec<(i64, f32, u64)> = Vec::with_capacity(k);
 
+        // The diagnostics of the scan: how many cells it visited and how
+        // many rows it measured.
+        let mut visited_cells = 0usize;
+        let mut measured_rows = 0usize;
+        // The number of the cells that the pruning removed, and the number
+        // of the rows that the filter accepted.
+        let mut pruned_cells = 0usize;
+        let mut fetch_some = 0usize;
+        // The number of the rows of the visited cells, whether the filter
+        // accepted them or not.
+        let mut rows_visited = 0usize;
+        // The number of the cells whose bound would have been better than
+        // the K-th distance of the answer, if the answer had held K rows.
+        //
+        // It is the decisive number of the pruning: a cell is skipped when
+        // its bound is worse than the K-th distance, so this counter says
+        // how many cells the bound *could* have removed.
+        let mut would_prune = 0usize;
+        // The best bound over all the cells: the smallest distance that a
+        // point of some cell can have.
+        let mut best_bound = f32::INFINITY;
+
         for (cell, centroid_dist_sq) in order.iter().take(limit) {
             let centroid_dist = centroid_dist_sq.sqrt();
 
@@ -318,14 +454,24 @@ impl IvfIndex {
             // Skip this cell: its own radius already proves that it cannot
             // contain a better answer.
             if best.len() >= k && centroid_dist - self.radii[*cell] > best[k - 1].1 {
+                pruned_cells += 1;
                 continue;
             }
 
+            visited_cells += 1;
+            // The bound of this cell: no point of it is closer than this.
+            let bound = centroid_dist - self.radii[*cell];
+            if bound < best_bound {
+                best_bound = bound;
+            }
             for entry in self.lists[*cell].iter() {
+                rows_visited += 1;
                 let d = match fetch(entry.row_id)? {
                     Some(d) => d,
                     None => continue,
                 };
+                fetch_some += 1;
+                measured_rows += 1;
                 best.push((entry.pk, d, entry.row_id));
             }
             if best.len() > k {
@@ -338,8 +484,82 @@ impl IvfIndex {
             }
         }
 
+        // The length of the answer, taken before the answer is moved out.
+        let final_best_len = best.len();
+        // The distance of the K-th accepted row, which is the number that
+        // the bound of a cell is compared against. It is `None` when the
+        // answer does not hold K rows, because then there is nothing to
+        // compare against.
+        let final_kth_dist = if final_best_len >= k {
+            best[k - 1].1
+        } else {
+            f32::INFINITY
+        };
+        // The number of the cells whose bound is better than the K-th
+        // distance of the answer.
+        //
+        // It is the decisive number of the pruning: a cell is skipped when
+        // its bound is worse than the K-th distance, so this counter says
+        // how many cells the bound *could* have removed once the answer
+        // held K rows.
+        if final_best_len >= k {
+            for (cell, centroid_dist_sq) in order.iter().take(limit) {
+                let bound = centroid_dist_sq.sqrt() - self.radii[*cell];
+                if bound > final_kth_dist {
+                    would_prune += 1;
+                }
+            }
+        }
         out.append(&mut best);
+        // The diagnostics of the scan are recorded, so that the effect of
+        // a change of the centroids is visible.
+        self.last_scan_cells.set(visited_cells);
+        self.last_scan_rows.set(measured_rows);
+        self.last_scan_pruned.set(pruned_cells);
+        self.last_scan_best_len.set(final_best_len);
+        self.last_scan_kth_dist.set(final_kth_dist);
+        self.last_scan_rows_visited.set(rows_visited);
+        self.last_scan_would_prune.set(would_prune);
+        self.last_scan_best_bound.set(best_bound);
         Ok(())
+    }
+
+    /// The diagnostics of the index, computed now.
+    ///
+    /// The numbers are the ones that decide the cost of the approximate
+    /// scan: the radius of a cell bounds how far the scan has to look, and
+    /// the number of rows of a cell decides how many blocks the scan has
+    /// to decode.
+    pub fn stats(&self) -> IndexStats {
+        let mut max_radius = 0.0f32;
+        let mut radius_sum = 0.0f32;
+        let mut largest_cell = 0usize;
+        for radius in self.radii.iter() {
+            if *radius > max_radius {
+                max_radius = *radius;
+            }
+            radius_sum += *radius;
+        }
+        for list in self.lists.iter() {
+            if list.len() > largest_cell {
+                largest_cell = list.len();
+            }
+        }
+        IndexStats {
+            cells: self.nlist,
+            rows: self.len(),
+            max_radius,
+            radius_sum,
+            largest_cell,
+            last_scan_cells: self.last_scan_cells.get(),
+            last_scan_rows: self.last_scan_rows.get(),
+            last_scan_pruned: self.last_scan_pruned.get(),
+            last_scan_best_len: self.last_scan_best_len.get(),
+            last_scan_kth_dist: self.last_scan_kth_dist.get(),
+            last_scan_rows_visited: self.last_scan_rows_visited.get(),
+            last_scan_would_prune: self.last_scan_would_prune.get(),
+            last_scan_best_bound: self.last_scan_best_bound.get(),
+        }
     }
 
     /// Record the cell and the position of a row.

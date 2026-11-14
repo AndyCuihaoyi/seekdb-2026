@@ -237,6 +237,19 @@ pub struct TableStore {
     /// fewer columns than the table has. The count is what tells such a row
     /// apart from a row that is complete.
     column_count: usize,
+    /// The number of scalar blocks that were decoded, since the process
+    /// started.
+    ///
+    /// It is a diagnostic. The cost of a query is decided by the number of
+    /// blocks it has to decode, and the approximate scan decodes a block
+    /// for every cell that holds one of its rows, so the number makes the
+    /// difference between the two scan paths visible.
+    pub scalar_decodes: std::cell::Cell<u64>,
+    /// The number of times a scalar block was served from the cache.
+    pub scalar_hits: std::cell::Cell<u64>,
+    /// The number of vector blocks that were decoded, since the process
+    /// started.
+    pub vector_decodes: std::cell::Cell<u64>,
 }
 
 impl TableStore {
@@ -291,6 +304,9 @@ impl TableStore {
             scalar_pool,
             vector_index: None,
             column_count: 0,
+            scalar_decodes: std::cell::Cell::new(0),
+            scalar_hits: std::cell::Cell::new(0),
+            vector_decodes: std::cell::Cell::new(0),
         };
         store.reload_counts()?;
         // A fresh vector file gets its header right away, so that the file
@@ -506,8 +522,15 @@ impl TableStore {
     ) -> SqlResult<Rc<ScalarBlock>> {
         let key = (self.file_id, block as u64);
         if let Some(hit) = self.scalar_pool.borrow_mut().get(key) {
+            self.scalar_hits.set(self.scalar_hits.get() + 1);
             return Ok(hit);
         }
+        // The block is decoded, not served from the cache. The number of
+        // decodes is a diagnostic: it is the number of blocks the query
+        // had to decode, and the cost of the approximate scan is decided
+        // by it, because the rows of a cell are spread over every block
+        // of the table.
+        self.scalar_decodes.set(self.scalar_decodes.get() + 1);
         let (buf, offsets) = self.read_image_block(metas)?;
         let mut out = Vec::with_capacity(metas.len());
         for (slot, meta) in metas.iter().enumerate() {
@@ -977,6 +1000,7 @@ impl TableStore {
         if let Some(hit) = self.vector_pool.borrow_mut().get(key) {
             return Ok(hit);
         }
+        self.vector_decodes.set(self.vector_decodes.get() + 1);
         let br = self.block_rows;
         let d = self.dim;
         let total = br * d * 4;
