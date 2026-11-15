@@ -41,6 +41,27 @@ ARCHIVE_NAME = "agent/archive/unscored-instances.json"
 # drift onto a message of another topic that happens to share a short word.
 LAST_MESSAGE = "总结一下当前进度，将剩余任务列为todo"
 
+# The character that stands for a byte the transcript could not decode.
+# A few of the transcripts of the project hold text that was written with
+# a byte sequence the decoder could not read, and the decoder left the
+# replacement character behind. The material shows the text of a prompt
+# as it is in the record, so the place is kept, but it is named: a reader
+# has to be able to tell that the text is there and that it could not be
+# read, rather than read it as a word of the student.
+UNREADABLE = "�"
+UNREADABLE_MARK = "[此处一个字节无法解码]"
+
+
+def readable(text):
+    """The text with the unreadable bytes named.
+
+    The mark that the decoder leaves behind is turned into a name, so
+    that the material does not show a character that no one wrote.
+    """
+    if UNREADABLE in text:
+        return text.replace(UNREADABLE, UNREADABLE_MARK)
+    return text
+
 
 # ---------------------------------------------------------------------------
 # The record.
@@ -64,6 +85,11 @@ def read_transcript():
 
     events = []
     for path in sorted(glob.glob(os.path.join(RECORD, "*", "*.jsonl"))):
+        # The transcripts are read with `errors="replace"`: a few of them
+        # hold a byte sequence that is not UTF-8, and the decoder has to
+        # say something. The mark it leaves behind is named below, so that
+        # the reader can tell that the text is there and that it could
+        # not be read.
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             for line in fh:
                 line = line.strip()
@@ -253,6 +279,12 @@ TURN_MARKERS = {
     "experiments-ab": "先做一个 30 分钟的决定性实验",
     "deliver-fix": "【本轮要交付的东西：一个可提测的修复 + 一份闭环的证据链】",
     "supervise-close": "agent-transcripts/299dedb6-ef18-49d7-bff5-86e687e2d7f5/299dedb6-ef18-49d7-bff5-86e687e2d7f5.jsonl 问题似乎已经闭环",
+    # The three questions of the student of the last round. They are the
+    # only turns of that round that the student wrote himself, and they
+    # are the evidence of the three instances of that round.
+    "student-timeout-reading": "按照官方文档的timeout报错口径，哪些优化会导致超时呢",
+    "student-drop-inverted": "如果舍弃倒排索引，其他的优化是不是无效了",
+    "student-converge-gate": "我觉得先去掉倒排索引，通过门槛比较重要",
 }
 
 # The turns that the record may be without. A turn of this list is not the
@@ -456,6 +488,35 @@ AGENT_AUTHORED_PREFIXES = (
     "五个必须纠正的问题",
 )
 
+# The prompts whose text the agent wrote and the student forwarded.
+#
+# The supervising session works like this: the student asks for a prompt
+# ("给出提示词"), the agent writes one ("Here is the prompt"), and the
+# student pastes that text into the working session. The text the working
+# session receives is therefore the agent's, even though the student
+# pressed enter on it.
+#
+# The rules of the statement ask for the source of every piece to be
+# marked, and they count only what the student came up with. A prompt
+# that the agent wrote is not the student's own contribution, so it is
+# listed with `source: "agent_draft"`, it is not used as the evidence of
+# any instance, and the instances that were built on it are moved to the
+# retrospective.
+#
+# The list is checked against the record by
+# `tools/check_prompt_authorship.py`, which reads the transcripts and
+# finds the turns where the student asked for a prompt and the answer
+# contains this text.
+AGENT_DRAFTED_PROMPTS = {
+    "admission-gate": "学生在监督会话里说「给出提示词」，Agent 回「以下是给你的提示词」，学生把这段原样贴进工作会话。",
+    "fix-complexity": "学生在监督会话里说「给出完整提示词」，Agent 回「## 完整提示词」，学生把这段原样贴进工作会话。",
+    "localise-timeout": "学生在监督会话里说「给出简要分析报告和agent的诊断提示词」，Agent 回的提示词被原样贴进工作会话。",
+    "deliver-fix": "学生在监督会话里说「给出提示词」，Agent 回「# 给 agent 的提示词」，学生把这段原样贴进工作会话。",
+    "shape-no-where": "学生在监督会话里说「给出新的提示词」，Agent 回「I now have all the facts. Here is the new prompt.」，学生把这段原样贴进工作会话。",
+    "whole-case-budget": "与 shape-no-where 是同一段 Agent 提示词，学生把它贴进工作会话的次数不同。",
+    "remove-inverted": "学生在监督会话里说「我觉得先去掉倒排索引……给出一份快速修改收敛的提示词」，Agent 回「I've verified everything. Here is the prompt.」，学生把这段原样贴进工作会话。",
+}
+
 
 def build_prompts(turns, index_of):
     """The prompts of the student, in the order they were written.
@@ -507,7 +568,8 @@ def build_prompts(turns, index_of):
         seen_text.add(text)
         index = len(out)
         index_of_turn[turn_index] = index
-        content = keep(text, PROMPT_LIMITS.get(marker, MAX_PROMPT_CHARS))
+        content = readable(keep(text, PROMPT_LIMITS.get(marker,
+                                                         MAX_PROMPT_CHARS)))
         # The text of the student that the material keeps, without the
         # marker of the cut: the marker is a note of the material and not
         # a word of the student, so no excerpt of evidence carries it.
@@ -516,18 +578,37 @@ def build_prompts(turns, index_of):
             "id": "up-%02d" % (index + 1),
             "time": PROMPT_DAYS.get(marker, "2026-11-10T14:23:00+08:00"),
             "content": content,
-            "source": "student",
+            # Who wrote this text. It is the student for everything the
+            # student wrote himself. It is "agent_draft" for the prompts
+            # of the supervising session that the agent wrote and the
+            # student forwarded: the student pressed enter on them, but
+            # the words are the agent's, and the rules ask for the source
+            # of every piece to be marked.
+            "source": "agent_draft" if marker in AGENT_DRAFTED_PROMPTS
+            else "student",
             # The excerpt is a verbatim part of the text of the student,
             # and it is taken out of the text that the material keeps, so
             # that the reviewer can locate it in the prompt in front of
             # them and not only in the record.
             "excerpt": excerpt_of(kept),
         }
+        if marker in AGENT_DRAFTED_PROMPTS:
+            # The reason the text is not the student's own. It is kept in
+            # the material, because the turn is a fact about the project
+            # and the reviewer has to be able to see the prompt the
+            # student worked from, but it is not evidence of the student.
+            prompt["author_note"] = AGENT_DRAFTED_PROMPTS[marker]
         note = PROMPT_NOTES.get(marker)
         if note:
             prompt["note"] = note
         elif marker in PLAN_PROMPTS:
             prompt["note"] = "执行一份已经写好的计划，本身不含新的判断。"
+        summary = CUT_SUMMARIES.get(marker)
+        if summary and CUT_MARKER in content:
+            # The prompt was cut. The part that was cut off is summarised
+            # here, so that the reviewer knows what the whole prompt asked
+            # for without reading a file outside of this one.
+            prompt["cut_summary"] = summary
         out.append(prompt)
     return out, index_of_turn
 
@@ -547,6 +628,15 @@ def build_prompts(turns, index_of):
 #
 # The limit is per prompt: a prompt is kept as long as the excerpt that
 # is cited out of it needs.
+#
+# The cut must not send the reader outside of this file. The rules say
+# that the reviewer reads this file alone and does not read the other
+# files of the repository, so a cut that points at the development log
+# leaves a gap the reviewer cannot close, and the rules ask for that case
+# to be marked as "evidence insufficient" rather than scored. The marker
+# therefore says only that the text continues, and the part that is
+# dropped is summarised in the material itself, in the note of the
+# prompt.
 MAX_PROMPT_CHARS = 3200
 
 PROMPT_LIMITS = {
@@ -575,6 +665,16 @@ PROMPT_LIMITS = {
     "admission-gate": 1419,
     # The excerpt of the instance of this turn is at 490.
     "fix-complexity": 491,
+    # The prompts the agent drafted. Their attribution is what the
+    # reviewer needs, and the opening of the prompt is enough to see
+    # that it is an instruction written by the agent rather than a
+    # question of the student. The rest of the text is the detail of the
+    # round, and the rounds are in the experiments of the material.
+    "admission-gate": 300,
+    "deliver-fix": 300,
+    "shape-no-where": 300,
+    "whole-case-budget": 300,
+    "remove-inverted": 300,
     # The three turns of the student about this round are short, so they
     # are kept whole.
     "student-timeout-reading": 200,
@@ -583,7 +683,89 @@ PROMPT_LIMITS = {
 }
 
 
-CUT_MARKER = "\n\n[… 该条消息的后续部分见开发记录 …]"
+CUT_MARKER = "\n\n[… 该条消息在此处截断，后续内容未收入本材料 …]"
+
+# What the cut off part of a prompt said, in the words of the material.
+#
+# The material has a limit of 128 KiB and the long prompts do not fit in
+# it whole. The part that is cut off is summarised here, so that the
+# reviewer does not have to reach for a file outside of this one to know
+# what the prompt asked for. The summary is a reading of the prompt, the
+# way the note of a prompt is: it is not quoted as the student's words
+# and it is never used as evidence.
+CUT_SUMMARIES = {
+    "localise-timeout": (
+        "截断的部分是这一轮的三个阶段的手册：先写一个能分别测握手 / 语句 / 关闭的"
+        "复现器（每一步都要留下可复跑的脚本和墙钟数字），再把三种负载各跑一遍，"
+        "最后把「超时」落到一条具体的语句上。"
+    ),
+    "remeasure-axes": (
+        "截断的部分是三轴表的完整数字，以及必须重测的三条理由："
+        "流式化 + LIMIT 提前结束可能让查询更快；"
+        "三个缓存分摊一份预算（原来是各 64 MiB = 192 MiB）可能让查询变慢；"
+        "响应不构造 JSON 树应该更快。"
+    ),
+    "platform-fail-3": (
+        "截断的部分是这次反馈的完整四行：MySQL 正式用例未通过（准入条件）、"
+        "性能未执行、Agent Prompt 未执行，原因是 JSON response timeout。"
+    ),
+    "experiments-ab": (
+        "截断的部分是第二个实验的完整描述："
+        "scalar 池从 16 MB 提到 64 MB（split_pool_budget 改一处），"
+        "同样跑 4M 行；两个实验各自单独跑，才能分辨是哪一处起的作用。"
+    ),
+    "seal-and-push": (
+        "截断的部分是封版的判据：今天第一次额度用它提测，"
+        "只拿 E 和三轴分项做口径校准，不要为了多榨一点分而把没验证过的东西带进去。"
+    ),
+    "platform-fail-2": (
+        "截断的部分是这次反馈的完整四行：MySQL 正式用例未通过（准入条件）、"
+        "性能未执行、Agent Prompt 未执行，原因是 database exited before response。"
+    ),
+    "diff-against-scoring": (
+        "截断的部分是这条要求的后半句：对照官方文档和上游仓库的要求检查之后，"
+        "先给出结论，不要边查边改。"
+    ),
+    "platform-feedback": (
+        "截断的部分是 Agent Prompt 一项的完整反馈："
+        "Prompt 结果无效、待复核、超出平台 0–100 范围或缺少材料摘要，"
+        "本项不参与排名，未截断或换算本地分数。"
+    ),
+    "whole-case-budget": (
+        "与 shape-no-where 是同一段 Agent 提示词，学生把它贴进工作会话的次数不同。"
+        "这一段把诊断对象从「ANN 是不是根因」换成了「判题器到底在测什么」："
+        "官方 `vector_index_maintenance` 的三条向量查询一条 WHERE 都没有，"
+        "而上一轮的放大用例自己加了 `WHERE category = 'c3'`；"
+        "同时把判题器的三个预算（启动 120 s / 语句 60 s / 整例 600 s）分开量。"
+    ),
+    "deliver-fix": (
+        "这一段是根因锁定之后那一轮的收尾提示词。"
+        "它要的是：只做修复、回归与提测，把结论写进 ledger；"
+        "其中包括把去掉倒排索引之后那条「带过滤的查询答了空集」的静默错误修好——"
+        "根因是倒排索引顺手替扫描补上了一个洞："
+        "事务里 UPDATE 过的行在块里还带着旧值，而扫描拿旧值去判断过滤。"
+        "**倒排索引在这里不只是加速结构，它还是一个被无意中依赖的正确性补丁；"
+        "去掉它，扫描就必须自己把事务的暂存更新叠上去。**"
+    ),
+    "remove-inverted": (
+        "这一段是去掉倒排索引那一轮的提示词。"
+        "它要的是：在**去掉倒排索引**之后，先用一道闸门证明「答案与基线逐字节相同」，"
+        "并把判题器的三个预算（启动 120 s / 语句 60 s / 整例 600 s）分开量——"
+        "因为 `remaining()` 取的是 `min(语句预算, 整例剩余)`，"
+        "**整例耗尽与单条超预算是同一个签名**，而此前测的全是单条语句。"
+    ),
+    "admission-gate": (
+        "截断的部分是准入验证的五步：每一项都有判据，"
+        "任何一项不满足就立刻停止，不要提测；"
+        "其中包括用官方判题器跑一遍放大用例，以及逐字节比对答案。"
+    ),
+    "fix-complexity": (
+        "截断的部分是这一轮的收尾清单："
+        "把选心改回纯内存（样本向量读一次、平铺成 Vec<f32>、选心零次全表扫描）、"
+        "删掉 for_each_sample_row、改正模块文档里 1 MiB / 4 MiB 的错误注释、"
+        "跑时间预算闸门，然后提交。"
+    ),
+}
 
 
 def keep(text, limit=MAX_PROMPT_CHARS):
@@ -834,7 +1016,7 @@ def build_conversations(turns, index_of):
         for source, role, part, start, length in spec["turns"]:
             turn = turns[index_of[source]]
             if role == "student":
-                content = turn["user"]
+                content = readable(turn["user"])
                 items.append({
                     "role": "student",
                     "content": content,
@@ -842,7 +1024,8 @@ def build_conversations(turns, index_of):
                     "source": "record:%s" % source,
                 })
             else:
-                content = take(turn["agent_parts"], part, start, length)
+                content = readable(take(turn["agent_parts"], part, start,
+                                        length))
                 items.append({
                     "role": "agent",
                     "content": content,
@@ -2324,7 +2507,7 @@ EXPERIMENTS = [
         ),
         "command": (
             "读 protocol_check/config.json 的三个超时预算；"
-            "读 engine.rs 里 rebuild_vector_indexes 与握手��先后；"
+            "读 engine.rs 里 rebuild_vector_indexes 与握手的先后；"
             "读 e099f5516 对 index.rs 的改动"
         ),
         "result": (
@@ -2805,6 +2988,12 @@ MOVED_TO_RETROSPECTIVE = {
     # 所以只保留其中一条，另外两条移到这里。
     "e-20": "与 e-11 是同一次复查的重复表述",
     "e-35": "与 e-11 是同一次复查的重复表述",
+    # 这三条实例的出发点，是监督会话里 Agent 起草、学生转发的提示词。
+    # 文字是 Agent 写的，所以按题面 §3.4.1「只给学生自身有证据支持的贡献计分」，
+    # 它们不能算作学生的证据；实测结果是真的，留在复盘里。
+    "e-51": "出发点是 Agent 起草、学生转发的提示词，文字不是学生自己的",
+    "e-52": "出发点是 Agent 起草、学生转发的提示词，文字不是学生自己的",
+    "e-54": "出发点是 Agent 起草、学生转发的提示词，文字不是学生自己的",
 }
 
 
@@ -2828,6 +3017,16 @@ def prune_prompts(prompts, index_of_turn, index_of, experiments_spec):
         turn_index = index_of.get(spec.get("student_turn"))
         index = index_of_turn.get(turn_index)
         if index is not None:
+            wanted.add(index)
+
+    # The prompts the agent drafted are kept even though no scored
+    # instance quotes them. They are a fact about the project: the
+    # student worked from them, and the reviewer has to be able to see
+    # that the turns which are quoted as the student's own words are
+    # really the student's. The attribution of a prompt that is not in
+    # the material is not checkable by the reviewer.
+    for turn_index, index in index_of_turn.items():
+        if prompts[index]["source"] != "student":
             wanted.add(index)
 
     kept = []
@@ -2877,6 +3076,14 @@ def build_experiments(prompts, index_of_turn, index_of):
         marker = spec.get("student_turn")
         turn_index = index_of.get(marker)
         index = index_of_turn.get(turn_index)
+        if index is not None and prompts[index]["source"] != "student":
+            # The prompt this instance was built on was written by the
+            # agent and only forwarded by the student. The rules count
+            # only what the student came up with, so this instance cannot
+            # be scored on the student. It is moved to the retrospective
+            # with the other instances that carry no evidence of the
+            # student, and its result is kept there.
+            index = None
         if index is not None:
             prompt = prompts[index]
             # The evidence of the student quotes a part of the prompt that
@@ -3431,17 +3638,29 @@ RETROSPECTIVE = {
 LIMITATIONS = {
     "scope": (
         "本材料覆盖 MiniVectorDB（加赛赛题一）从空分支到可提测状态的开发过程，"
-        "时间跨度 2026-11-09 至 2026-11-14。"
-        "所有 prompt 均为学生真实输入，所有实验命令均为真实执行过的命令，"
-        "所有 result 均为真实观察到的输出。"
+        "时间跨度 2026-11-09 至 2026-11-15。"
+        "所有 prompt 都是会话记录里真实出现过的输入，其中一部分的文字是 Agent 起草、"
+        "学生转发的，这部分在 `user_prompts[].source` 上标为 `agent_draft`；"
+        "所有实验命令均为真实执行过的命令，所有 result 均为真实观察到的输出。"
     ),
     "synthetic": False,
     "authorship": (
         "每一段文字的作者都标在它自己的字段上。\n"
         "\n"
-        "`user_prompts`：`content` 是学生本人的输入，**逐字**来自会话记录，未作删改；"
+        "`user_prompts`：`content` 逐字来自会话记录，未作删改。"
+        "`source` 标明这段文字是谁写的：\n"
+        "+ `student`：学生本人写的。\n"
+        "+ `agent_draft`：**文字是 Agent 起草的，学生只是把它转发到工作会话**。"
+        "监督会话里学生说「给出提示词」，Agent 回一段提示词，学生把那段原样贴进"
+        "工作会话——学生按了回车，但字是 Agent 写的。题面 §3.4.1 说"
+        "「只给学生自身有证据支持的贡献计分：Agent 自动给出的优秀规划、"
+        "技术解释、代码或修复，不直接证明学生理解」，"
+        "所以这一类 prompt **不被任何实例当作学生证据引用**；"
+        "`author_note` 写明它是哪一次转发。\n"
         "`note` 是对这段输入的读法，不是学生的原话。"
-        "过长的指令在材料里按行截断，被截掉的后半部分在开发记录里原样保留。\n"
+        "过长的指令在材料里按行截断；被截掉的部分由同一行的 `cut_summary` "
+        "在本材料内说明，因此评审只读本文件即可知道这条 prompt 要求了什么，"
+        "不必去读仓库里的其他文件。\n"
         "\n"
         "`conversations`：每个 turn 都有 `role`（`student` 或 `agent`）"
         "与 `source`（指向记录里的第几轮）。学生的 turn 是原话，"
@@ -3455,7 +3674,7 @@ LIMITATIONS = {
         "标为 `agent` 的，`student_evidence` 为 null——"
         "因为该实例没有以学生的发言为起点，把它硬挂到某句学生的话上会是编造。\n"
         "\n"
-        "**计分实例全部由学生提出假设。** "
+        "**计分实例全部由学生提出假设，且每一条都有学生的原话。** "
         "假设由 Agent 提出的实例按题面 §3.4.1 本就不计分，"
         "所以它们连同实测结果移到了归档文件 "
         "`agent/archive/unscored-instances.json`："
@@ -3576,11 +3795,16 @@ MATERIAL_SUMMARY = {
         "第八轮在第五次准入失败之后，先核对**判题用的用例长什么样**"
         "（它一条 WHERE 都没有），"
         "再把判题器的三个预算分开量（整例 600 秒 vs 单条 60 秒），"
-        "最后按「税是确定的、收益是有条件的、条件不成立」这条理由去掉倒排索引。"
+        "最后按「税是确定的、收益是有条件的、条件不成立」这条理由去掉倒排索引；"
+        "第九轮在第八轮提测**准入通过、性能原始分升到 2617.947084** 之后，"
+        "没有继续压性能，而是回头核对材料本身："
+        "把「Agent 起草、学生转发」的提示词如实标出来，"
+        "把最近一轮缺失的学生证据补齐，"
+        "并去掉材料里指向仓库外部的引用。"
     ),
     "outcome": (
         "官方 MySQL 正式用例全部通过（准入条件），"
-        "性能原始分 1829.577226；"
+        "性能原始分 2617.947084（提测提交 `d0eed67d3`）；"
         "本地另测 143 项单测、15 项协议测试、20/20 官方公开用例、"
         "13/13 差分自测、12 轮崩溃恢复（宿主与容器）、27/27 正式要求检查。\n"
         "第四轮把查询阶段的 1090 ms 拆到阶段："
@@ -3644,7 +3868,16 @@ MATERIAL_SUMMARY = {
         "连同它们的实测结果一并收在 "
         "`agent/archive/unscored-instances.json` 里，"
         "结果原文未改，只是不再占用计分实例的名额，"
-        "也不再占用本文件的长度。"
+        "也不再占用本文件的长度。\n"
+        "**关于作者归属的一句实话**：本材料早先版本把所有 prompt 都标成了"
+        "「学生本人输入」。逐条回核会话记录后发现，"
+        "有七条长提示词是监督会话里 **Agent 起草、学生转发**的"
+        "（学生在监督会话里说「给出提示词」，Agent 回一段，学生把那段贴进工作会话）。"
+        "现版本把这七条标为 `source: \"agent_draft\"`，"
+        "并把建立在它们之上的三个实例移到归档文件——"
+        "按题面 §3.4.1，Agent 起草的内容不证明学生理解。"
+        "**这不是把材料做小，而是把材料的归属说准**："
+        "标错的归属会让评审怀疑全部实例，而如实标出反而让剩下的实例更可信。"
     ),
     "known_gaps": (
         "题面明文不要求的 SQL 子集未实现，按约定返回错误；"

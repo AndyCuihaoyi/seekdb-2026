@@ -48,6 +48,21 @@ DIMENSIONS = (
 # the reviewer has something to score in every dimension.
 MIN_INSTANCES_PER_DIMENSION = 2
 
+# The sources a prompt may have. `student` is for the prompts the student
+# wrote himself, `agent_draft` for the prompts of the supervising
+# session that the agent wrote and the student forwarded.
+PROMPT_SOURCES = ("student", "agent_draft")
+
+# The words that send the reader outside of this file. The rules say that
+# the reviewer reads this file alone and does not read the other files of
+# the repository, so a reference to the development log leaves a gap that
+# cannot be closed and the case has to be marked as "evidence
+# insufficient" rather than scored.
+OUTSIDE_REFERENCES = (
+    "见开发记录",
+    "topics/mvdb-01-minivectordb/",
+)
+
 
 def fail(problems, message):
     problems.append(message)
@@ -186,11 +201,22 @@ def check_experiments(doc, problems):
 
 
 def check_prompts(doc, problems):
-    """Check that every prompt is marked with its author."""
+    """Check that every prompt is marked with its author.
+
+    The source is either `student`, for the prompts the student wrote
+    himself, or `agent_draft`, for the prompts of the supervising
+    session that the agent wrote and the student forwarded. A prompt
+    whose text the agent drafted has to say so: the rules count only
+    what the student came up with, and a prompt that is marked as the
+    student's while the record says otherwise makes the reviewer doubt
+    every attribution in the file.
+    """
     for i, prompt in enumerate(doc.get("user_prompts", [])):
         where = "/user_prompts/%d" % i
-        if prompt.get("source") != "student":
-            fail(problems, "%s is not marked as the work of the student" % where)
+        source = prompt.get("source")
+        if source not in PROMPT_SOURCES:
+            fail(problems, "%s has the source %r, which is not one of %s"
+                 % (where, source, " / ".join(PROMPT_SOURCES)))
         content = prompt.get("content")
         excerpt = prompt.get("excerpt")
         if not isinstance(content, str) or not content.strip():
@@ -202,6 +228,85 @@ def check_prompts(doc, problems):
         if excerpt not in content:
             fail(problems, "the excerpt of %s is not a verbatim part of it"
                  % where)
+        if source == "agent_draft":
+            # The reason the text is not the student's own is part of the
+            # material: without it the reviewer only sees the label and
+            # cannot tell whether the label is right.
+            note = prompt.get("author_note")
+            if not isinstance(note, str) or not note.strip():
+                fail(problems, "%s is marked as an agent draft but has no "
+                               "author_note" % where)
+
+
+def check_agent_drafts_are_not_evidence(doc, problems):
+    """Check that no instance is scored on a prompt the agent wrote.
+
+    The rules say that only what the student came up with is counted.
+    An instance whose evidence points at a prompt the agent drafted
+    would claim a contribution of the student that is not there.
+    """
+    sources = {}
+    for i, prompt in enumerate(doc.get("user_prompts", [])):
+        sources["/user_prompts/%d" % i] = prompt.get("source")
+
+    for i, experiment in enumerate(doc.get("experiments", [])):
+        where = "/experiments/%d" % i
+        block = experiment.get("student_evidence")
+        if not isinstance(block, dict):
+            continue
+        pointer = block.get("prompt_pointer")
+        if not isinstance(pointer, str):
+            continue
+        if sources.get(pointer) == "agent_draft":
+            fail(problems, "%s is scored on the prompt %s, which the agent "
+                           "drafted" % (where, pointer))
+
+
+def check_every_instance_has_student_evidence(doc, problems):
+    """Check that no scored instance is without the student's own words.
+
+    An instance that is marked as the student's hypothesis but carries no
+    student evidence has nothing for the reviewer to score. The rules
+    ask for the evidence of the student and the evidence of the result
+    to be given apart, and an instance with only the result is not an
+    instance of the student's understanding.
+    """
+    for i, experiment in enumerate(doc.get("experiments", [])):
+        where = "/experiments/%d" % i
+        if experiment.get("hypothesis_author") != "student":
+            continue
+        block = experiment.get("student_evidence")
+        if not isinstance(block, dict):
+            fail(problems, "%s has no student evidence" % where)
+            continue
+        excerpt = block.get("excerpt")
+        if not isinstance(excerpt, str) or not excerpt.strip():
+            fail(problems, "%s has no student excerpt" % where)
+
+
+def check_material_is_self_contained(doc, problems):
+    """Check that the material does not send the reader outside of it.
+
+    The rules say that the reviewer reads this file alone. A pointer to
+    the development log or to any other file of the repository leaves a
+    gap the reviewer cannot close, and the rules ask for that case to be
+    marked as "evidence insufficient" rather than scored.
+    """
+    def walk(node, path):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                walk(value, path + "/" + key)
+        elif isinstance(node, list):
+            for j, value in enumerate(node):
+                walk(value, path + "/" + str(j))
+        elif isinstance(node, str):
+            for needle in OUTSIDE_REFERENCES:
+                if needle in node:
+                    fail(problems, "%s points outside of the material: %r"
+                         % (path, needle))
+                    return
+
+    walk(doc, "")
 
 
 def check_evidence_is_not_shared(doc, problems):
@@ -337,6 +442,9 @@ def main():
             check_excerpts(doc, problems)
             check_experiments(doc, problems)
             check_prompts(doc, problems)
+            check_agent_drafts_are_not_evidence(doc, problems)
+            check_every_instance_has_student_evidence(doc, problems)
+            check_material_is_self_contained(doc, problems)
             check_evidence_is_not_shared(doc, problems)
             check_instances_are_independent(doc, problems)
             check_dimensions(doc, problems)
