@@ -150,3 +150,22 @@ student_evidence = null
   产生「材料类型判断不一致」的概率显著下降；
 * 任一维度都不会因为「证据不足」被判 `null`；
 * 材料与当前代码（`d0eed67d3`）一致，不会再出现「货不对版」。
+
+## 6. 已实施（提交 `1ef7f26d8`）
+
+| 项 | 落地 |
+| --- | --- |
+| P0-1 作者归属 | `AGENT_DRAFTED_PROMPTS` 列出七条 Agent 起草、学生转发的提示词；`user_prompts[].source` 区分 `student` / `agent_draft`，后者带 `author_note`。材料里保留了 4 条代笔 prompt（其余被剪枝），**代笔文本一律不进 `student_evidence`** |
+| P0-2 缺失证据 | `TURN_MARKERS` 补上 `student-timeout-reading` / `student-drop-inverted` / `student-converge-gate`；21 个计分实例**全部**同时有 `student_evidence` 与 `result_evidence`（原先 e-56/57/58 的 `student_evidence` 是 `null`） |
+| P1-1 自包含 | 截断标记由「后续部分见开发记录」改为「在此处截断，后续内容未收入本材料」；九条被截断的 prompt 各配一条 `cut_summary`，把截掉的内容在材料内说清；材料中已无任何指向仓库外部的指针 |
+| P1-2 摘要对齐 | `material_summary` 改为第九轮、E = 2617.947084、提测提交 `d0eed67d3`，并如实写出这次修正了什么；旧值 1829.577226 不再出现在 `outcome` 里 |
+| P1-3 校验器 | `check_conversation_json.py` 新增四条断言；新增 `tools/check_prompt_authorship.py`，对着真实 transcript 双向核对每条 prompt 的归属（已用人为改错验证过它确实会抓） |
+| 附带 | transcript 里有几处字节解码失败留下的替换字符（U+FFFD），现在统一命名为「[此处一个字节无法解码]」；材料里已无该字符 |
+
+### 改后的材料
+
+* 大小 128 986 B（限额 131 072 B），`conversation.json` 与 `agent/conversation.json` 逐字节一致；
+* 维度覆盖：独立验证与质疑 7、取舍与反思 5、问题理解与自主拆解 4、技术理解与迁移 3、实验与反馈迭代 2；
+* 构建可重现：重跑构建器后工作区无差异；
+* **引擎代码与得分提交 `d0eed67d3` 逐字节相同**——本轮只动材料与工具。
+
