@@ -508,13 +508,13 @@ AGENT_AUTHORED_PREFIXES = (
 # finds the turns where the student asked for a prompt and the answer
 # contains this text.
 AGENT_DRAFTED_PROMPTS = {
-    "admission-gate": "学生在监督会话里说「给出提示词」，Agent 回「以下是给你的提示词」，学生把这段原样贴进工作会话。",
-    "fix-complexity": "学生在监督会话里说「给出完整提示词」，Agent 回「## 完整提示词」，学生把这段原样贴进工作会话。",
-    "localise-timeout": "学生在监督会话里说「给出简要分析报告和agent的诊断提示词」，Agent 回的提示词被原样贴进工作会话。",
-    "deliver-fix": "学生在监督会话里说「给出提示词」，Agent 回「# 给 agent 的提示词」，学生把这段原样贴进工作会话。",
-    "shape-no-where": "学生在监督会话里说「给出新的提示词」，Agent 回「I now have all the facts. Here is the new prompt.」，学生把这段原样贴进工作会话。",
-    "whole-case-budget": "与 shape-no-where 是同一段 Agent 提示词，学生把它贴进工作会话的次数不同。",
-    "remove-inverted": "学生在监督会话里说「我觉得先去掉倒排索引……给出一份快速修改收敛的提示词」，Agent 回「I've verified everything. Here is the prompt.」，学生把这段原样贴进工作会话。",
+    "admission-gate": "学生在监督会话里说「给出提示词」，Agent 回了一段，学生把那段原样贴进工作会话。",
+    "fix-complexity": "学生在监督会话里说「给出完整提示词」，Agent 回了一段，学生把那段原样贴进工作会话。",
+    "localise-timeout": "学生在监督会话里要一份诊断提示词，Agent 回的那段被原样贴进工作会话。",
+    "deliver-fix": "学生在监督会话里说「给出提示词」，Agent 回了一段，学生把那段原样贴进工作会话。",
+    "shape-no-where": "学生在监督会话里说「给出新的提示词」，Agent 回了一段，学生把那段原样贴进工作会话。",
+    "whole-case-budget": "与 shape-no-where 是同一段 Agent 提示词，贴进工作会话的次数不同。",
+    "remove-inverted": "学生在监督会话里要一份「去掉倒排索引」的提示词，Agent 回的那段被原样贴进工作会话。",
 }
 
 
@@ -665,16 +665,18 @@ PROMPT_LIMITS = {
     "admission-gate": 1419,
     # The excerpt of the instance of this turn is at 490.
     "fix-complexity": 491,
-    # The prompts the agent drafted. Their attribution is what the
-    # reviewer needs, and the opening of the prompt is enough to see
-    # that it is an instruction written by the agent rather than a
-    # question of the student. The rest of the text is the detail of the
-    # round, and the rounds are in the experiments of the material.
-    "admission-gate": 300,
-    "deliver-fix": 300,
-    "shape-no-where": 300,
-    "whole-case-budget": 300,
-    "remove-inverted": 300,
+    # The prompts the agent drafted. No instance quotes them, because the
+    # text is not the student's own. They are kept so that the reviewer
+    # can see that the turns which are quoted as the student's words are
+    # really the student's, and so that the attribution can be checked
+    # against the record. The opening of the prompt is enough to see
+    # whose it is, and the `cut_summary` of the prompt says what the
+    # whole of it asked for, so the body is kept short.
+    "admission-gate": 140,
+    "deliver-fix": 140,
+    "shape-no-where": 140,
+    "whole-case-budget": 140,
+    "remove-inverted": 140,
     # The three turns of the student about this round are short, so they
     # are kept whole.
     "student-timeout-reading": 200,
@@ -769,10 +771,29 @@ CUT_SUMMARIES = {
 
 
 def keep(text, limit=MAX_PROMPT_CHARS):
-    """The text of a prompt, cut to the length the material keeps."""
+    """The text of a prompt, cut to the length the material keeps.
+
+    A cut that lands on the line of separators that some of the prompts
+    open with keeps nothing worth reading: the reader sees a row of
+    signs and the cut, and learns nothing. So the separator lines at
+    the top of a prompt are left out, and the text that is kept begins
+    with the first line that says something.
+    """
     if len(text) <= limit:
         return text
-    cut = text[:limit]
+    body = text
+    while True:
+        stripped = body.lstrip(" \t")
+        if not stripped or not stripped[0] in "=─━═*#-":
+            break
+        newline = stripped.find("\n")
+        if newline == -1:
+            body = ""
+            break
+        body = stripped[newline + 1:]
+    if not body:
+        body = text
+    cut = body[:limit]
     end = cut.rfind("\n")
     if end > 0:
         cut = cut[:end]
@@ -836,15 +857,6 @@ def excerpt_of(text, limit=95):
 # student turns are quoted; the agent turns are quoted where they carry
 # the result of the exchange.
 CONVERSATIONS = [
-    {
-        "id": "c-01",
-        "topic": "读题面，核对交付形态，倒推该做什么",
-        "dimension": "问题理解与自主拆解",
-        "turns": [
-            ("read-docs", "student", None, None, None),
-            ("read-docs", "agent", 0, 0, 700),
-        ],
-    },
     {
         "id": "c-02",
         "topic": "对交付约束提出疑问：是不是非 Docker 不可",
@@ -1052,8 +1064,8 @@ def take(parts, part, start, length):
         # quoting.
         for candidate in parts:
             if len(candidate) >= 400:
-                return candidate.strip()
-        return (parts[0] if parts else "").strip()
+                return without_thinking(candidate).strip()
+        return without_thinking(parts[0] if parts else "").strip()
     text = parts[part]
     if start:
         # Move to the beginning of the paragraph that follows the cut.
@@ -1065,7 +1077,23 @@ def take(parts, part, start, length):
     end = piece.rfind("\n\n")
     if end > length * 0.6:
         piece = piece[:end]
-    return piece.strip()
+    return without_thinking(piece).strip()
+
+
+def without_thinking(text):
+    """The text with the reasoning of the agent taken out.
+
+    A few of the answers of the agent begin with the reasoning that
+    belongs to it. The rules do not ask for the hidden reasoning of the
+    agent, and it is not the evidence of the student, so it is left out
+    of the material. What is kept is the answer itself.
+    """
+    if "<think>" not in text:
+        return text
+    out = re.sub(r"<think>.*?</think>", "", text, flags=re.S)
+    # A mark that was never closed takes the rest of the text with it.
+    out = out.split("<think>")[0]
+    return out.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -3368,14 +3396,12 @@ RETROSPECTIVE = {
     # and dropping them would lose the measurement that they carry.
     "agent_side_measurements": {
         "note": (
-            "以下是假设由 Agent 提出、因而**不参与计分**的实验实例，"
-            "以及按题面 §3.4.2 与 §3.4.3 移出计分列表的实例。\n"
+            "假设由 Agent 提出、因而**不参与计分**的实验实例，"
+            "以及按题面 §3.4.2 与 §3.4.3 移出计分列表的实例，"
+            "都在 `agent/archive/unscored-instances.json` 里。"
             "它们的结果原文一字未改：结果是关于这个项目的事实，"
             "删掉会丢数据；但它们不构成学生的证据，"
-            "所以移到了 `agent/archive/unscored-instances.json`，"
-            "既不占用计分实例的名额，也不占用本文件的长度。\n"
-            "题面 §3.4.1 说 Agent 自动给出的规划、"
-            "技术解释、代码或修复不直接证明学生理解。"
+            "所以既不占用计分实例的名额，也不占用本文件的长度。"
         ),
         "archive": ARCHIVE_NAME,
         "count": 0,
@@ -3601,9 +3627,6 @@ RETROSPECTIVE = {
         "有限的 `--ann-nprobe` 才会给出真正近似的答案，此时召回率依赖数据分布。",
         "向量索引不落盘，启动时重建。题面允许这样做，"
         "但重建成本会计入恢复时间。",
-        "本材料覆盖的官方验证以 `2026-competition-round2` 分支上"
-        "已发布的 20 组公开用例为限；上游若在提测前再改协议，"
-        "本结论需重新验证。",
         "事务语义的覆盖依赖 `protocol_check` 已发布的用例；"
         "更细的隔离级别（READ COMMITTED / REPEATABLE READ / SERIALIZABLE）"
         "与显式锁语义尚未实现，按约定返回错误。",
@@ -3619,16 +3642,13 @@ RETROSPECTIVE = {
         "「本题不要求 NULL、JOIN、聚合、子查询、ALTER TABLE、外键、"
         "嵌套事务或主键更新。不支持的语句须返回约定错误」，"
         "且已逐条实测这 8 类语句确实返回了约定错误、"
-        "题面「必须支持」的 17 项全部成功。",
-        "错误码的冻结映射尚未公布。官方 `protocol_check/config.json` 的 "
+        "题面「必须支持」的 17 项全部成功。",        "错误码的冻结映射尚未公布。官方 `protocol_check/config.json` 的 "
         "`error_codes` 是空对象，题包 README 写着「正式映射以题包为准」；"
         "公开用例只用到 `duplicate_key` / `dimension_mismatch` / `unsupported_sql` "
-        "三个名字。本实现覆盖 9 个语义名"
-        "（`duplicate_key` / `dimension_mismatch` / `unsupported_sql` / "
-        "`syntax_error` / `no_such_table` / `no_such_column` / `data_error` / "
+        "三个名字。本实现覆盖 9 个语义名（这三个之外还有 `syntax_error` / "
+        "`no_such_table` / `no_such_column` / `data_error` / "
         "`value_out_of_range` / `transaction_state`），"
-        "但若正式映射使用了不同的名字，仍有失配的可能——"
-        "这是当前无法通过本地验证消除的不确定性。",
+        "但若正式映射使用了不同的名字，仍有失配的可能——"        "这是当前无法通过本地验证消除的不确定性。",
     ],
 }
 # ---------------------------------------------------------------------------
@@ -3642,6 +3662,7 @@ LIMITATIONS = {
         "所有 prompt 都是会话记录里真实出现过的输入，其中一部分的文字是 Agent 起草、"
         "学生转发的，这部分在 `user_prompts[].source` 上标为 `agent_draft`；"
         "所有实验命令均为真实执行过的命令，所有 result 均为真实观察到的输出。"
+        "材料自包含：评审只读本文件即可核对。"
     ),
     "synthetic": False,
     "authorship": (
@@ -3651,21 +3672,18 @@ LIMITATIONS = {
         "`source` 标明这段文字是谁写的：\n"
         "+ `student`：学生本人写的。\n"
         "+ `agent_draft`：**文字是 Agent 起草的，学生只是把它转发到工作会话**。"
-        "监督会话里学生说「给出提示词」，Agent 回一段提示词，学生把那段原样贴进"
+        "监督会话里学生说「给出提示词」，Agent 回一段，学生把那段原样贴进"
         "工作会话——学生按了回车，但字是 Agent 写的。题面 §3.4.1 说"
-        "「只给学生自身有证据支持的贡献计分：Agent 自动给出的优秀规划、"
-        "技术解释、代码或修复，不直接证明学生理解」，"
+        "「只给学生自身有证据支持的贡献计分」，"
         "所以这一类 prompt **不被任何实例当作学生证据引用**；"
         "`author_note` 写明它是哪一次转发。\n"
         "`note` 是对这段输入的读法，不是学生的原话。"
-        "过长的指令在材料里按行截断；被截掉的部分由同一行的 `cut_summary` "
-        "在本材料内说明，因此评审只读本文件即可知道这条 prompt 要求了什么，"
-        "不必去读仓库里的其他文件。\n"
+        "过长的指令按行截断，被截掉的部分由同一行的 `cut_summary` "
+        "在本材料内说明，因此评审只读本文件即可知道这条 prompt 要求了什么。\n"
         "\n"
         "`conversations`：每个 turn 都有 `role`（`student` 或 `agent`）"
         "与 `source`（指向记录里的第几轮）。学生的 turn 是原话，"
-        "Agent 的 turn 是该轮回答里与判断相关的一段，"
-        "取自该轮回答的**单个**消息，不是把多段拼接起来的。\n"
+        "Agent 的 turn 是该轮回答里与判断相关的**单个**消息中的一段。\n"
         "\n"
         "`experiments`：每个实例都有 `hypothesis_author`（`student` 或 `agent`），"
         "指明这个假设是谁提出的。标为 `student` 的，"
@@ -3685,52 +3703,33 @@ LIMITATIONS = {
     ),
     "missing": [
         "对话记录中的思考过程未收录。题面 §3.4.5 明确不要求提交隐藏思维链。",
-        "Agent 的部分回答很长，材料只保留了与判断相关的段落，"
-        "省略处用省略号标出；学生的发言一律逐字保留，未作删改。",
+        "Agent 的部分回答很长，材料只保留了与判断相关的段落；"
+        "学生的发言一律逐字保留，未作删改。",
         "官方回归的结论以 `2026-competition-round2` 分支已发布的 "
         "`protocol_check/` 与 `mysqltest/`（20 组公开用例）为准；"
         "上游尚未公开的隐藏用例不在本材料的验证范围内。"
         "已知的替代验证是：按官方 README 明列的 5 项正式要求逐条验收"
         "（27 项检查全部满足），并在判题沙箱的真实限制下把数据量推到 200 万行。"
         "**2026-11-14 补记**：本轮**用官方判题器本身**复现了平台的超时"
-        "（放大版，`status: TIMEOUT`、`message: JSON response timeout`、"
-        "168 010 ms），并在修复后由同一个判题器判为 `PASS`（108 298 ms）；"
+        "（放大版，`status: TIMEOUT`、`message: JSON response timeout`、"        "168 010 ms），并在修复后由同一个判题器判为 `PASS`（108 298 ms）；"
         "引用的是官方 `run.py` / `_transport.py` / `config.json`，不是自研脚本。",
         "协议改版前的那一版实现（纯 SQL 文本流）已不再保留为可运行状态，"
         "因此「改版前后」的对比是通过设计上的隔离（协议层参数化）"
         "与性能三轴持平来间接证明的，而非同一份代码的两次运行。",
-        "本材料早先版本的一个缺陷已修正，此处如实记录以便核对："
-        "旧版把 `experiments` 的 `hypothesis` 与 `interpretation` "
-        "在 `limitations.authorship` 中统称为「学生贡献」，"
-        "而逐条核对会话记录后确认这些实例大多出自 Agent；"
-        "现版本已按真实记录逐条标注 `hypothesis_author`，"
-        "并把 Agent 的推理留在 `interpretation` 里。"
-        "旧版还有一处去重缺陷：8 个实例引用了同一段学生原话，"
-        "而题面 §3.4.3 要求「同一证据不得跨实例或跨维度重复得分」；"
+        "**旧版的两个缺陷已修正，此处如实记录以便核对。** "
+        "一是作者归属：旧版把 `experiments` 的 `hypothesis` 与 `interpretation` "
+        "统称为「学生贡献」，而逐条核对记录后确认多数实例出自 Agent；"
+        "现版本按真实记录逐条标注 `hypothesis_author`。"
+        "二是去重：旧版有 8 个实例引用同一段学生原话，"
+        "而题面 §3.4.3 要求同一证据不得跨实例或跨维度重复得分；"
         "现版本为每个实例改引同一段发言中不同的片段，"
-        "并保证没有任何两个实例落在同一条 prompt 上。",
-        "本材料覆盖的正式提测版本是 `868b8cce2`；"
-        "之后又修掉了两个只有放大数据量才暴露的缺陷"
-        "（多行 INSERT 的 O(N²)、日志不回收导致的数据目录翻倍），"
-        "对应提交为 `2e910c8e5` 与 `faeb93e1c`；"
-        "再之后是随行数线性增长的内存（投影与扫描融合、LIMIT 提前结束、"
-        "响应直接写字符串、三个缓存分摊预算、标量块按真实字节计账）。"
-        "**本材料的提测候选是 `c561d44b9`**"
-        "（unlimited 模式改走精确路径）与去掉倒排索引的那一版，"
-        "下面这一轮的三条实例都发生在它们之前，"
-        "完整证据链在 `docs/perf/ledger.md` 的 §4.1.3.8 至 §4.1.3.11。",
-        "**本材料因 128 KiB 上限而做了一次取舍。** "
-        "第五轮新增实例与对话之后文件超出了上限，"
-        "于是裁掉了 16 个被后一轮的更强证据覆盖的早期实例。"
-        "被裁掉的都是**过程**而不是**结论**："
-        "它们的结论仍在保留实例的 `interpretation` 里。\n"
-        "**体积预算从第六轮起是主动设的。** "
-        "材料是从会话记录自动生成的，每一轮都会自己长一截；"
-        "第一次撞上限时文件是 131 468 字节，只差 396 字节就判不过。"
-        "现在构建器只输出**被计分实例引用过**的 prompt，"
-        "没有被实例引用的发言不占预算。"
-        "剪枝之后下标重新连续，"
-        "所以 `/user_prompts/N` 这个指针仍然指向它原来指向的那一条。",
+        "并保证没有任何两个实例落在同一条 prompt 上。",        "**本材料覆盖的正式提测版本与体积取舍。** "
+        "提测提交是 `d0eed67d3`（去掉倒排索引之后的那一版），"
+        "完整证据链在 `docs/perf/ledger.md` 的 §4.1.3.8 至 §4.1.3.11。"
+        "材料是从会话记录自动生成的，每一轮都会自己长一截，"
+        "所以构建器只输出**被计分实例引用过**的 prompt，"
+        "没有被实例引用的发言不占预算；"
+        "剪枝之后下标重新连续，`/user_prompts/N` 仍指向它原来指向的那一条。",
         "**一处如实记录的记录损坏与恢复。** "
         "2026-11-13 整理这份材料时，"
         "会话记录文件被后续的对话覆盖写入，"
@@ -3744,20 +3743,18 @@ LIMITATIONS = {
         "校验器 `check_conversation_against_record.py` 也把快照当作记录的一部分。"
         "**这条链路上没有一句新写的话**："
         "快照里的每一句都在本材料的早先版本里出现过，"
-        "而早先版本的每一句都是从记录里逐字摘出来的。",
-    ],
+        "而早先版本的每一句都是从记录里逐字摘出来的。",    ],
     "redaction": [
         "仓库 URL 中的访问令牌已移除，只保留仓库名与分支名。",
         "云实例的 IP 与端口未收录，与本题无关。",
-        "未收录任何访问密钥；本材料不含密钥。",
+        "本材料不含密钥。",
     ],
     "integrity": (
         "`experiments[].result` 中的数字逐字来自命令输出，"
         "包括 `1.57s`、`29106.1`、`5811434332.0`、`IDENTICAL` 等；"
         "`student_evidence.ref` 与 `result_evidence.ref` 是本文件内的 "
         "RFC6901 JSON pointer，可直接定位到原文；"
-        "为了让评审能直接定位，实验条目在 JSON 里是自包含的，"
-        "不依赖仓库里的其他文件。"
+        "实验条目在 JSON 里是自包含的。"
     ),
 }
 
@@ -3773,7 +3770,7 @@ MATERIAL_SUMMARY = {
         "轻量向量数据库；全部核心组件自行实现，不依赖任何外部 crate 或现成引擎。"
     ),
     "how": (
-        "分八轮推进，每一轮都由平台的反馈或题面的要求触发。"
+        "分九轮推进，每一轮都由平台的反馈或题面的要求触发。"
         "第一轮在题包未发布时把框架与可本地验证的部分做完；"
         "第二轮上游发布题包后按新协议重写协议层并做全量回归；"
         "第三轮正式提测后按官方明列的正式要求逐条验收，"
@@ -3835,9 +3832,9 @@ MATERIAL_SUMMARY = {
         "官方的 `vector_index_maintenance` 里三条向量查询**一条 WHERE 都没有**，"
         "而上一轮的放大用例自己加了 `WHERE category = 'c3'`——"
         "于是上一轮量到的机制只对一条不存在的路径成立。"
-        "第八轮把判题器的三个预算分开量：`remaining()` 取的是 "
-        "`min(语句预算, 整例剩余)`，所以**整例耗尽与单条超预算是同一个签名**，"
-        "而此前测的全是单条语句。"
+        "把判题器的三个预算分开量之后才看清："
+        "`remaining()` 取的是 `min(语句预算, 整例剩余)`，"
+        "所以**整例耗尽与单条超预算是同一个签名**，而此前测的全是单条语句。"
         "4M 行、每批 100 条的忠实序列上，单条语句最大 0.173 s（预算 60 s），"
         "可是整例的 91% 被写入吃掉，总耗时 245.8 s（预算 600 s）。\n"
         "第八轮据此去掉倒排索引——"
@@ -3871,8 +3868,7 @@ MATERIAL_SUMMARY = {
         "也不再占用本文件的长度。\n"
         "**关于作者归属的一句实话**：本材料早先版本把所有 prompt 都标成了"
         "「学生本人输入」。逐条回核会话记录后发现，"
-        "有七条长提示词是监督会话里 **Agent 起草、学生转发**的"
-        "（学生在监督会话里说「给出提示词」，Agent 回一段，学生把那段贴进工作会话）。"
+        "有七条长提示词是监督会话里 **Agent 起草、学生转发**的。"
         "现版本把这七条标为 `source: \"agent_draft\"`，"
         "并把建立在它们之上的三个实例移到归档文件——"
         "按题面 §3.4.1，Agent 起草的内容不证明学生理解。"
@@ -3880,8 +3876,8 @@ MATERIAL_SUMMARY = {
         "标错的归属会让评审怀疑全部实例，而如实标出反而让剩下的实例更可信。"
     ),
     "known_gaps": (
-        "题面明文不要求的 SQL 子集未实现，按约定返回错误；"
-        "错误码的冻结映射尚未公布，这是本地无法消除的不确定性。"
+        "题面明列的未实现项与错误码映射的不确定性，"
+        "逐条列在 `retrospective.known_limitations` 里。"
     ),
 }
 

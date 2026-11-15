@@ -102,13 +102,12 @@ def turns_of(path):
 
 
 def drafted_texts():
-    """The texts the agent wrote in answer to a request for a prompt.
+    """The answers of the agent to a request for a prompt.
 
-    The answers are returned as they are, and the turn of the student
-    that carries the text is returned with them: the material keeps a
-    cut of the prompt, so the cut cannot be looked for in the answer of
-    the agent directly. What is looked for is the turn of the student
-    whose text the agent wrote.
+    Only the answers that the agent gave in answer to a turn in which
+    the student asked for a prompt are returned. Those are the texts
+    that the agent wrote for the student to paste into the working
+    session.
     """
     found = []
     for path in sorted(glob.glob(os.path.join(RECORD, "*", "*.jsonl"))):
@@ -119,22 +118,39 @@ def drafted_texts():
                 # to paste.
                 continue
             for answer in turn["agent"]:
-                found.append((norm(turn["user"]), norm(answer)))
+                found.append(norm(answer))
     return found
 
 
 def was_drafted(content, drafts):
     """Whether the text of a prompt was written by the agent.
 
-    The material keeps a cut of the prompt, so the cut of the material
-    is not what is compared. The comparison is made the other way round:
-    the text of the turn of the student is looked for in the answer of
-    the agent, because that is the text that was written first.
+    The material keeps a cut of the prompt, and the cut lands wherever
+    the budget allowed, so the whole of the cut is not what can be
+    compared. The lines of the cut are compared one by one instead.
+
+    A prompt the student wrote that the agent then quoted back does not
+    make the prompt the agent's: the student wrote it first. The test
+    that tells the two apart is how much of the prompt the answer of the
+    agent holds: the agent's own prompt is held whole, while a quoted
+    piece of the student's message is held in a few lines of an answer
+    that is mostly something else.
+
+    The threshold is three quarters: the prompts of the agent that were
+    measured hold between seven eighths and all of their lines in the
+    answer, while the one prompt of the student that the agent quoted
+    back holds two thirds of its lines.
     """
-    for question, answer in drafts:
-        if question and question in answer:
-            return True
-    return False
+    lines = [ln for ln in content.split(" ") if len(ln) >= 24]
+    if not lines:
+        return False
+    hits = 0
+    for line in lines:
+        for answer in drafts:
+            if line in answer:
+                hits += 1
+                break
+    return hits * 4 >= len(lines) * 3
 
 
 def fail(problems, message):
@@ -158,10 +174,13 @@ def main():
         content = norm(prompt.get("content", ""))
         if len(content) < MINIMAL:
             continue
-        # The cut of the material is compared with the cut of the record:
-        # the first line of the prompt is enough to tell whose it is.
-        head = content[:HEAD]
-        drafted = any(head and head in answer for _, answer in drafts)
+        # The material keeps a cut of the prompt, and the cut lands
+        # wherever the budget allowed, so the whole of the cut is not
+        # what can be compared. The lines of the cut are compared one by
+        # one instead: a prompt the agent wrote has lines that appear in
+        # the answer of the agent and nowhere else, and a prompt the
+        # student wrote does not.
+        drafted = was_drafted(content, drafts)
         source = prompt.get("source")
         if drafted and source != "agent_draft":
             fail(problems, "%s is marked as %r, but the record shows that "

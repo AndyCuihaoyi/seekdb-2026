@@ -26,8 +26,15 @@ import json
 import os
 import sys
 
-# The limit of the statement is 128 KiB.
-MAX_BYTES = 128 * 1024
+# The limit of the statement is 128 KiB (131072 bytes).
+#
+# The material is held to the stricter of the readings that the wording
+# allows: 125 KB (125000 bytes). A file that is refused outright is
+# refused silently as far as the contestant is concerned, so the
+# material is kept below the number that every reading agrees on. The
+# build is reproducible, so the size is known before the file is
+# committed.
+MAX_BYTES = 125000
 
 # The limit of a cited excerpt.
 MAX_EXCERPT = 240
