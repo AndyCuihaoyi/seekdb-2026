@@ -2712,6 +2712,88 @@ python3 /tmp/official/protocol_check/run.py --image minivectordb:noinv \
   --package /tmp/amp_noinv --case vector_index_maintenance_amplified --output /tmp/ampnoinv_res
 ```
 
+### 4.1.3.12 The cores of the judge: one core or two, and where the
+### 600 seconds are actually spent
+
+The platform reported the same signature twice, on two commits whose
+**engine code was byte for byte identical** (§4.1.3.11.8, and the
+diff of `d0eed67d3` against `dc3d72ed6` in
+`agent/DIAGNOSIS-agent-prompt.md` §8). The material cannot reach the
+admission, because the material is read **after** the admission
+(题面 §3.4). So the question this section answers is the one that is
+left: **is the case close enough to the 600 s budget that the machine
+the judge runs on decides the outcome?**
+
+The answer is **yes**, and the margin is measurable.
+
+#### 4.1.3.12.1 The measurement: one core and two cores, the same binary
+
+`tools/measure_case_budget.py` already pins the server with `taskset`
+and charges the **official** budgets (`case_timeout` 600,
+`request_timeout` 60, `startup_timeout` 120, all read from the official
+`config.json`). Two runs of the **same binary**, at 4 000 000 rows, a
+kilobyte of text and a hundred rows per statement - the shape the
+platform describes:
+
+| the cores | the write | the whole case | the share of the 600 s |
+| --- | ---: | ---: | ---: |
+| **one** (`taskset -c 0`) | **282.9 s** | **301.2 s** | **50.2%** |
+| **two** (`taskset -c 0,1`) | **230.2 s** | **248.4 s** | **41.4%** |
+
+**One core instead of two costs the write 22.9% and the whole case
+21.2%.** The build is single threaded - there is no `rayon`, no
+`thread::spawn`, no `available_parallelism` anywhere in
+`minivectordb/src` - so the second core is of no use to the server.
+What the second core does do is take the **judge's own driver** off the
+one core the server is on, and the driver and the server then stop
+sharing a cache.
+
+**So the number of cores the judge happens to give is a first-order
+factor of the case, and it is a factor the code cannot control.**
+
+#### 4.1.3.12.2 Where the 600 s are actually spent, and the row count that breaks it
+
+The write is **91%** of the case (§4.1.3.11.1) and the write is
+linear in the number of rows. Both facts together give the number that
+matters:
+
+| the cores | the rows at which the case reaches 600 s |
+| --- | ---: |
+| one | **about 8.2 million** |
+| two | **about 10.0 million** |
+
+The two runs above are the two ends of that table, and the distance
+between them - **1.8 million rows** - is a distance that the platform
+never announces and that the candidate cannot see.
+
+**This is the shape of the failure the platform reported.** A case that
+writes *n* rows passes on a machine with two cores and times out on a
+machine with one, with the **same** binary, the **same** material and
+the **same** commit. And because `Session.remaining()` takes the
+smaller of the statement budget and what is left of the case budget
+(`_transport.py`), a case that runs out of its 600 s **raises the very
+same `TimeoutError("JSON response timeout")`** that a single slow
+statement raises. The message does not tell the two apart.
+
+#### 4.1.3.12.3 What this round did not do
+
+**This section changed no code.** The engine of `d0eed67d3` is the one
+that scored, and the only thing this round did with the measurement is
+to write down **how much room the case has** and **what the room depends
+on**:
+
+* at 4 000 000 rows the case uses **41%** of the budget on two cores
+  and **50%** on one;
+* the write grows **linearly** with the rows, at about 57.5 us per row
+  on two cores and 70.7 us per row on one;
+* therefore the case reaches its budget at about **10.0 M rows** on two
+  cores and about **8.2 M rows** on one.
+
+A case that writes four million rows has a **1.8 million row** margin
+against the machine the judge happens to run on. That margin is the
+honest answer to the question the platform's message asks, and it is
+the number the next round of the performance work has to move.
+
 ### 4.2 The write axis, and what it would take
 
 The write phase writes 11,407,360 B to the disk. The data files are

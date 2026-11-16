@@ -299,3 +299,66 @@ def remaining(self, timeout):
 `docs/perf/ledger.md` §4.1.3.11.5 已经写明，写入占了 600 s 预算的 91%，
 而去掉倒排索引只省下 3.3%——**剩下的那 91% 才是真正要压的东西**。
 但那是性能代码，按当前约定不动。
+
+## 9. 第十轮：核数是第一个影响因素（`ledger.md` §4.1.3.12）
+
+学生提出的怀疑是「**可能是测评机器的线程或者核心问题**」。这一轮把它测成了数字。
+
+### 9.1 为什么材料不可能是原因（已由 git 定死）
+
+`d0eed67d3` 与 `dc3d72ed6` 的 `minivectordb/` **tree 哈希相同**，
+`Dockerfile`、`Cargo.toml`、`Cargo.lock` 的 blob 也相同；
+两个 commit 之间改动的 7 个文件全是材料与工具。
+而 `Dockerfile` 只 `COPY minivectordb/Cargo.toml` 与 `minivectordb/src`，
+**根本不读 `conversation.json`，也不读 `tools/`**——镜像的输入逐字节相同。
+
+题面 §3.4 的顺序也是硬的：「**MySQL case 全部通过后**，由评测 Agent 分析
+选手随该次提交上传的 Agent prompt 材料」。材料是**准入之后**才被读的；
+§2.4 也写明「Agent prompt 材料无效仅将该项记为 0，仍可获得有效的性能得分」。
+**所以材料没有任何一条路径能进入 `JSON response timeout` 的成因里。**
+
+### 9.2 核数实测：1 CPU 与 2 CPU，同一份二进制
+
+`tools/measure_case_budget.py` 用 `taskset` 固定核数，并按官方
+`config.json` 的预算计时（`case_timeout` 600 / `request_timeout` 60 /
+`startup_timeout` 120）。4 000 000 行、每行一千字节文本、每批 100 条：
+
+| 核数 | 写入 | 整例 | 600 s 的占比 |
+| --- | ---: | ---: | ---: |
+| **1**（`taskset -c 0`） | **282.9 s** | **301.2 s** | **50.2%** |
+| **2**（`taskset -c 0,1`） | **230.2 s** | **248.4 s** | **41.4%** |
+
+**一个核比两个核，写入慢 22.9%，整例慢 21.2%。**
+`minivectordb/src` 里没有 `rayon`、没有 `thread::spawn`、没有
+`available_parallelism`——服务器是单线程的，第二个核唯一的作用是
+**把判题器自己的驱动进程从服务器所在的那个核上挪走**。
+
+### 9.3 换算到门槛上：临界行数差 180 万行
+
+写入占整例 91%，且随行数线性增长。于是：
+
+| 核数 | 整例到 600 s 的临界行数 |
+| --- | ---: |
+| 1 | 约 **820 万行** |
+| 2 | 约 **1000 万行** |
+
+**一个写 400 万行的用例，在两核的机器上用掉 41% 的预算，在一核的机器上用掉
+50%；两台机器之间的余量差 180 万行，而平台从不公布它给几核**
+（`--cpus=2` 是**配额**不是亲和，驱动与服务器是否同核也看不见）。
+
+再加上 `Session.remaining()` 取 `min(语句预算, 整例剩余)`，
+**整例耗尽 600 s 抛出的正是同一个 `TimeoutError("JSON response timeout")`**——
+这就是「同一份代码，一次通过、两次超时」的形状。
+
+### 9.4 这一轮的产物
+
+- `ledger.md` 新增 §4.1.3.12（核数、600 s 的去向、临界行数）；
+- 材料新增两个实例（`e-59` 核数、`e-60` 评审规则作为设计约束），
+  都在学生的原话上取证，`student_evidence` 与 `result_evidence` 齐全；
+- 消掉两处**结构上的重复**：`student_quote` 与 `student_evidence.excerpt`
+  是同一段字、`result_excerpt` 与 `result_evidence.excerpt` 也是同一段字，
+  现在指针直接指到证据块里的那个字段，**字节省下约 6 KB，证据一条没少**；
+- 去掉材料里唯一一处指向本材料之外的指针（`limitations.missing` 里
+  「完整证据链在 `docs/perf/ledger.md`」），改成指向本文件内的 `experiments`；
+- 引擎与构建文件仍与 `d0eed67d3` **逐字节相同**，本轮只动材料与文档。
+

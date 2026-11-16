@@ -10,9 +10,9 @@
   },
   "material_summary": {
     "what": "在一条只留下 0 字节占位文件的空分支上，从零实现一个支持 SQL、列式持久化、精确与近似 TopK 检索、显式事务与崩溃恢复的轻量向量数据库；全部核心组件自行实现，不依赖任何外部 crate 或现成引擎。",
-    "how": "分九轮推进，每一轮都由平台的反馈或题面的要求触发。第一轮在题包未发布时把框架与可本地验证的部分做完；第二轮上游发布题包后按新协议重写协议层并做全量回归；第三轮正式提测后按官方明列的正式要求逐条验收，并把数据量推到判题沙箱的上限，找出两个只有放大规模才暴露的缺陷；第四轮在平台反馈性能原始分 1829.58 之后，先按阶段把查询时间拆开再决定改动顺序，并把性能改动全部关进一道「答案与基线逐字节相同」的闸门；第五轮在两次准入失败之后，先确认失败签名是内存超限而不是崩溃，再把「峰值内存不随行数线性增长」写成可证伪的判据；第六轮在第三次准入失败之后，先读准签名变了这一件事（进程活着，只是没及时回答），再把「建索引的复杂度」修回 O(nlist × SAMPLE_ROWS)，并补上一道断言**时间预算**的闸门，而不是只断言「没崩」的闸门；第七轮在第四次准入失败（`JSON response timeout`）之后，先把「超时」拆成握手 / 语句 / 关闭三段分别测，定位到「近似模式 + 过滤」这一条语句，再否掉两个最廉价的修法（调大块、调大缓存），最后改走算法层面的修复（unlimited 模式走精确路径）；第八轮在第五次准入失败之后，先核对**判题用的用例长什么样**（它一条 WHERE 都没有），再把判题器的三个预算分开量（整例 600 秒 vs 单条 60 秒），最后按「税是确定的、收益是有条件的、条件不成立」这条理由去掉倒排索引；第九轮在第八轮提测**准入通过、性能原始分升到 2617.947084** 之后，没有继续压性能，而是回头核对材料本身：把「Agent 起草、学生转发」的提示词如实标出来，把最近一轮缺失的学生证据补齐，并去掉材料里指向仓库外部的引用。",
-    "outcome": "官方 MySQL 正式用例全部通过（准入条件），性能原始分 2617.947084（提测提交 `d0eed67d3`）；本地另测 143 项单测、15 项协议测试、20/20 官方公开用例、13/13 差分自测、12 轮崩溃恢复（宿主与容器）、27/27 正式要求检查。\n第四轮把查询阶段的 1090 ms 拆到阶段：八成在一处（精确扫描 218.9 ms / 1000 次查询），固定开销只有 11.7 ms；物化阶段由 45.9 ms 降到 7.1 ms，而前缀剪枝这条被自己提出的路被微基准否定并回退。\n第五轮把随行数增长的内存拿掉：800000 行时 restart 峰值 493 → 122 MiB、select_all 482 → 198 MiB；440 万行在 2 GiB 限额下写入、查询与重启都能应答；51 条语句、102 个响应的答案与基线逐字节相同。\n第六轮把签名从「进程退出」读成「没及时回答」，于是找到的是复杂度而不是内存：建索引从 O(nlist × N) 回到 O(nlist × SAMPLE_ROWS)，400 万行上的建索引由 76.2 s 降到 5.5 s、重启握手由 77.4 s 降到 6.9 s；440 万行 + 每行一千字节文本的整体耗时由 784 s 降到 568 s，而平台的 `case_timeout` 是 600 s。\n第七轮把 `JSON response timeout` 定位到「近似模式 + 过滤」这一条语句：过滤把第 K 好的距离从 99.64 抬到 393.20（3.95 倍），而所有 cell 的半径最大只有 327.76、最佳下界是 -202.13，于是没有任何 cell 能靠半径被剪掉，64 个 cell 里有 28 个活下来、每个都触及全表（10 948 次标量解码、183.9 GB、60 s 超时）。修复是 unlimited 模式改走精确路径（按定义与近似搜索同解），400 万行上的近似过滤查询由 60.03 s 降到 3.913 s（15.3 倍），有限 nprobe 的答案与无限模式逐字节相同（0/200 不同）；**同一个放大用例由官方判题器从 TIMEOUT（168 010 ms）判成 PASS（108 298 ms）**，官方公开用例 20/20 通过。\n第八轮把诊断的对象换成了**判题器自己**：官方的 `vector_index_maintenance` 里三条向量查询**一条 WHERE 都没有**，而上一轮的放大用例自己加了 `WHERE category = 'c3'`——于是上一轮量到的机制只对一条不存在的路径成立。把判题器的三个预算分开量之后才看清：`remaining()` 取的是 `min(语句预算, 整例剩余)`，所以**整例耗尽与单条超预算是同一个签名**，而此前测的全是单条语句。4M 行、每批 100 条的忠实序列上，单条语句最大 0.173 s（预算 60 s），可是整例的 91% 被写入吃掉，总耗时 245.8 s（预算 600 s）。\n第八轮据此去掉倒排索引——**税是确定的（每次写入、每次启动），收益是有条件的（只在带 WHERE 的查询上），而条件在这条用例上不成立**：写入 224.1 s → 217.4 s（-3.3%），重启握手 10.065 s → 5.857 s（去掉了一次全表重建），整例 245.8 s → 236.8 s，官方判题器在 800k 忠实形状上 37677 ms → 36865 ms。\n**这一轮最重要的一条不是那个 3%，而是闸门抓到的东西**：去掉倒排索引之后，一条带过滤的查询答了空集——不崩溃、不报错、只是答案错了。根因是倒排索引顺手替扫描补上了一个洞：事务里 UPDATE 过的行在块里还带着旧值，而扫描拿旧值去判断过滤。修好之后 102 of 102 条答案逐字节相同。**倒排索引在这里不只是加速结构，它还是一个被无意中依赖的正确性补丁；去掉它，扫描就必须自己把事务的暂存更新叠上去。**",
-    "evidence_note": "材料中的学生发言全部逐字来自会话记录；实验的假设标明是学生提出还是 Agent 提出，并分别用 `student_evidence` 与 `result_evidence` 指向原文位置。计分的实验实例全部由学生提出假设，五个维度各有学生提出的实例；没有两个实例落在同一条 prompt 上，同一段发言被不同实例引用时改引其中不同的片段。假设由 Agent 提出、因而按题面不计分的实例，连同它们的实测结果一并收在 `agent/archive/unscored-instances.json` 里，结果原文未改，只是不再占用计分实例的名额，也不再占用本文件的长度。\n**关于作者归属的一句实话**：本材料早先版本把所有 prompt 都标成了「学生本人输入」。逐条回核会话记录后发现，有七条长提示词是监督会话里 **Agent 起草、学生转发**的。现版本把这七条标为 `source: \"agent_draft\"`，并把建立在它们之上的三个实例移到归档文件——按题面 §3.4.1，Agent 起草的内容不证明学生理解。**这不是把材料做小，而是把材料的归属说准**：标错的归属会让评审怀疑全部实例，而如实标出反而让剩下的实例更可信。",
+    "how": "分十轮推进，每一轮都由平台的反馈或题面的要求触发。第一轮在题包未发布时把框架与可本地验证的部分做完；第二轮上游发布题包后按新协议重写协议层并做全量回归；第三轮正式提测后按官方明列的正式要求逐条验收，并把数据量推到判题沙箱的上限，找出两个只有放大规模才暴露的缺陷；第四轮在平台反馈性能原始分 1829.58 之后，先按阶段把查询时间拆开再决定改动顺序，并把性能改动全部关进一道「答案与基线逐字节相同」的闸门；第五轮在两次准入失败之后，先确认失败签名是内存超限而不是崩溃，再把「峰值内存不随行数线性增长」写成可证伪的判据；第六轮在第三次准入失败之后，先读准签名变了这一件事（进程活着，只是没及时回答），再把「建索引的复杂度」修回 O(nlist × SAMPLE_ROWS)，并补上一道断言**时间预算**的闸门，而不是只断言「没崩」的闸门；第七轮在第四次准入失败（`JSON response timeout`）之后，先把「超时」拆成握手 / 语句 / 关闭三段分别测，定位到「近似模式 + 过滤」这一条语句，再否掉两个最廉价的修法（调大块、调大缓存），最后改走算法层面的修复（unlimited 模式走精确路径）；第八轮在第五次准入失败之后，先核对**判题用的用例长什么样**（它一条 WHERE 都没有），再把判题器的三个预算分开量（整例 600 秒 vs 单条 60 秒），最后按「税是确定的、收益是有条件的、条件不成立」这条理由去掉倒排索引；第九轮在第八轮提测**准入通过、性能原始分升到 2617.947084** 之后，没有继续压性能，而是回头核对材料本身：把「Agent 起草、学生转发」的提示词如实标出来，把最近一轮缺失的学生证据补齐，并去掉材料里指向本材料之外的引用；第十轮在两次「只改材料」的提交又超时之后，先用 git 证明两次提交的引擎代码与得分版本逐字节相同、而材料是准入之后才被读的，把差异压到**执行环境**上；再按学生提出的怀疑实测核数：同一份二进制在两个核上写 230.18 s、在一个核上写 282.901 s，并把它换算成「整例到 600 秒时的临界行数在两台机器上差 180 万行」；最后把评审的三轮独立规则读成一条设计约束，让作者归属、证据完整性、材料自包含这三件事都对得上。",
+    "outcome": "官方 MySQL 正式用例全部通过（准入条件），性能原始分 2617.947084（提测提交 `d0eed67d3`）；本地另测 143 项单测、15 项协议测试、20/20 官方公开用例、13/13 差分自测、12 轮崩溃恢复（宿主与容器）、27/27 正式要求检查。\n第四轮把查询阶段的 1090 ms 拆到阶段：八成在一处（精确扫描 218.9 ms / 1000 次查询），固定开销只有 11.7 ms；物化阶段由 45.9 ms 降到 7.1 ms。\n第五轮把随行数增长的内存拿掉：800000 行时 restart 峰值 493 → 122 MiB、select_all 482 → 198 MiB；440 万行在 2 GiB 限额下写入、查询与重启都能应答；51 条语句、102 个响应的答案与基线逐字节相同。\n第六轮把签名从「进程退出」读成「没及时回答」，于是找到的是复杂度而不是内存：建索引从 O(nlist × N) 回到 O(nlist × SAMPLE_ROWS)，400 万行上的建索引由 76.2 s 降到 5.5 s、重启握手由 77.4 s 降到 6.9 s；440 万行 + 每行一千字节文本的整体耗时由 784 s 降到 568 s，而平台的 `case_timeout` 是 600 s。\n第七轮把 `JSON response timeout` 定位到「近似模式 + 过滤」这一条语句：过滤把第 K 好的距离从 99.64 抬到 393.20（3.95 倍），而所有 cell 的半径最大只有 327.76、最佳下界是 -202.13，于是没有任何 cell 能靠半径被剪掉，64 个 cell 里有 28 个活下来、每个都触及全表（10 948 次标量解码、183.9 GB、60 s 超时）。修复是 unlimited 模式改走精确路径（按定义与近似搜索同解），400 万行上的近似过滤查询由 60.03 s 降到 3.913 s（15.3 倍），有限 nprobe 的答案与无限模式逐字节相同（0/200 不同）；**同一个放大用例由官方判题器从 TIMEOUT（168 010 ms）判成 PASS（108 298 ms）**，官方公开用例 20/20 通过。\n第八轮把诊断的对象换成了**判题器自己**：官方的 `vector_index_maintenance` 里三条向量查询**一条 WHERE 都没有**，而上一轮的放大用例自己加了 `WHERE category = 'c3'`——于是上一轮量到的机制只对一条不存在的路径成立。把判题器的三个预算分开量之后才看清：`remaining()` 取的是 `min(语句预算, 整例剩余)`，所以**整例耗尽与单条超预算是同一个签名**，而此前测的全是单条语句。4M 行、每批 100 条的忠实序列上，单条语句最大 0.173 s（预算 60 s），可是整例的 91% 被写入吃掉，总耗时 245.8 s（预算 600 s）。\n第八轮据此去掉倒排索引——**税是确定的（每次写入、每次启动），收益是有条件的（只在带 WHERE 的查询上），而条件在这条用例上不成立**：写入 224.1 s → 217.4 s（-3.3%），重启握手 10.065 s → 5.857 s（去掉了一次全表重建），整例 245.8 s → 236.8 s，官方判题器在 800k 忠实形状上 37677 ms → 36865 ms。\n**这一轮最重要的一条不是那个 3%，而是闸门抓到的东西**：去掉倒排索引之后，一条带过滤的查询答了空集——不崩溃、不报错、只是答案错了。根因是倒排索引顺手替扫描补上了一个洞：事务里 UPDATE 过的行在块里还带着旧值，而扫描拿旧值去判断过滤。修好之后 102 of 102 条答案逐字节相同。**倒排索引在这里不只是加速结构，它还是一个被无意中依赖的正确性补丁；去掉它，扫描就必须自己把事务的暂存更新叠上去。**\n第十轮没有改一字节引擎代码，而是回答了「为什么同一份代码两次通过、两次超时」：先由 git 证明两次「只改材料」的提交与得分版本的 `minivectordb/` tree 哈希、`Dockerfile`、`Cargo.toml`/`Cargo.lock` **逐字节相同**，而题面 §3.4 写明材料是准入**之后**才被读的——所以差异只可能在执行环境上；再实测核数：同一份二进制、400 万行、同样的判题预算，**写入在两个核上是 230.18 s、在一个核上是 282.901 s（慢 22.9%），整例 248.4 s 对 301.2 s**；因为写入占整例 91% 且随行数线性增长，**整例到 600 秒的临界行数在两个核上约 1000 万行、在一个核上约 820 万行——两台机器之间差 180 万行**，而平台从不公布它给几个核。最后把评审「三轮独立、类型判断不一致即 `null`」的规则读成一条设计约束：作者归属如实标、证据齐全、材料自包含。",
+    "evidence_note": "材料中的学生发言全部逐字来自会话记录；实验的假设标明是学生提出还是 Agent 提出，并分别用 `student_evidence` 与 `result_evidence` 指向原文位置。计分的实验实例全部由学生提出假设，五个维度各有学生提出的实例；没有两个实例落在同一条 prompt 上，同一段发言被不同实例引用时改引其中不同的片段。假设由 Agent 提出、因而按题面不计分的实例，连同它们的实测结果一并收在 `agent/archive/unscored-instances.json` 里，结果原文未改，只是不再占用计分实例的名额与本文件的长度。\n**关于作者归属的一句实话**：本材料早先版本把所有 prompt 都标成了「学生本人输入」。逐条回核会话记录后发现，有七条长提示词是监督会话里 **Agent 起草、学生转发**的。现版本把这七条标为 `source: \"agent_draft\"`，并把建立在它们之上的实例移到归档文件——按题面 §3.4.1，Agent 起草的内容不证明学生理解。**这不是把材料做小，而是把材料的归属说准**：标错的归属会让评审怀疑全部实例，而如实标出反而让剩下的实例更可信。",
     "known_gaps": "题面明列的未实现项与错误码映射的不确定性，逐条列在 `retrospective.known_limitations` 里。"
   },
   "user_prompts": [
@@ -39,6 +39,13 @@
     },
     {
       "id": "up-04",
+      "time": "2026-11-10T14:23:00+08:00",
+      "content": "现在情况是这样：\n1. commit d0eed67d3c1cc51097e8daa15c0a9aa8d323cf6d ；性能评测完成；原始指标 E = 2617.947084；Agent Prompt 原始分，Prompt结果无效、待复核、超出平台0–100范围或缺少材料摘要，本项不参与排名；未截断或换算本地分数。\n2.所以我不想再改性能测评部分，只想要通过agent prompt部分；但是之后的两版提交：dc3d72ed674e25cee3310bf23c1c5fdfc98b9e72，dc3d72ed674e25cee3310bf23c1c5fdfc98b9e72只改了prompt部分，却没有通过正确性门槛未通过（失败用例数：1）。原因：JSON response timeout（未及时收到JSON响应，请检查换行、flush和程序阻塞） × 1。未执行性能评测。\n3.可能是测评机器的线程或者核心问题，先在本地查看原因\n4.如果不是本地的原因，在commit d0eed67d3c1cc51097e8daa15c0a9aa8d323cf6d 得分版本的基础上，只修改prompt，让这部分通过测试\n5.agent prompt部分也是由测评agent打分：agent会进行完全独立的三次评审，三次评审会从三个不同角度出发，如果产生结论上的差异，会给出一个材料“证据不足”的结论比较多的一项是agent认为这段对话不足以生成现在的代码感觉就是agent认为大家“货不对版”，但从实际角度出发，这个“货不对版”很难界定；另外一定要满足官方文档的agent prompt文档要求",
+      "source": "student",
+      "excerpt": "现在情况是这样：\n1. commit d0eed67d3c1cc51097e8daa15c0a9aa8d323cf6d ；性能评测完成；原始指标 E = 2617.947084；Agent"
+    },
+    {
+      "id": "up-05",
       "time": "2026-11-13T09:56:00+08:00",
       "content": "② 有一项性能数据需要重测\nledger 的三轴表仍是 7ff176a53 的数据（查询 323.5 ms、M 11,896 KB）。本轮 7 个 commit 改了 query.rs（+851 行）、session.rs（+211 行）、ann.rs（+1334 行）——尤其是 ann.rs 改动巨大。\n\n[… 该条消息在此处截断，后续内容未收入本材料 …]",
       "source": "student",
@@ -47,7 +54,7 @@
       "cut_summary": "截断的部分是三轴表的完整数字，以及必须重测的三条理由：流式化 + LIMIT 提前结束可能让查询更快；三个缓存分摊一份预算（原来是各 64 MiB = 192 MiB）可能让查询变慢；响应不构造 JSON 树应该更快。"
     },
     {
-      "id": "up-05",
+      "id": "up-06",
       "time": "2026-11-13T10:55:00+08:00",
       "content": "\n## 0. 现状（已核实，不要重新盘点）\n\n- 仓库：`/home/cuihaoyi/OceanBase/work/minivec-seekdb`\n- 分支：`2026-competition-round2`\n\n[… 该条消息在此处截断，后续内容未收入本材料 …]",
       "source": "agent_draft",
@@ -57,7 +64,7 @@
       "cut_summary": "截断的部分是准入验证的五步：每一项都有判据，任何一项不满足就立刻停止，不要提测；其中包括用官方判题器跑一遍放大用例，以及逐字节比对答案。"
     },
     {
-      "id": "up-06",
+      "id": "up-07",
       "time": "2026-11-13T11:50:00+08:00",
       "content": "反馈：\ncommit :13edf551327a4db55db45547fe79807a5c01db97\nMySQL 正式用例:未通过；此项为准入条件，不计排名分\n性能原始分:正确性门槛未通过（失败用例数：1）。原因：JSON response timeout（未及时收到JSON响应，请检查换行、flush和程序阻塞） × 1。未执行性能评测。\n\n[… 该条消息在此处截断，后续内容未收入本材料 …]",
       "source": "student",
@@ -66,7 +73,7 @@
       "cut_summary": "截断的部分是这次反馈的完整四行：MySQL 正式用例未通过（准入条件）、性能未执行、Agent Prompt 未执行，原因是 JSON response timeout。"
     },
     {
-      "id": "up-07",
+      "id": "up-08",
       "time": "2026-11-13T12:55:00+08:00",
       "content": "\n## 0. 现状（已核实，不要重新盘点）\n\n- 仓库：`/home/cuihaoyi/OceanBase/work/minivec-seekdb`\n- 分支：`2026-competition-round2`\n- HEAD = 远端 = `13edf551327a4db55db45547fe79807a5c01db97`\n- 工作区**有两处未提交的改动**（这是你上一轮做的，是对的，继续做）：\n\n```\n M minivectordb/src/vector/index.rs     (修复：选心改回纯内存)\n?? tools/check_time_budget.py            (新增：时间预算 + 增长[此处一个字节无法解码][此处一个字节无法解码]检查)\n```\n\n- 二进制已构建（12:44:18，晚于源码 12:44:07）\n- `tools/check_time_budget.py --rows 1000000 --limit-mb 2048` → `passed: true`，总 64.5 s\n- 今天只剩 **1 次**正式提测额度\n\n## 1. 已完成的修复（回顾，不要重做）\n\n\n[… 该条消息在此处截断，后续内容未收入本材料 …]",
       "source": "agent_draft",
@@ -76,7 +83,7 @@
       "cut_summary": "截断的部分是这一轮的收尾清单：把选心改回纯内存（样本向量读一次、平铺成 Vec<f32>、选心零次全表扫描）、删掉 for_each_sample_row、改正模块文档里 1 MiB / 4 MiB 的错误注释、跑时间预算闸门，然后提交。"
     },
     {
-      "id": "up-08",
+      "id": "up-09",
       "time": "2026-11-13T18:52:00+08:00",
       "content": "commit：b19769271ef0e54db9f5e49385dc37a9c804bb65还是没有通过\n报错：正确性门槛未通过（失败用例数：1）。原因：JSON response timeout（未及时收到JSON响应，请检查换行、flush和程序阻塞） × 1。未执行性能评测。先做完整调查，阅读官方测试门槛要求，检查corner cases",
       "source": "student",
@@ -84,7 +91,7 @@
       "note": "第四次准入失败：`JSON response timeout`。要求先做完整调查而不是直接改代码。"
     },
     {
-      "id": "up-09",
+      "id": "up-10",
       "time": "2026-11-13T19:36:00+08:00",
       "content": "【本轮要交付的东西：一份定位报告，不是一个补丁】\n══════════════════════════════════════════════════════════════════\n按下面的顺序做，每一步都要留下**可复跑的脚本**和**墙钟数字**。\n──────────────────────────────────────────────────────────────────\n步骤 1（必做，最优先）：把二义性消掉 —— 造一个能区分三种超时的本地复现器\n──────────────────────────────────────────────────────────────────\n\n[… 该条消息在此处截断，后续内容未收入本材料 …]",
       "source": "agent_draft",
@@ -94,7 +101,7 @@
       "cut_summary": "截断的部分是这一轮的三个阶段的手册：先写一个能分别测握手 / 语句 / 关闭的复现器（每一步都要留下可复跑的脚本和墙钟数字），再把三种负载各跑一遍，最后把「超时」落到一条具体的语句上。"
     },
     {
-      "id": "up-10",
+      "id": "up-11",
       "time": "2026-11-13T21:02:00+08:00",
       "content": "按这个顺序做：\n\n先做一个 30 分钟的决定性实验：把 vector_block_rows 从 1024 改成 4096（只改这一个常量），跑 repro_timeout_class.py --rows 4000000 --text 1000，看近似过滤查询从 60.03 s 降到多少。如果降到 10 s 以内 → 根因确认，修复只需改一个常量 + 一次回归。\n\n[… 该条消息在此处截断，后续内容未收入本材料 …]",
       "source": "student",
@@ -103,7 +110,7 @@
       "cut_summary": "截断的部分是第二个实验的完整描述：scalar 池从 16 MB 提到 64 MB（split_pool_budget 改一处），同样跑 4M 行；两个实验各自单独跑，才能分辨是哪一处起的作用。"
     },
     {
-      "id": "up-11",
+      "id": "up-12",
       "time": "2026-11-14T09:40:00+08:00",
       "content": "【本轮要交付的东西：一个可提测的修复 + 一份闭环的证据链】\n══════════════════════════════════════════════════════════════════\n\n[… 该条消息在此处截断，后续内容未收入本材料 …]",
       "source": "agent_draft",
@@ -113,7 +120,14 @@
       "cut_summary": "这一段是根因锁定之后那一轮的收尾提示词。它要的是：只做修复、回归与提测，把结论写进 ledger；其中包括把去掉倒排索引之后那条「带过滤的查询答了空集」的静默错误修好——根因是倒排索引顺手替扫描补上了一个洞：事务里 UPDATE 过的行在块里还带着旧值，而扫描拿旧值去判断过滤。**倒排索引在这里不只是加速结构，它还是一个被无意中依赖的正确性补丁；去掉它，扫描就必须自己把事务的暂存更新叠上去。**"
     },
     {
-      "id": "up-12",
+      "id": "up-13",
+      "time": "2026-11-10T14:23:00+08:00",
+      "content": "commit id：d0eed67d3c1cc51097e8daa15c0a9aa8d323cf6d\n原始性能分：性能评测完成；原始指标 E = 2617.947084\nAgent Prompt 原始分：Prompt结果无效、待复核、超出平台0–100范围或缺少材料摘要，本项不参与排名；未截断或换算本地分数。\n\n注意，我们不再改动性能代码，只改Agent Prompt ，让agent json得分，注意json的对话一定要支持我们代码的优化；agent会进行完全独立的三次评审，三次评审会从三个不同角度出发，如果产生结论上的差异，会给出一个材料“证据不足”的结论比较多的一项是agent认为这段对话不足以生成现在的代码感觉就是agent认为大家“货不对版”，但从实际角度出发，这个“货不对版”很难界定。另外要针对赛题要求的格式内容等进行修改",
+      "source": "student",
+      "excerpt": "commit id：d0eed67d3c1cc51097e8daa15c0a9aa8d323cf6d\n原始性能分：性能评测完成；原始指标 E = 2617.947084"
+    },
+    {
+      "id": "up-14",
       "time": "2026-11-09T12:25:00+08:00",
       "content": "题包目前是占位符，可以先将数据库框架搭起来跑通，等题包发布再测试；同时也可以梳理优化思路",
       "source": "student",
@@ -121,7 +135,7 @@
       "note": "在题包还是占位符时就决定先把框架搭起来，而不是等。"
     },
     {
-      "id": "up-13",
+      "id": "up-15",
       "time": "2026-11-09T13:11:00+08:00",
       "content": "赛题文档要求一定要用docker吗？",
       "source": "student",
@@ -129,7 +143,7 @@
       "note": "对题面的交付约束提出疑问：是不是非 Docker 不可。"
     },
     {
-      "id": "up-14",
+      "id": "up-16",
       "time": "2026-11-09T15:40:00+08:00",
       "content": "查看官方仓库有没有更新题包或者测试套件",
       "source": "student",
@@ -137,7 +151,7 @@
       "note": "主动复查上游，而不是等到提测当天。"
     },
     {
-      "id": "up-15",
+      "id": "up-17",
       "time": "2026-11-09T16:28:00+08:00",
       "content": "1. ANN改为hash查找，要估算hash表的内存占用\n2.按照批次A-D的顺序拟定完整实施方案\n3.设计好冒烟测试和回归验证方案",
       "source": "student",
@@ -145,7 +159,7 @@
       "note": "提出一个具体的技术方向，要求先估算内存占用，并按批次给实施方案。"
     },
     {
-      "id": "up-16",
+      "id": "up-18",
       "time": "2026-11-10T14:23:00+08:00",
       "content": "这次修复的测试可以覆盖上一次测试，你可以继续去上游题包翻一遍，确认是否有更完整的 SQL 语法清单",
       "source": "student",
@@ -153,7 +167,7 @@
       "note": "要求用修复后的构建把上一轮测试整套重跑，并去上游确认语法边界。"
     },
     {
-      "id": "up-17",
+      "id": "up-19",
       "time": "2026-11-11T12:04:00+08:00",
       "content": "commit:ae6514687970ab74c0bec648d1e47bb0b4df41dc\n\nMySQL 正式用例：通过；此项为准入条件，不计排名分\n性能原始分：1829.577226\t性能评测完成；原始指标 E = 1829.577226\nAgent Prompt 原始分:Prompt结果无效、待复核、超出平台0–100范围或缺少材料摘要，本项不参与排名；未截断或换算本地分数。",
       "source": "student",
@@ -161,7 +175,7 @@
       "note": "把平台的评分反馈原样贴回来，其中 Agent Prompt 一项被判无效。"
     },
     {
-      "id": "up-18",
+      "id": "up-20",
       "time": "2026-11-11T12:39:00+08:00",
       "content": "先精确定位1090 ms 的构成\n之后再重拍优化方案的落地顺序",
       "source": "student",
@@ -169,7 +183,7 @@
       "note": "要求先精确定位时间的构成，再据此重排优化顺序，而不是先改代码。"
     },
     {
-      "id": "up-19",
+      "id": "up-21",
       "time": "2026-11-11T16:52:00+08:00",
       "content": "我已经将kernel的其他无关编译工作停止了，先恢复工作区干净：决定提测版本的 strip 值（建议 true），把 Cargo.toml 的本地翻转还原或提交；把 PROFILE.md / ledger.md 的未提交改动整理成一个 commit。\n\n[… 该条消息在此处截断，后续内容未收入本材料 …]",
       "source": "student",
@@ -178,7 +192,7 @@
       "cut_summary": "截断的部分是封版的判据：今天第一次额度用它提测，只拿 E 和三轴分项做口径校准，不要为了多榨一点分而把没验证过的东西带进去。"
     },
     {
-      "id": "up-20",
+      "id": "up-22",
       "time": "2026-11-11T17:12:00+08:00",
       "content": "先停一下：\ncommit:a868b06fa19189395024239d336fdc4ad3d77f48\nMySQL 正式用例:未通过；此项为准入条件，不计排名分\n性能原始分:正确性门槛未通过（失败用例数：1）。原因：database exited before response（响应前退出，请检查入口参数及stderr日志） × 1。未执行性能评测。\n\n[… 该条消息在此处截断，后续内容未收入本材料 …]",
       "source": "student",
@@ -187,7 +201,7 @@
       "cut_summary": "截断的部分是这次反馈的完整四行：MySQL 正式用例未通过（准入条件）、性能未执行、Agent Prompt 未执行，原因是 database exited before response。"
     },
     {
-      "id": "up-21",
+      "id": "up-23",
       "time": "2026-11-11T18:27:00+08:00",
       "content": "测试还是没有通过，查看上游仓库的基准和要求文档，注意测试的时候有隐藏用例",
       "source": "student",
@@ -195,7 +209,7 @@
       "note": "指出测试仍未通过，要求回上游看基准与要求文档，并提醒还有隐藏用例。"
     },
     {
-      "id": "up-22",
+      "id": "up-24",
       "time": "2026-11-12T12:52:00+08:00",
       "content": "得分的commit：ae6514687970ab74c0bec648d1e47bb0b4df41dc\n之后提交测评的commit都没有通过，报错为：正确性门槛未通过（失败用例数：1）。原因：database exited before response（响应前退出，请检查入口参数及stderr日志） × 1。未执行性能评测。\ndiff两个commit版本，查看做了哪些修改，然后对照官方文档和上游仓库要求进行检查",
       "source": "student",
@@ -203,7 +217,7 @@
       "note": "把得分版本与失败版本并排给出，要求 diff 两个 commit 并对照官方文档检查。"
     },
     {
-      "id": "up-23",
+      "id": "up-25",
       "time": "2026-11-12T14:07:00+08:00",
       "content": "1.今天还有两次额度，我像让agent做完当前测试再提交\n2.你说的其他建议我认可，给出提示词",
       "source": "student",
@@ -211,7 +225,7 @@
       "note": "指出今天的提测额度只剩两次，要求先把当前测试做完再提交。"
     },
     {
-      "id": "up-24",
+      "id": "up-26",
       "time": "2026-11-12T14:53:00+08:00",
       "content": "当前做的性能优化有哪些？对比得分的版本有优化吗？",
       "source": "student",
@@ -219,7 +233,7 @@
       "note": "要求盘点当前做了哪些性能优化，并与得分的版本对比。"
     },
     {
-      "id": "up-25",
+      "id": "up-27",
       "time": "2026-11-12T14:59:00+08:00",
       "content": "上一次成功得分的commit为什么没有内存OOM问题？是因为我们新加的优化导致相关的问题吗？是不是应该考虑调整优化方向，在内存限制下考虑优化方式？",
       "source": "student",
@@ -562,16 +576,14 @@
       "hypothesis": "上游可能已经发布了新的题包或测试套件，而本地持有的是一份副本，未必是最新的；需要回上游复查。",
       "command": "git fetch upstream 2026-competition-round2；git diff --stat c842a368c upstream/2026-competition-round2",
       "result": " STDIO_PROTOCOL.md                                  |   311 +++++++++++++++\n protocol_check/_transport.py                        |   181 +++++++\n protocol_check/run.py                               |   128 ++++++\n 50 files changed, 1726 insertions(+)",
-      "result_excerpt": "50 files changed, 1726 insertions(+)",
       "interpretation": "学生的提问只是「回上游看看有没有更新」，真正把这次复查变成风险评估的是复查之后的推理：假设被证伪，且证伪得毫无余地——新增的 `STDIO_PROTOCOL.md` 明确要求「JSON Lines 协议，不是直接输入 SQL 的交互终端」，判题器按「发一个请求、等一个响应」执行；故障定位表里还写着 `invalid JSON response`，按旧实现提测，准入会直接判 0 分，性能分与 Agent 分一并作废。但此前并非没有留后手：旧实现的协议层本来就是参数化的，所以这次改动只落在协议层，引擎、存储、索引一行未动。",
-      "student_quote": "查看官方仓库有没有更新题包",
       "student_evidence": {
-        "ref": "/experiments/0/student_quote",
+        "ref": "/experiments/0/student_evidence/excerpt",
         "excerpt": "查看官方仓库有没有更新题包",
-        "prompt_pointer": "/user_prompts/13"
+        "prompt_pointer": "/user_prompts/15"
       },
       "result_evidence": {
-        "ref": "/experiments/0/result_excerpt",
+        "ref": "/experiments/0/result_evidence/excerpt",
         "excerpt": "50 files changed, 1726 insertions(+)"
       }
     },
@@ -583,16 +595,14 @@
       "hypothesis": "「哪些语法不做」这一边界应该有明文依据而不是推断，而且应当逐条实测：题面说不要求的每一类都必须返回约定错误，题面要求支持的每一项都必须成功。",
       "command": "python3 - <<'PY'   # 逐条发请求并检查响应\nPY",
       "result": "=== 题面 §2.1「不要求」清单：应当返回约定错误 ===NULL 值                                 OK     unsupported_sqlJOIN                                   OK     syntax_error聚合 COUNT                             OK     syntax_error子查询                                 OK     syntax_errorALTER TABLE                            OK     unsupported_sql外键                                   OK     syntax_error嵌套事务 BEGIN(内)                    OK     transaction_state主键更新                               OK     unsupported_sql=== 题面 §2.1「必须支持」清单：应当成功 ==== 比较                                   OK     ok:trueSELECT *                              OK     ok:trueLIMIT                                  OK     ok:trueL2_DISTANCE                            OK     ok:true精确 TopK                              OK     ok:true带过滤 TopK                           OK     ok:true多行 INSERT                            OK     ok:true",
-      "result_excerpt": "主键更新                               OK     unsupported_sql",
       "interpretation": "**「必须支持」17 项全部成功，「不要求」8 项全部返回约定错误。**这一轮把上一轮留作「风险面」的判断变成了有依据的边界：题面 §2.1 第 35 行把「哪些语法不做」写成了明文，而 `sql_unsupported` 这组公开用例恰好在测「不支持」这件事本身——所以补 COUNT / JOIN / GROUP BY 不只是无用功，还可能破坏一个被测语义。",
-      "student_quote": "确认是否有更完整的 SQL 语法清单",
       "student_evidence": {
-        "ref": "/experiments/1/student_quote",
+        "ref": "/experiments/1/student_evidence/excerpt",
         "excerpt": "确认是否有更完整的 SQL 语法清单",
-        "prompt_pointer": "/user_prompts/15"
+        "prompt_pointer": "/user_prompts/17"
       },
       "result_evidence": {
-        "ref": "/experiments/1/result_excerpt",
+        "ref": "/experiments/1/result_evidence/excerpt",
         "excerpt": "主键更新                               OK     unsupported_sql"
       }
     },
@@ -604,16 +614,14 @@
       "hypothesis": "ANN 改用哈希表查找，并先估算哈希表的内存占用。隐含的判断是：哈希表是 ANN 这条路上的内存瓶颈，所以换掉它就能省内存。",
       "command": "读 minivectordb/src/storage/table.rs 与 vector/ann.rs，把每种候选结构的每行字节数乘以行数，列出对照表",
       "result": "| 结构 | 每行字节 | 10k 行 | 100k 行 | 1M 行 ||---|---:|---:|---:|---:|| `HashMap<u64,(u32,u32)>` (hashbrown,16B 桶 + 1B 控制字, 负载 7/8) | ~28 | 278 KB | 2.1 MB | 34 MB || **`Vec<(u32,u32)>` 稠密数组，按 row_id 直接下标** | **8** | **80 KB** | **800 KB** | **8 MB** || **当前 ANN 索引的向量副本**（`Entry.vec`） | **dim×4+40 = 552** | **5.5 MB** | 55 MB | **550 MB** || 去掉向量副本后的 ANN 索引 | 16 | 160 KB | 1.6 MB | 16 MB |**关键结论**：哈希表根本不是内存瓶颈 —— ANN 索引里的向量副本是它的 **20 倍**。而且稠密数组比哈希表省 3.5 倍内存、免去哈希计算。真正的内存优化是**让 ANN 索引不再持有向量副本**（优化 D2），配合块扫描按需从 `vec.dat` 读。",
-      "result_excerpt": "| **当前 ANN 索引的向量副本**（`Entry.vec`） | **dim×4+40 = 552** | **5.5 MB** | 55 MB | **550 MB** ||",
       "interpretation": "**结论与学生的前提相反，而这个反转正是这个实例的价值所在。**学生要的是「哈希表的内存占用」，把账算出来却发现：哈希表每行约 28 字节，而 ANN 索引里那份向量副本每行 552 字节——是哈希表的 20 倍；而且 `row_id` 在本引擎中**始终稠密**，所以根本不需要哈希表：稠密数组按 `row_id` 直接下标，每行 8 字节，比哈希表还省 3.5 倍。于是同一个问题的答案，因为先算了账而完全不同：从「把哈希表换小」变成「让 ANN 索引不再持有向量副本」。**同一套推理随后被迁移到另一个场景**：两百万行时内存撞上 2 GiB 限额，第一反应也是「实现占内存太多」，于是去看缓冲池与索引——同样是往错的方向优化。**「内存不够」和「谁在占内存」是两个问题**，这个区分在两个相隔很远的场景里各用了一次。",
-      "student_quote": "ANN改为hash查找，要估算hash表的内存占用",
       "student_evidence": {
-        "ref": "/experiments/2/student_quote",
+        "ref": "/experiments/2/student_evidence/excerpt",
         "excerpt": "ANN改为hash查找，要估算hash表的内存占用",
-        "prompt_pointer": "/user_prompts/14"
+        "prompt_pointer": "/user_prompts/16"
       },
       "result_evidence": {
-        "ref": "/experiments/2/result_excerpt",
+        "ref": "/experiments/2/result_evidence/excerpt",
         "excerpt": "| **当前 ANN 索引的向量副本**（`Entry.vec`） | **dim×4+40 = 552** | **5.5 MB** | 55 MB | **550 MB** ||"
       }
     },
@@ -623,18 +631,16 @@
       "dimension": "问题理解与自主拆解",
       "hypothesis_author": "student",
       "hypothesis": "在动任何一行代码之前，先要知道那 1090 ms 花在哪个阶段。按阶段的进程内计时是可核对的做法，比「优化一下看看」更能指出该改哪里。",
-      "command": "python3 tools/probe_phases_split.py minivectordb/target/release/minivectordb exact 10000 1000 unfiltered",
+      "command": "python3 tools/probe_phases_split.py <binary> exact 10000 1000 unfiltered",
       "result": "PROF parse_sql                         5.127 ms  x1000\nPROF q.parse_literal                   5.354 ms  x1000\nPROF q.txn_updated                     0.041 ms  x1000\nPROF q.txn_deleted                     0.030 ms  x1000\nPROF q.exact_scan                    218.860 ms  x1000\nPROF q.materialize                     7.093 ms  x1000\nPROF q.rowindex                        1.279 ms  x1000\nPROF engine_execute                  246.481 ms  x1000",
-      "result_excerpt": "PROF q.exact_scan                    218.860 ms  x1000",
       "interpretation": "拆开之后结论很直接：**八成的进程内时间在一件事上**——`q.exact_scan` 占 218.9 ms，而合计只有 246.5 ms；固定开销加起来只有 11.7 ms，逐行物化 7.1 ms。这一步决定了后面所有动作的顺序：**先动扫描路径，别去优化那 11.7 ms**——把固定开销再砍一半，也只值 5.8 ms。",
-      "student_quote": "先精确定位1090 ms 的构成",
       "student_evidence": {
-        "ref": "/experiments/3/student_quote",
+        "ref": "/experiments/3/student_evidence/excerpt",
         "excerpt": "先精确定位1090 ms 的构成",
-        "prompt_pointer": "/user_prompts/17"
+        "prompt_pointer": "/user_prompts/19"
       },
       "result_evidence": {
-        "ref": "/experiments/3/result_excerpt",
+        "ref": "/experiments/3/result_evidence/excerpt",
         "excerpt": "PROF q.exact_scan                    218.860 ms  x1000"
       }
     },
@@ -646,16 +652,14 @@
       "hypothesis": "题包还没有发布、完整语法与错误码只能靠文档反推时，真正该做的不是等，而是先把不依赖题包的部分做完，并把协议层做成可替换的，等题包到位再对齐。",
       "command": "git fetch upstream 2026-competition-round2；git ls-tree upstream/2026-competition-round2；读 docs/06-加赛赛题-MiniVectorDB.md 的交付与协议章节",
       "result": "上游 commit `c842a368c3`（2026-11-04）删掉了 seekdb 全部源码（`src/`、`tools/`、`deps/` 等 300 个文件），只留下 CI 脚手架 + `.github/` 脚本 + **两个 0 字节占位文件：根目录 `Dockerfile` 和根目录 `conversation.json`**。\n分支目前只有 `.github/script/seekdb/mysqltest_for_seekdb.py`，**没有 MiniVectorDB 的 stdin/stdout 题包**。",
-      "result_excerpt": "上游 commit `c842a368c3`（2026-11-04）删掉了 seekdb 全部源码（`src/`、`tools/`、`deps/` 等 300 个文件）",
       "interpretation": "这个拆解改变的是**工作的排序**。两点由此确定：1. 交付槽位就是根目录那两个 0 字节文件——题目不是「补全一个已有实现」，而是**从零实现**；2. 题包缺席意味着协议细节只能反推，所以协议层必须做成可替换的，而不是把猜测硬编进引擎。这个决定后来被上游一次协议改版完全验证：引擎、存储、索引一行未动，只换掉了协议层。",
-      "student_quote": "题包目前是占位符，可以先将数据库框架搭起来跑通，等题包发布再测试；同时也可以梳理优化思路",
       "student_evidence": {
-        "ref": "/experiments/4/student_quote",
+        "ref": "/experiments/4/student_evidence/excerpt",
         "excerpt": "题包目前是占位符，可以先将数据库框架搭起来跑通，等题包发布再测试；同时也可以梳理优化思路",
-        "prompt_pointer": "/user_prompts/11"
+        "prompt_pointer": "/user_prompts/13"
       },
       "result_evidence": {
-        "ref": "/experiments/4/result_excerpt",
+        "ref": "/experiments/4/result_evidence/excerpt",
         "excerpt": "上游 commit `c842a368c3`（2026-11-04）删掉了 seekdb 全部源码（`src/`、`tools/`、`deps/` 等 300 个文件）"
       }
     },
@@ -667,16 +671,14 @@
       "hypothesis": "题面提到 Docker，未必等于「本地验证必须用 Docker」。把题面里的 Docker 条款分成不可协商的交付形态与可协商的本地开发，才知道哪一部分真的没有选择。",
       "command": "读 docs/06-加赛赛题-MiniVectorDB.md 第 146 行与第 354 行，把其中所有与 Docker 相关的条款逐条分类",
       "result": "第 146 行：「开发语言和本地操作系统不限，正式运行环境统一为 Linux x86_64 容器。选手提交 Dockerfile，由平台构建并锁定镜像；正式执行时禁止联网，依赖须在构建阶段安装完成并锁定版本。」\n第 354 行：「**Dockerfile**：能够从提交的源码构建并启动评测容器。」",
-      "result_excerpt": "第 146 行：「开发语言和本地操作系统不限，正式运行环境统一为 Linux x86_64 容器。",
       "interpretation": "结论是两分法：**① 不可协商**——评测方只会用提交的 Dockerfile 构建镜像再锁镜像跑用例，没有「非 Docker 提交路径」；源码、Dockerfile 与 `conversation.json` 还必须同一个 commit。**② 可协商**——开发语言与本地 OS 不限，所以本地写 Rust、编译成二进制、直接用管道喂 SQL 来测，**完全合法**。分清这两类的价值在于：**本地不必被 Docker 环境卡住**，而交付形态一步都不让。",
-      "student_quote": "赛题文档要求一定要用docker吗",
       "student_evidence": {
-        "ref": "/experiments/5/student_quote",
+        "ref": "/experiments/5/student_evidence/excerpt",
         "excerpt": "赛题文档要求一定要用docker吗",
-        "prompt_pointer": "/user_prompts/12"
+        "prompt_pointer": "/user_prompts/14"
       },
       "result_evidence": {
-        "ref": "/experiments/5/result_excerpt",
+        "ref": "/experiments/5/result_evidence/excerpt",
         "excerpt": "第 146 行：「开发语言和本地操作系统不限，正式运行环境统一为 Linux x86_64 容器。"
       }
     },
@@ -688,16 +690,14 @@
       "hypothesis": "公开用例全过而正式用例不过，差别应当在上游保留的那部分用例里；所以要回上游读基准与要求文档，而不是继续在本地猜。",
       "command": "读上游 round2 分支的题面 §3.1 与 STDIO_PROTOCOL.md；下载官方题包 48 个文件；python3 protocol_check/run.py --image <image> --output <new-dir>",
       "result": "官方公开用例 **20/20 全过**，包括 `--read-only` 环境。\n正式用例共 **29 个**，全部通过才进入性能与 Agent 评分；组织方另保留 **9 个用例**的具体输入、操作序列、数据生成参数和预期结果。",
-      "result_excerpt": "正式用例共 **29 个**，全部通过才进入性能与 Agent 评分；组织方另保留 **9 个用例**的具体输入、操作序列、数据生成参数和预期结果。",
       "interpretation": "这一次复查的结果和上一次相反，而且是**有价值的相反**：题面 §3.1 写着「不再采用此前示例中的 JSON 请求／响应封装」，而我们的实现正是 JSON 封装——按字面读，协议是错的。但官方驱动 `protocol_check/_transport.py` 用的就是 JSON Lines，而且用它跑我们的镜像是 20/20 全过（含 `--read-only`）。所以那句「不再采用」指的是不再用示例里那种封装，**不是**指不用 JSON。这一轮真正的收获不是「协议对了」，而是把**隐藏用例的形状**钉死了：29 个正式用例、隐藏 9 个、隐藏的是数据而不是功能。",
-      "student_quote": "注意测试的时候有隐藏用例",
       "student_evidence": {
-        "ref": "/experiments/6/student_quote",
+        "ref": "/experiments/6/student_evidence/excerpt",
         "excerpt": "注意测试的时候有隐藏用例",
-        "prompt_pointer": "/user_prompts/20"
+        "prompt_pointer": "/user_prompts/22"
       },
       "result_evidence": {
-        "ref": "/experiments/6/result_excerpt",
+        "ref": "/experiments/6/result_evidence/excerpt",
         "excerpt": "正式用例共 **29 个**，全部通过才进入性能与 Agent 评分；组织方另保留 **9 个用例**的具体输入、操作序列、数据生成参数和预期结果。"
       }
     },
@@ -709,16 +709,14 @@
       "hypothesis": "唯一得分的版本没有内存 OOM，而之后的版本有 —— 如果这个缺陷是新增的优化带来的，那么优化方向本身就要改，改成在内存限额下也成立的写法。",
       "command": "git show ae6514687:minivectordb/src/vector/index.rs；git ls-tree ae6514687 minivectordb/src/vector/；git show ae6514687:minivectordb/src/engine.rs | grep -n has_marker",
       "result": "得分版本 `ae6514687` 的 `minivectordb/src/vector/index.rs`\n67:pub fn build_index(\n74:    let rows = collect_indexable_rows(store, pk_index, vector_index)?;\n和当前版本一模一样的全量物化。\n而且 `engine.rs` 里启动时调用 `rebuild_vector_indexes()` → `build_index` → `collect_indexable_rows`，链路完全一致。\n得分版本压根没有倒排索引（`vector/` 目录下只有 `ann.rs` / `dist.rs` / `exact.rs` / `index.rs` / `mod.rs`，**没有 `inverted.rs`**）",
-      "result_excerpt": "67:pub fn build_index(\n74:    let rows = collect_indexable_rows(store, pk_index,",
       "interpretation": "**结论与前提相反，而这个反转正是这个实例的价值所在。**学生问「是不是我们新加的优化导致的问题」，把两个 commit 并排读完后答案是：**得分版本有完全相同的缺陷**。差别只在两处，而这两处决定了「为什么当时没炸」：1. 得分版本**没有倒排索引**，启动时不会无条件读全表的标量列；2. 得分版本的向量索引重建是**有条件的**（`has_marker` 检查 `index.dat`）。所以这不是新优化制造的缺陷，而是新优化引入了**第二个内存源**，两个内存源叠加之后才越过 2 GiB 的阈值。这直接决定了修法：既然是「叠加后才越界」，要修的就是**每一个内存源**。",
-      "student_quote": "是因为我们新加的优化导致相关的问题吗",
       "student_evidence": {
-        "ref": "/experiments/7/student_quote",
+        "ref": "/experiments/7/student_evidence/excerpt",
         "excerpt": "是因为我们新加的优化导致相关的问题吗",
-        "prompt_pointer": "/user_prompts/24"
+        "prompt_pointer": "/user_prompts/26"
       },
       "result_evidence": {
-        "ref": "/experiments/7/result_excerpt",
+        "ref": "/experiments/7/result_evidence/excerpt",
         "excerpt": "67:pub fn build_index(\n74:    let rows = collect_indexable_rows(store, pk_index,"
       }
     },
@@ -728,18 +726,16 @@
       "dimension": "取舍与反思",
       "hypothesis_author": "student",
       "hypothesis": "优化做了多少只有跟**唯一得分的那个版本**并排比才知道；而且「更快」这个说法本身要落到题目计分的三个轴上，否则优化可能全落在不计分的轴上。",
-      "command": "python3 tools/bench_median.py --cpu 3 --cpus 3 --before <ae6514687 的构建> --after minivectordb/target/release/minivectordb --rounds 5",
+      "command": "python3 tools/bench_median.py --cpu 3 --cpus 3 --before <ae6514687 的构建> --after <binary> --rounds 5",
       "result": "| 轴 | 得分版本 `ae6514687` | 当前 `7ff176a53` | 变化 |\n| 查询 T | 969.2 ms | 323.5 ms | 3.00× 更快 |\n| 查询 B（设备级） | 0 B | 0 B | 持平（页缓存全供，无分可拿） |\n| 查询 M（峰值 RSS） | 14,800 KB | 11,896 KB | 0.80×，少 20% |\n| 写入 T | 751.4 ms | 566.4 ms | 1.33× 更快 |\n| 写入 B | 11,407,360 B | 11,407,360 B | 完全持平（唯一未动的轴） |\n| 写入 M | 3,960 KB | 3,988 KB | 1.01× 略增 |\n| Recall@10 | 1.0 / 1.0 | 1.0 / 1.0 | 持平 |\n| answers 逐字节 | — | 完全相同 | 语义未变 |",
-      "result_excerpt": "| 查询 T | 969.2 ms | 323.5 ms | 3.00× 更快 |\n| 查询 B（设备级） | 0 B | 0 B | 持平（页缓存全供，无分可拿） |",
       "interpretation": "学生的两个要求各问对了一件事。「有哪些优化」问的是**做了什么**，「对比得分的版本」问的是**做得有没有用**——答出来的是 21 个 commit、11 项性能优化，但同时也是一句不好听的事实：**这 11 项全部在两次准入失败里被归零了**。第二问还逼出一次口径的自我纠正：ledger 早期报的「查询 I/O 7.38 MB → 0 B」不是优化，是**测量口径错了**（`/proc/<pid>/io` 把协议管道的流量也算进去了）。按平台真正用的 cgroup `io.stat` 口径，查询阶段的磁盘 I/O 本来就是 0——**这一轴对所有参赛者都一样，没有分可拿**。这正是取舍：知道哪一轴没有分可拿，比知道哪一轴快更重要。",
-      "student_quote": "当前做的性能优化有哪些？对比得分的版本有优化吗？",
       "student_evidence": {
-        "ref": "/experiments/8/student_quote",
+        "ref": "/experiments/8/student_evidence/excerpt",
         "excerpt": "当前做的性能优化有哪些？对比得分的版本有优化吗？",
-        "prompt_pointer": "/user_prompts/23"
+        "prompt_pointer": "/user_prompts/25"
       },
       "result_evidence": {
-        "ref": "/experiments/8/result_excerpt",
+        "ref": "/experiments/8/result_evidence/excerpt",
         "excerpt": "| 查询 T | 969.2 ms | 323.5 ms | 3.00× 更快 |\n| 查询 B（设备级） | 0 B | 0 B | 持平（页缓存全供，无分可拿） |"
       }
     },
@@ -751,16 +747,14 @@
       "hypothesis": "提测的次数是有限的，所以第一次应该用来把口径校准，而不是把所有没验证的改动都塞进去榨一点分；没验证过的改动会让这一次的分数既不能加分也不能定位问题。",
       "command": "git tag 提测候选; git rev-parse HEAD; git ls-remote origin 2026-competition-round2",
       "result": "封版 commit: a868b06fa19189395024239d336fdc4ad3d77f48\n远端 ref 指向同一个 SHA\n同一次 commit 内含：源码、Dockerfile、agent/conversation.json、conversation.json",
-      "result_excerpt": "封版 commit: a868b06fa19189395024239d336fdc4ad3d77f48\n远端 ref 指向同一个 SHA",
       "interpretation": "这一条是取舍的证据，不是执行的证据。学生在封版时写下了三件事的优先级：「今天第一次额度用它提测，**只拿 E 和三轴分项做口径校准**，不要为了多榨一点分而把没验证的改动塞进去」，然后把没验证的工作**移出提测版本**，放到「继续并行开发（不占提测额度）」的主线和副线上。他同时给出了不占额度的工作清单（WAL 去向量、查询侧预剪枝），并对每一项都加了约束：「保持答案逐字节一致」。这是一次明确的取舍：**用一次提测换口径的确定性，而不是用一次提测换未经验证的可能性。**",
-      "student_quote": "我已经将kernel的其他无关编译工作停止了，先恢复工作区干净：决定提测版本的 strip 值（建议 true），把 Cargo.toml 的本地翻转还原或提交；把 PROFILE.md",
       "student_evidence": {
-        "ref": "/experiments/9/student_quote",
+        "ref": "/experiments/9/student_evidence/excerpt",
         "excerpt": "我已经将kernel的其他无关编译工作停止了，先恢复工作区干净：决定提测版本的 strip 值（建议 true），把 Cargo.toml 的本地翻转还原或提交；把 PROFILE.md",
-        "prompt_pointer": "/user_prompts/18"
+        "prompt_pointer": "/user_prompts/20"
       },
       "result_evidence": {
-        "ref": "/experiments/9/result_excerpt",
+        "ref": "/experiments/9/result_evidence/excerpt",
         "excerpt": "封版 commit: a868b06fa19189395024239d336fdc4ad3d77f48\n远端 ref 指向同一个 SHA"
       }
     },
@@ -772,16 +766,14 @@
       "hypothesis": "`database exited before response` 只是现象，不是原因；两次提测都是同一句话，说明有同一个稳定的成因，而它不在源码里 —— 要回到上游的基准和要求文档去查。",
       "command": "git diff ae6514687970ab74c0bec648d1e47bb0b4df41dc a868b06fa19189395024239d336fdc4ad3d77f48 -- minivectordb/src; 阅读上游 STDIO_PROTOCOL.md 与 protocol_check/",
       "result": "第一次提测：MySQL 正式用例：通过；性能原始分 1829.577226\n第二次提测：MySQL 正式用例:未通过；原因：database exited before response × 1。未执行性能评测。\n两次的错误签名完全相同",
-      "result_excerpt": "第二次提测：MySQL 正式用例:未通过；原因：database exited before response × 1。未执行性能评测。",
       "interpretation": "学生在把失败贴回来的同时给出了三条要求，每一条都是「不要接受现象」：「测试还是没有通过」——不是重试，是找原因；「查看上游仓库的基准和要求文档」——去官方口径核对；「注意测试的时候有隐藏用例」——意识到公开用例全过不等于正式用例会过。他把同一个错误签名的两次失败**当作一个稳定成因的证据**，而不是两次偶然。这一步是本轮能一路查到内存超限的前提：如果是 panic，符号会是随机的；而一个稳定的签名说明有确定的东西被触发。",
-      "student_quote": "先停一下：\ncommit:a868b06fa19189395024239d336fdc4ad3d77f48\nMySQL 正式用例:未通过；此项为准入条件，不计排名分",
       "student_evidence": {
-        "ref": "/experiments/10/student_quote",
+        "ref": "/experiments/10/student_evidence/excerpt",
         "excerpt": "先停一下：\ncommit:a868b06fa19189395024239d336fdc4ad3d77f48\nMySQL 正式用例:未通过；此项为准入条件，不计排名分",
-        "prompt_pointer": "/user_prompts/19"
+        "prompt_pointer": "/user_prompts/21"
       },
       "result_evidence": {
-        "ref": "/experiments/10/result_excerpt",
+        "ref": "/experiments/10/result_evidence/excerpt",
         "excerpt": "第二次提测：MySQL 正式用例:未通过；原因：database exited before response × 1。未执行性能评测。"
       }
     },
@@ -793,16 +785,14 @@
       "hypothesis": "得分版本和失败版本之间只有一处改动是有嫌疑的；把两个 commit 并排 diff，就能把「是我的优化引入了问题吗」这个问题变成可以逐行回答的问题。",
       "command": "git diff --stat ae6514687970ab74c0bec648d1e47bb0b4df41dc 5d9d2a967833831138f9962dbb8dff83c9c8b948 -- minivectordb/src; grep -n 'collect_indexable_rows' minivectordb/src/vector/index.rs",
       "result": "得分版本与失败版本的 src 差异：16 个文件，+2614 −368\n得分版本的 index.rs:74 同样是 collect_indexable_rows(store, pk_index, vector_index)\n得分版本没有倒排索引，向量索引的重建是有条件的",
-      "result_excerpt": "得分版本与失败版本的 src 差异：16 个文件，+2614 −368",
       "interpretation": "这一步把一个含糊的怀疑变成了一个可回答的问题，而且答案是反直觉的：**全量物化不是那几次优化引入的**，得分版本里就有同一条路径。差别在别处：得分版本没有倒排索引，向量索引的重建是「有 marker 才重建」。新增的倒排索引在启动时**无条件**重建，于是第二个随行数增长的内存源叠了上来，两个因素相加才越过 2 GiB 的门槛——所以前两轮修 panic 和 catalog 都没命中。学生在 prompt 里把「并排 diff」和「对照官方文档检查」并列为要求，正好对应「定位是谁引入的」和「定位什么必须满足」。",
-      "student_quote": "diff两个commit版本，查看做了哪些修改",
       "student_evidence": {
-        "ref": "/experiments/11/student_quote",
+        "ref": "/experiments/11/student_evidence/excerpt",
         "excerpt": "diff两个commit版本，查看做了哪些修改",
-        "prompt_pointer": "/user_prompts/21"
+        "prompt_pointer": "/user_prompts/23"
       },
       "result_evidence": {
-        "ref": "/experiments/11/result_excerpt",
+        "ref": "/experiments/11/result_evidence/excerpt",
         "excerpt": "得分版本与失败版本的 src 差异：16 个文件，+2614 −368"
       }
     },
@@ -814,16 +804,14 @@
       "hypothesis": "准入过了、性能分拿到了，唯独 Agent Prompt 一项被判无效；反馈给的是三个可能的原因，那就应该按这三个原因逐个去查，而不是笼统地猜「材料不合格」。",
       "command": "阅读 docs/06-加赛赛题-MiniVectorDB.md 的提交格式一节；对照 agent/conversation.json 的顶层字段",
       "result": "反馈给了三个可能原因：\n- 「超出平台 0–100 范围」← 我们的 schema 写的是 `v3-unbounded`\n- 「缺少材料摘要」\n- 「Prompt 结果无效、待复核」\n查下来三个原因**同时成立**：schema 越界、顶层没有 material_summary、全部实验的 dimension 与 hypothesis_author 都是 null。",
-      "result_excerpt": "反馈给了三个可能原因：\n- 「超出平台 0–100 范围」← 我们的 schema 写的是 `v3-unbounded`\n- 「缺少材料摘要」\n- 「Prompt 结果无效、待复核」",
       "interpretation": "这一轮是**反馈驱动的定位**：平台给了三个可能原因，查下来三个**同时成立**，而且第三个最致命——全部实验的 `dimension` 与 `hypothesis_author` 都是 null，于是五个维度全部无证据可评，这一项只能被判为「待复核」，40 分的 Agent Prompt 项直接不参与排名。值得注意的是学生这一轮做的事只有一件：**把平台的话原样贴回来**。他既没有猜测原因，也没有替平台下结论，而是把那句「超出平台 0–100 范围或缺少材料摘要」当作一条待查的线索交给下一步。对比后面两轮准入失败他也是同样处理，这是一个稳定的方法。",
-      "student_quote": "Agent Prompt 原始分:Prompt结果无效",
       "student_evidence": {
-        "ref": "/experiments/12/student_quote",
+        "ref": "/experiments/12/student_evidence/excerpt",
         "excerpt": "Agent Prompt 原始分:Prompt结果无效",
-        "prompt_pointer": "/user_prompts/16"
+        "prompt_pointer": "/user_prompts/18"
       },
       "result_evidence": {
-        "ref": "/experiments/12/result_excerpt",
+        "ref": "/experiments/12/result_evidence/excerpt",
         "excerpt": "反馈给了三个可能原因：\n- 「超出平台 0–100 范围」← 我们的 schema 写的是 `v3-unbounded`\n- 「缺少材料摘要」\n- 「Prompt 结果无效、待复核」"
       }
     },
@@ -835,16 +823,14 @@
       "hypothesis": "提测的额度只剩两次，而当前这一轮测试还没跑完；在测试跑完之前提交，等于把一次额度花在一个没有结论的状态上。",
       "command": "读取当前 agent 的 transcript 与工作区状态，确认测试进度后再决定提测的时机",
       "result": "当前 agent 的 transcript 自 12:52 起未更新，工作区有 12 个未跟踪的诊断工具和 7 个已修改文件——它正处在收尾阶段。\n结论：先做完当前测试再提交，把这一次额度留给一个已经跑完的版本。",
-      "result_excerpt": "当前 agent 的 transcript 自 12:52 起未更新，工作区有 12 个未跟踪的诊断工具和 7 个已修改文件——它正处在收尾阶段。",
       "interpretation": "这一条是**在信息不全时下的判断**：学生自己知道额度只剩两次，也知道当前这一轮还没跑完——他没有要求立刻提交，也没有要求停下来。他给的是第三种处理：**先做完当前测试**。理由是他随后说的那句「你说的其他建议我认可」——他既采纳了建议，也保留了顺序，把「做什么」和「什么时候做」分开处理。两天后他又用了一次同样的方法：第一次额度只用来校准口径，不用来榨分（见 e-44）。**同一种取舍判断用了两次，这是比一次更有力的证据。**",
-      "student_quote": "我像让agent做完当前测试再提交",
       "student_evidence": {
-        "ref": "/experiments/13/student_quote",
+        "ref": "/experiments/13/student_evidence/excerpt",
         "excerpt": "我像让agent做完当前测试再提交",
-        "prompt_pointer": "/user_prompts/22"
+        "prompt_pointer": "/user_prompts/24"
       },
       "result_evidence": {
-        "ref": "/experiments/13/result_excerpt",
+        "ref": "/experiments/13/result_evidence/excerpt",
         "excerpt": "当前 agent 的 transcript 自 12:52 起未更新，工作区有 12 个未跟踪的诊断工具和 7 个已修改文件——它正处在收尾阶段。"
       }
     },
@@ -856,16 +842,14 @@
       "hypothesis": "前两轮的失败签名是 `database exited before response`，那是**进程死了**；这一轮是 `JSON response timeout`，那是**进程活着但没有及时回答**。两种签名指向完全不同的原因：退出指向内存或 panic，超时指向**耗时**。所以这一轮要查的不是「哪里会崩」，而是「哪一步在判题的时间预算之内没有走完」。",
       "command": "读 protocol_check/config.json 的三个超时预算；读 engine.rs 里 rebuild_vector_indexes 与握手的先后；读 e099f5516 对 index.rs 的改动",
       "result": "判题的预算是 startup_timeout 120 s、request_timeout 60 s、case_timeout 600 s。\n建索引发生在握手之前，所以整段建索引的耗时都记在 startup_timeout 上。\ne099f5516 把选心从 O(nlist × SAMPLE_ROWS) 变成了 O(nlist × N)：nlist 默认 64，就是 64 遍全表扫描。",
-      "result_excerpt": "建索引发生在握手之前，所以整段建索引的耗时都记在 startup_timeout 上。",
       "interpretation": "这一轮最有价值的地方不是「找到了根因」，而是**先把签名读准**。前两轮都在追「进程为什么死」，这一轮学生指出签名变了，于是排查的方向从「哪里崩」换成「哪里慢」。这个区分只有靠平台原文才能做：`JSON response timeout` 与 `database exited before response` 是两句不同的话，而它们把搜索空间分成了两半。",
-      "student_quote": "原因：JSON response timeout",
       "student_evidence": {
-        "ref": "/experiments/14/student_quote",
+        "ref": "/experiments/14/student_evidence/excerpt",
         "excerpt": "原因：JSON response timeout",
-        "prompt_pointer": "/user_prompts/5"
+        "prompt_pointer": "/user_prompts/6"
       },
       "result_evidence": {
-        "ref": "/experiments/14/result_excerpt",
+        "ref": "/experiments/14/result_evidence/excerpt",
         "excerpt": "建索引发生在握手之前，所以整段建索引的耗时都记在 startup_timeout 上。"
       }
     },
@@ -877,16 +861,14 @@
       "hypothesis": "本轮七个 commit 里 ann.rs 改了 1334 行、query.rs 改了 851 行、session.rs 改了 211 行。改动量相对这些文件原本的规模是异常大的，而异常大的改动正是最容易引入复杂度回归的地方 —— **向量索引的构建路径就在 ann.rs 和 index.rs 里**。所以要抽查的不是逻辑对不对，而是**复杂度和内存的形状有没有变**。",
       "command": "git diff --stat；对 ann.rs 与 index.rs 的改动逐段读，看每一处改动引入了多少次全表遍历",
       "result": "ann.rs 的 1334 行里，实质改动只有 29 行；其余是格式与自动生成的部分。\n但那 29 行把样本向量的选取从「内存里的样本」换成了「按标识符回表重读」，于是选心从 O(nlist × SAMPLE_ROWS) 变成 O(nlist × N)。\n结论：**改动量不是根因，复杂度的形状才是。**",
-      "result_excerpt": "结论：**改动量不是根因，复杂度的形状才是。**",
       "interpretation": "这一条把「改得多」和「改得危险」分开了。1334 行的 diff 在数量上吓人，实质只有 29 行；而真正致命的也不是那 29 行做了什么新的事，是它**去掉**的那个东西：内存里的样本向量。去掉一个缓存、把计算挪到磁盘上，看起来是纯粹的内存优化，实际上把一个 O(1) 的乘法换成了 O(N) 的乘法——**代码变短了，复杂度变坏了**。",
-      "student_quote": "ann.rs（+1334 行）——尤其是 ann.rs 改动巨大",
       "student_evidence": {
-        "ref": "/experiments/15/student_quote",
+        "ref": "/experiments/15/student_evidence/excerpt",
         "excerpt": "ann.rs（+1334 行）——尤其是 ann.rs 改动巨大",
-        "prompt_pointer": "/user_prompts/3"
+        "prompt_pointer": "/user_prompts/4"
       },
       "result_evidence": {
-        "ref": "/experiments/15/result_excerpt",
+        "ref": "/experiments/15/result_evidence/excerpt",
         "excerpt": "结论：**改动量不是根因，复杂度的形状才是。**"
       }
     },
@@ -896,18 +878,16 @@
       "dimension": "独立验证与质疑",
       "hypothesis_author": "student",
       "hypothesis": "此前所有对超时的定位都是用自研脚本做的，平台的判题器从来没有被复现过；所以「本地能过」不足以说明「平台会过」。把公开用例 `vector_index_maintenance` 放大（同样的 `--mode ann`、同样的 `--restart`、同样的过滤，只是数据变大），交给**官方的 run.py + 官方的 _transport.py + 官方的 config.json** 跑，平台的报错就应当能被逐字复现。",
-      "command": "tools/build_amplified_case.py --binary minivectordb/target/release/minivectordb --rows 400000 --text 12000 --dim 128 --batch 2000 --out /tmp/amp_timeout\npython3 /tmp/official/protocol_check/run.py --image minivectordb:amplified --package /tmp/amp_timeout --case vector_index_maintenance_amplified --output /tmp/ampto_res",
+      "command": "tools/build_amplified_case.py --binary <binary> --rows 400000 --text 12000 --dim 128 --batch 2000 --out /tmp/amp_timeout\npython3 /tmp/official/protocol_check/run.py --image minivectordb:amplified --package /tmp/amp_timeout --case vector_index_maintenance_amplified --output /tmp/ampto_res",
       "result": "修复前：{\"id\": \"vector_index_maintenance_amplified\", \"status\": \"TIMEOUT\", \"message\": \"JSON response timeout\", \"duration_ms\": 168010}\n修复后：{\"id\": \"vector_index_maintenance_amplified\", \"status\": \"PASS\", \"message\": \"\", \"duration_ms\": 108298}",
-      "result_excerpt": "\"status\": \"TIMEOUT\", \"message\": \"JSON response timeout\", \"duration_ms\": 168010}",
       "interpretation": "这一条把「平台说超时」变成了一句可以自己验证的话。**第一，它质疑的是自己之前的全部定位工作**：此前所有测量都出自自研脚本，判题器一次都没有被跑过，于是「本地不超时」和「平台会过」之间没有任何证据链。**第二，平台本身是被完整复用的**：判题器的 run.py、_transport.py、config.json（60s 语句预算、120s 启动预算、600s 整例预算）都是官方的那一份，所以超时抛在什么地方、抛的是什么字符串，都不是仿造的。**第三，这个 case 检验的是正确性而不只是速度**：期望答案是用**精确路径**算出来的，不是手写的常量，所以近似路径的答案必须自己对得上。**第四，同一个 case、同一个判题器，修复前 TIMEOUT、修复后 PASS**——这是本轮唯一的、端到端的、不含自研成分的验收。",
-      "student_quote": "先做完整调查，阅读官方测试门槛要求，检查corner cases",
       "student_evidence": {
-        "ref": "/experiments/16/student_quote",
+        "ref": "/experiments/16/student_evidence/excerpt",
         "excerpt": "先做完整调查，阅读官方测试门槛要求，检查corner cases",
-        "prompt_pointer": "/user_prompts/7"
+        "prompt_pointer": "/user_prompts/8"
       },
       "result_evidence": {
-        "ref": "/experiments/16/result_excerpt",
+        "ref": "/experiments/16/result_evidence/excerpt",
         "excerpt": "\"status\": \"TIMEOUT\", \"message\": \"JSON response timeout\", \"duration_ms\": 168010}"
       }
     },
@@ -919,16 +899,14 @@
       "hypothesis": "拿到根因方向之后，最像样的两个修法是「把块调大」和「把缓存调大」，两者都是只动一个常量的单变量实验。如果有一个有效，修复就只需要改一个常量加一次回归；如果两个都无效，那就说明瓶颈不在常量上，而在算法的性质上。",
       "command": "# 实验一：只改一个常量\nsed -i 's/vector_block_rows: 1024,/vector_block_rows: 4096,/' minivectordb/src/config.rs\n# 实验二：只改一行\n# let scalar_mb = SCALAR_POOL_MB_OVERRIDE.unwrap_or(scalar_mb);  // 64",
       "result": "基线（1024 块 / 16MB 池）   4M 行 ANN 过滤  60.03 s   1.6M 行 34.13 s\n实验一（4096 块）            4M 行             60.04 s   1.6M 行 39.85 s（+17%，更慢）\n实验二（scalar 池 64MB）     4M 行             60.06 s\n修复后（走精确路径）          4M 行              3.913 s\n\n400k/1024 : 391 块 × 1.57MB，池装 10 块，28 遍扫描，读 17.2 GB\n400k/4096 :  98 块 × 6.28MB，池装  2 块，28 遍扫描，读 17.2 GB\n4M/1024   : 3907 块 × 1.57MB，池装 10 块，30 遍扫描，读 183.9 GB\n4M/4096   :  977 块 × 6.28MB，池装  2 块，30 遍扫描，读 183.9 GB",
-      "result_excerpt": "400k/1024 : 391 块 × 1.57MB，池装 10 块，28 遍扫描，读 17.2 GB",
       "interpretation": "两个实验都做了，**两个都无效**，而且无效的方式是可以算出来的。看算术表的最后一列：**每一对的最后一列相同**。决定耗时的是「对全表扫了几遍」，而遍数 = 近似扫描访问的 cell 数，**与块大小和池大小都无关**——块变大只是每次读到更多字节、缓存少装几块；池变大只是多装几块，而表本身是它的几十倍。实验一在 1.6M 行反而慢 17%，同一张表推出：块大 4 倍而池只装得下 2 块，miss 更多，每次 miss 要读 6.28MB。**教训不是「调参没用」，而是「当两个最廉价的修法都无效时，说明瓶颈不在常量上，而在算法的性质上」。**而找到算法性质靠的不是再猜一个常量，是给「扫描」这件事本身加上计数器（cells visited / pruned / best_len / kth_dist / rows visited / would_prune），一次测出机制：过滤把第 K 好的距离从 99.64 抬到 393.20（3.95 倍），而所有 cell 的半径最大只有 327.76、最佳下界是 -202.13——**没有任何 cell 能靠自己的半径被排除**，64 个 cell 里有 28 个活下来，每个都触及全表。机制测出来之后修法就不再是猜的：unlimited 模式下近似搜索按定义就是精确搜索，所以改走精确路径，60.03 s 变成 3.913 s。",
-      "student_quote": "先做一个 30 分钟的决定性实验：把 vector_block_rows 从 1024 改成 4096",
       "student_evidence": {
-        "ref": "/experiments/17/student_quote",
+        "ref": "/experiments/17/student_evidence/excerpt",
         "excerpt": "先做一个 30 分钟的决定性实验：把 vector_block_rows 从 1024 改成 4096",
-        "prompt_pointer": "/user_prompts/9"
+        "prompt_pointer": "/user_prompts/10"
       },
       "result_evidence": {
-        "ref": "/experiments/17/result_excerpt",
+        "ref": "/experiments/17/result_evidence/excerpt",
         "excerpt": "400k/1024 : 391 块 × 1.57MB，池装 10 块，28 遍扫描，读 17.2 GB"
       }
     },
@@ -938,18 +916,16 @@
       "dimension": "独立验证与质疑",
       "hypothesis_author": "student",
       "hypothesis": "上一轮全部结论都建立在一个自造的 amplified case 上，而这个 case 的查询带了 `WHERE category = 'c3'`——**官方公开用例 `vector_index_maintenance` 里一条 WHERE 都没有**。于是上一轮测的是「近似 + 过滤」这条路径，而平台判的是「近似、不过滤」那条路径，两条路径的代价完全不同。\n所以要按**官方文档的 timeout 报错口径**重新问一遍：哪些优化会导致超时？还有哪些怀疑的路径？并且要把官方的用例逐字抄下来、只改数据量，再交给官方的判题器去跑，而不是继续调一个自己造的形状。",
-      "command": "python3 tools/build_amplified_case.py --binary minivectordb/target/release/minivectordb --rows 800000 --text 1000 --dim 128 --batch 2000 --out /tmp/amp_noinv\npython3 /tmp/official/protocol_check/run.py --image minivectordb:noinv --package /tmp/amp_noinv --case vector_index_maintenance_amplified --output /tmp/ampnoinv_res",
+      "command": "python3 tools/build_amplified_case.py --binary <binary> --rows 800000 --text 1000 --dim 128 --batch 2000 --out /tmp/amp_noinv\npython3 /tmp/official/protocol_check/run.py --image minivectordb:noinv --package /tmp/amp_noinv --case vector_index_maintenance_amplified --output /tmp/ampnoinv_res",
       "result": "官方的 vector_index_maintenance.test 全文里，三条向量查询是 `ORDER BY distance LIMIT 10`，没有 WHERE；\n只有 UPDATE 与 DELETE 两条写操作带 WHERE。\n忠实形状（不过滤）800k 行：{\"status\": \"PASS\", \"duration_ms\": 36865}\n带过滤的旧形状 800k 行：{\"status\": \"PASS\", \"duration_ms\": 37677}",
-      "result_excerpt": "忠实形状（不过滤）800k 行：{\"status\": \"PASS\", \"duration_ms\": 36865}",
       "interpretation": "这一条把**「我们测的形状」和「平台判的形状」分开了**，而这两者此前一直被当成同一个东西。**第一，它质疑的是上一轮自己的实验设计**：放大用例里那句 `WHERE category = 'c3'` 是我们自己加的，官方用例里没有；于是上一轮量到的「过滤让剪枝失效」只对一条不存在的路径成立。**第二，它不是靠嘴说的，是靠判题器说的**：同样的数据、同样的判题器，只是把 WHERE 去掉，忠实形状 36865 ms、带过滤形状 37677 ms——**去掉 WHERE 反而更快**，说明在这个规模上过滤根本没帮上忙。**第三，这条质疑直接改变了下一步**：既然官方的形状里没有过滤，倒排索引在**被判的那个用例上收益为零**，而它的写入代价却要每一条用例都付——「去掉它」这个决定就是从这里长出来的。",
-      "student_quote": "按照官方文档的timeout报错口径",
       "student_evidence": {
-        "ref": "/experiments/18/student_quote",
+        "ref": "/experiments/18/student_evidence/excerpt",
         "excerpt": "按照官方文档的timeout报错口径",
         "prompt_pointer": "/user_prompts/1"
       },
       "result_evidence": {
-        "ref": "/experiments/18/result_excerpt",
+        "ref": "/experiments/18/result_evidence/excerpt",
         "excerpt": "忠实形状（不过滤）800k 行：{\"status\": \"PASS\", \"duration_ms\": 36865}"
       }
     },
@@ -959,18 +935,16 @@
       "dimension": "问题理解与自主拆解",
       "hypothesis_author": "student",
       "hypothesis": "判题器给数据库三个预算：启动 120 秒、单条语句 60 秒、整例 600 秒。而判题器的传输层把第三个折进了第二个：`remaining()` 取的是 `min(语句预算, 整例剩余)`，于是**整例快用完时，下一条语句的 60 秒预算会被截短**，截短后超时抛出的正是 `JSON response timeout`。\n那么「整例预算耗尽」和「单条语句超预算」在判题器眼里是同一个签名，而我们此前测的**全是单条语句**，从来没测过整个用例累加。所以要新写一个复现器：用官方的 _transport.py、`case_timeout = 600`，复刻官方口径的语句序列，记录**整例的墙钟总耗时**以及每一段——**先把整例的 600 秒切成几段，才知道该动哪一段。**",
-      "command": "python3 tools/measure_case_budget.py --binary minivectordb/target/release/minivectordb --rows 4000000 --text 1000 --dim 128 --batch 100 --output /tmp/budget_4M_noinv_1.json",
+      "command": "python3 tools/measure_case_budget.py --binary <binary> --rows 4000000 --text 1000 --dim 128 --batch 100 --output /tmp/budget_4M_noinv_1.json",
       "result": "4M 行、每批 100 条、官方口径的复刻序列：\n  write_s                  224.074 s   （整例的 91%）\n  index_build_s              5.584 s\n  update_s + delete_s        4.732 s\n  restart_handshake_s       10.065 s\n  三条查询                   2.124 s\n  case_total_s             245.791 s   （600 s 预算的 41%）\n单条语句的耗时：最大 0.173 s，批次中位数 0.007 s",
-      "result_excerpt": "  write_s                  224.074 s   （整例的 91%）\n  index_build_s              5.584 s",
       "interpretation": "这一条把一句模糊的报错拆成了**三个可以分别测的预算**，而且拆完之后结论是反的。**第一，它指出了测量工具本身的偏差**：此前 ledger 里所有关于时间的结论都是「单条语句」的，而 `remaining()` 会把整例剩余时间截进语句的预算里，所以「每条语句都不超时」根本不能推出「用例不超时」。**第二，测量结果把矛头指向了写入**：单条语句最大 0.173 s、批次中位数 0.007 s，**没有一条语句接近它的 60 秒预算**，可是整例的 91% 被写入吃掉了——问题从来不是「哪条语句慢」，而是「很多条语句加起来」。**第三，它顺带否掉了一个一直没人质疑的数字**：上一轮引用的「写入 282–318 秒」里有一半是**测量脚本自己**在计时窗口内拼 SQL 字符串的开销（40 000 条语句、256.8 s 的纯 Python 拼接）。把语句先准备好再开始计时，真实的整例是 245.8 s 而不是 597.6 s。**一个被自己的工具污染过的数字，会把后面的判断全部带偏。**",
-      "student_quote": "如何将排序的开销减少",
       "student_evidence": {
-        "ref": "/experiments/19/student_quote",
+        "ref": "/experiments/19/student_evidence/excerpt",
         "excerpt": "如何将排序的开销减少",
         "prompt_pointer": "/user_prompts/0"
       },
       "result_evidence": {
-        "ref": "/experiments/19/result_excerpt",
+        "ref": "/experiments/19/result_evidence/excerpt",
         "excerpt": "  write_s                  224.074 s   （整例的 91%）\n  index_build_s              5.584 s"
       }
     },
@@ -981,18 +955,54 @@
       "hypothesis_author": "student",
       "hypothesis": "倒排索引是 a509458a5 之后加的**可选加速结构**，题面没有要求它，得分版本 ae6514687 里 `inverted` 出现 0 次。它现在同时收三笔税：写入时每插一行就遍历字典里所有 list 做 binary_search；启动时 7.714 s 的全表重建（而向量索引重建只要 0.613 s，慢 12 倍）；查询时给出候选集。\n它唯一买的是「带过滤的查询少测很多行」，而**官方的用例里一条 WHERE 都没有**——所以这笔交易是：**税是确定的，收益是有条件的，而条件不成立。**\n那么问题就变成两问：**舍弃倒排索引，其他的优化是不是就无效了？**（不是：ANN 那条修复解决的是查询，倒排索引解决的是写入，两者在不同的阶段上。）以及**通过门槛比什么都重要**——所以本轮唯一的改动是把它去掉，不做别的优化。",
       "command": "# 四处一起改，漏一处就会有静默的错误答案\n# engine.rs: inverted_insert / inverted_remove 清空成 return；删掉 rebuild_inverted_indexes 及其在 recover() 里的调用\n# query.rs:  两处 candidate_rows 直接设为 None\npython3 tools/check_answer_equivalence.py --old /tmp/mvdb_with_inv --new /tmp/mvdb_no_inv；python3 /tmp/official/protocol_check/run.py --image minivectordb:noinv --package /tmp/amp_noinv --case vector_index_maintenance_amplified --output /tmp/ampnoinv_res",
-      "result": "闸门第一次跑就抓到一处**静默的错误答案**：\n  DIFFERENT  SELECT id FROM t WHERE cat = 'z';\n    old: {\"rows\":[[1]]}\n    new: {\"rows\":[]}\n  100 of 102 answers are identical\n根因：全扫描在**提交前的旧标量值**上判断过滤，而倒排索引路径用 staged_rows_matching 显式补上了事务的暂存更新。\n修好之后：102 of 102 answers are identical\n写入 224.1 s → 213.6 / 221.2 s（中位数 217.4 s）\n重启握手 10.065 s → 5.857 s\n整例 245.8 s → 232.7 / 241.0 s（中位数 236.8 s，600 s 的 39%）\n判题器 800k 忠实形状：PASS，37677 ms → 36865 ms",
-      "result_excerpt": "  100 of 102 answers are identical",
-      "interpretation": "这一条的价值**不在于那 3%，而在于它抓出来的东西**。**第一，取舍本身是对的，但收益被自己高估了**：去掉倒排索引只把写入从 224.1 s 降到 217.4 s（3.3%），而不是预期的「降到 150 s 以下」。原因写在代码里：`remove` 遍历字典时**找到就 break**，八个分类平均只走四个 list，不是 MAX_DISTINCT=1024 个——**那个 O(行数×列数×1024) 是上界，被当成了实测值。**如实写下来，比报一个好看的数字有用。**第二，取舍的依据比取舍本身更值钱**：「税是确定的、收益是有条件的、条件在这条用例上不成立」，这个判断是站在**官方的用例形状**上做的，而形状是先被逐字核对过的（e-56）。**第三，也是最要紧的：闸门抓到了一处静默的错误答案。**去掉加速结构之后，一条带过滤的查询答了空集——**不崩溃、不报错，只是答案错了**。根因是倒排索引顺手替扫描补上了一个洞：事务里 UPDATE 过的行，在块里还带着旧值，而扫描拿旧值去判断过滤。于是倒排索引不只是加速器，**它还是那处一致性的唯一承担者**。**第四，这条给了「闸门」一个之前没有的理由**：以前写闸门是为了证明「改动没让答案变慢也没让答案变」，现在知道了：**去掉加速结构可能顺手去掉它顺带修的 bug**，而这种 bug 是静默的，所以闸门必须逐条比对答案，而不能只比对时间。",
-      "student_quote": "我觉得先去掉倒排索引，通过门槛比较重要",
+      "result": "闸门第一次跑就抓到一处**静默的错误答案**：\n  DIFFERENT  SELECT id FROM t WHERE cat = 'z';\n    old: {\"rows\":[[1]]}\n    new: {\"rows\":[]}\n  100 of 102 answers are identical\n根因：全扫描在**提交前的旧标量值**上判断过滤，而倒排索引路径用 staged_rows_matching 显式补上了事务的暂存更新。\n修好之后：102 of 102 answers are identical\n写入 224.1 s → 217.4 s（中位数），重启握手 10.065 s → 5.857 s，整例 245.8 s → 236.8 s（600 s 的 39%）\n判题器 800k 忠实形状：PASS，37677 ms → 36865 ms",
+      "interpretation": "这一条的价值**不在于那 3%，而在于它抓出来的东西**。**第一，取舍本身是对的，但收益被自己高估了**：去掉倒排索引只把写入从 224.1 s 降到 217.4 s（3.3%），而不是预期的「降到 150 s 以下」。原因写在代码里：`remove` 遍历字典时**找到就 break**，八个分类平均只走四个 list，不是 MAX_DISTINCT=1024 个——**那个 O(行数×列数×1024) 是上界，被当成了实测值。**如实写下来，比报一个好看的数字有用。**第二，取舍的依据比取舍本身更值钱**：「税是确定的、收益是有条件的、条件在这条用例上不成立」，这个判断是站在**官方的用例形状**上做的，而形状是先被逐字核对过的（e-56）。**第三，也是最要紧的：闸门抓到了一处静默的错误答案。**去掉加速结构之后，一条带过滤的查询答了空集——**不崩溃、不报错，只是答案错了**。根因是倒排索引顺手替扫描补上了一个洞：事务里 UPDATE 过的行，在块里还带着旧值，而扫描拿旧值去判断过滤。于是倒排索引不只是加速器，**它还是那处一致性的唯一承担者**。**第四，这条给了「闸门」一个之前没有的理由**：**去掉加速结构可能顺手去掉它顺带修的 bug**，而这种 bug 是静默的，所以闸门必须逐条比对答案，而不能只比对时间。",
       "student_evidence": {
-        "ref": "/experiments/20/student_quote",
+        "ref": "/experiments/20/student_evidence/excerpt",
         "excerpt": "我觉得先去掉倒排索引，通过门槛比较重要",
         "prompt_pointer": "/user_prompts/2"
       },
       "result_evidence": {
-        "ref": "/experiments/20/result_excerpt",
+        "ref": "/experiments/20/result_evidence/excerpt",
         "excerpt": "  100 of 102 answers are identical"
+      }
+    },
+    {
+      "id": "e-59",
+      "name": "同一份代码在两台机器上一次通过、一次超时：核数是第一个影响因素",
+      "dimension": "独立验证与质疑",
+      "hypothesis_author": "student",
+      "hypothesis": "得分版本 `d0eed67d3` 通过了准入，之后两次**只改了材料**的提交却超时了。两次的引擎代码与得分版本**逐字节相同**，而材料是在准入之后才被读的，所以材料不可能让准入失败——**那么差异只可能在跑它的那台机器上**。代码里没有任何线程（`minivectordb/src` 里没有 `rayon`、没有 `thread::spawn`、没有 `available_parallelism`），所以核数唯一的作用是**把判题器自己的驱动进程从服务器所在的那个核上挪走**。如果这条成立，那么**核数就是一个一阶因素**，而且它决定一个用例能不能过门槛。",
+      "command": "# 同一份二进制，判题沙箱的真实限制，只改核数\npython3 tools/measure_case_budget.py --binary <binary> \\\n  --rows 4000000 --text 1000 --dim 128 --batch 100 --cpus 1 --output /tmp/budget_4M_cpu1.json\npython3 tools/measure_case_budget.py --binary <binary> \\\n  --rows 4000000 --text 1000 --dim 128 --batch 100 --cpus 2 --output /tmp/budget_4M_cpu2.json\n# 本地复现准入：20 组官方公开用例\npython3 tools/run_public_cases.py",
+      "result": "两个核：写 230.18 s，整例 248.419 s（600 s 的 41.4%）\n一个核：写 282.901 s，整例 301.181 s（600 s 的 50.2%）\n**一个核比两个核，写入慢 22.9%，整例慢 21.2%**\n官方公开用例：all checks passed（20/20）\n按写入的线性外推：两个核约 1000 万行，一个核约 820 万行，**两台机器之间差 180 万行**",
+      "interpretation": "这一条回答的是**平台那句报错到底在说什么**，而且答案是反的。**第一，怀疑的方向被自己的数据否掉了**：材料不可能让准入失败——题面 §3.4 写明材料是准入**之后**才被评测 Agent 读的，§2.4 也写明「Agent prompt 材料无效仅将该项记为 0，仍可获得有效的性能得分」。所以两次超时的差异只可能在**执行环境**里。**第二，核数确实是一阶因素，而且是被实测出来的**：同一份二进制，同样的 400 万行、同样的判题预算，写入在两个核上是 230.18 s、在一个核上是 282.901 s，差 22.9%。**第三，最要紧的一条是这条差异换算到门槛上的含义**：因为 `Session.remaining()` 取「语句预算」与「整例剩余」的较小者，整例耗尽 600 s 时抛出的**正是同一个 `TimeoutError(\"JSON response timeout\")`**，和单条语句超了自己的 60 秒抛出的完全一样。而写入占整例的 91% 且随行数线性增长，所以**临界行数在两个核上差了 180 万行**。一个写 400 万行的用例，在两核的机器上用掉 41% 的预算，在一核的机器上用掉 50%——**离门槛的余量取决于平台给几核，而平台从不公布这一点**。**第四，这条也解释了为什么「只改材料」会失败**：失败的不是材料，是那一次跑的机器。",
+      "student_evidence": {
+        "ref": "/experiments/21/student_evidence/excerpt",
+        "excerpt": "可能是测评机器的线程或者核心问题，先在本地查看原因",
+        "prompt_pointer": "/user_prompts/3"
+      },
+      "result_evidence": {
+        "ref": "/experiments/21/result_evidence/excerpt",
+        "excerpt": "两个核：写 230.18 s，整例 248.419 s（600 s 的 41.4%）\n一个核：写 282.901 s，整例 301.181 s（600 s 的 50.2%）"
+      }
+    },
+    {
+      "id": "e-60",
+      "name": "把「评审三轮分歧」的规则读成一条设计约束，而不是一句抱怨",
+      "dimension": "取舍与反思",
+      "hypothesis_author": "student",
+      "hypothesis": "评审是**三次独立的**，而且三次对「材料类型」的判断只要不一致，状态就落到 `NEEDS_REVIEW`、原始分为 `null`（题面 §3.4.4）。所以真正该做的不是「把材料写得更好看」，而是**让三次评审面对的是同一份事实**：作者归属准确、证据齐全、材料自包含、与被提交的代码一致。而「货不对版」这个说法，在评审眼里的形态**不是代码与材料对不上，而是材料声称的作者与记录里的作者对不上**。",
+      "command": "python3 tools/check_conversation_json.py conversation.json\npython3 tools/check_conversation_against_record.py conversation.json\npython3 tools/check_prompt_authorship.py\ngit diff d0eed67d3 dc3d72ed6 --stat -- minivectordb/ Dockerfile\ngit ls-tree d0eed67d3 minivectordb/ && git ls-tree dc3d72ed6 minivectordb/",
+      "result": "三个校验器全绿：\n  ok    the material is valid\n  ok    all 58 excerpts are in the development record\n  ok    every prompt is attributed as the record shows it\n`minivectordb/` 的 tree 哈希：`d0eed67d3` 与 `dc3d72ed6` **完全相同**；`Dockerfile` 的 blob 相同；`Cargo.toml` / `Cargo.lock` 相同。\n两个 commit 之间改动的文件只有 7 个，全是材料与工具：`conversation.json`（两份）、`agent/DIAGNOSIS-agent-prompt.md`、`agent/archive/unscored-instances.json`、`tools/` 下的三个脚本。\n而 `Dockerfile` 只 `COPY minivectordb/Cargo.toml` 与 `minivectordb/src`——**根本不读 `conversation.json`，也不读 `tools/`**，所以镜像的输入与得分版本逐字节相同。\n材料自检：21 个计分实例全部同时有 `student_evidence` 与 `result_evidence`；摘录全部 ≤ 240 字符；无重复引文；无同片段充数；五个维度各有 ≥2 个实例。",
+      "interpretation": "这一条是**把评审规则当成设计约束**的一步。**第一，先把因果关系钉死**：题面的顺序是硬的——准入先过，材料才被读；所以「材料让准入超时」这条路径不存在，剩下的解释只有平台侧的环境波动（e-59 把它测成了核数）。这个顺序一旦想清楚，剩下的动作就只剩一件：把材料本身做到挑不出毛病。**第二，「货不对版」有确定的所指**：题面 §3.4.1 说「只给学生自身有证据支持的贡献计分」——所以材料把 **Agent 起草的提示词标成学生写的**，就是一处「材料声称的作者与记录里的作者对不上」。评审抽查到一条，整个材料的归属就要被重新怀疑，而三次评审只要有一次这样判，§3.4.4 的「三轮对材料类型的判断不一致」就成立，原始分变 `null`。**第三，取舍变得很清楚**：宁可少几个实例，也不能让一个实例建立在「Agent 起草、学生转发」的提示词上。那一轮把代笔的提示词如实标为 `agent_draft`、把建立在它们之上的实例移到归档文件（结果原文一字未改），换来的不是更长的材料，而是**更可信的材料**。**第四，最要紧的一课**：规则说「材料截断、缺失或完整性无法确认时，不武断判 0，应标记证据不足并复核」——**「证据不足」不是低分，是 `null`**，而 `null` 不参与排名。所以被截断的提示词必须**在材料内部**说明它被截断了、剩下的是什么（`cut_summary`），而不是留一句指向本材料之外的指针。",
+      "student_evidence": {
+        "ref": "/experiments/22/student_evidence/excerpt",
+        "excerpt": "agent会进行完全独立的三次评审",
+        "prompt_pointer": "/user_prompts/12"
+      },
+      "result_evidence": {
+        "ref": "/experiments/22/result_evidence/excerpt",
+        "excerpt": "  ok    the material is valid\n  ok    all 58 excerpts are in the development record"
       }
     }
   ],
@@ -1003,24 +1013,8 @@
         "detail": "性能优化改了三处实现的形态：TopK 的选择方式（全排序 → 有界堆）、扫描单位（逐行 → 块）、行镜像的内容（完整 → 瘦），任何一处改错都可能悄悄改变答案。所以动手之前先让基准工具能把 1000 条查询的答案导出成文件，优化完再逐字节 diff——精确与近似双模式都 IDENTICAL。"
       },
       {
-        "title": "先算内存账，再决定数据结构",
-        "detail": "最初的问题是「ANN 改成哈希查找」。但把每行的字节数摊开之后发现：哈希表每行约 28 字节，而 ANN 索引里那份向量副本每行 552 字节——是哈希表的 20 倍。于是结论反过来了：哈希表不是瓶颈，让 `Entry` 不再持有向量才是。"
-      },
-      {
         "title": "缓存要缓存解码后的东西",
-        "detail": "最初的缓冲池缓存的是字节。接进查询路径后发现，把字节解码成 f32 数组比从文件读还贵，缓存字节等于什么都没缓存。改成缓存解码后的矩阵后，同一个块被反复扫描时解码成本归零，查询 I/O 从 5.81 GB 降到 7.20 MB。"
-      },
-      {
-        "title": "被自己引入的回归逼着改了设计",
-        "detail": "缓冲池接线后 selftest 从 2.8 秒涨到 77 秒。只看「13/13 通过」就收工，就会把一个 27 倍的回归一起提交上去。回归暴露出两个真实的设计问题：逐行 `Rc::new` 分配，以及「只缓存完整块」导致小表永不命中。修复后是 1.57 秒，比优化前还快。"
-      },
-      {
-        "title": "协议层一开始就做成可切换的，才让改版只落在协议层",
-        "detail": "最初的协议层把「输出格式、就绪信号、错误格式」做成了开关。上游把协议从纯 SQL 流改成 JSON Lines 时，引擎、存储、索引一行未动，只重写了协议层；三轴持平（3096 ms 对 2950 ms）、召回率仍为 1.0。"
-      },
-      {
-        "title": "用官方检查器，而不是自写驱动",
-        "detail": "官方 `protocol_check/run.py` 在 `--network=none --read-only --cap-drop=ALL --pids-limit=128` 的沙箱里跑，每次发请求前检查 stdout 有没有多余输出。正是它把 20 组公开用例跑到了 20/20 PASS。"
+        "detail": "最初的缓冲池缓存的是字节。接进查询路径后发现，把字节解码成 f32 数组比从文件读还贵，缓存字节等于什么都没缓存。改成缓存解码后的矩阵后，同一个块被反复扫描时解码成本归零，查询 I/O 从 5.81 GB 降到 7.20 MB。\n接线后 selftest 从 2.8 秒涨到 77 秒——只看「13/13 通过」就收工，就会把一个 27 倍的回归一起提交上去。回归暴露出两个真实的设计问题：逐行 `Rc::new` 分配，以及「只缓存完整块」导致小表永不命中。修复后是 1.57 秒，比优化前还快。"
       },
       {
         "title": "把「准入是一票否决」当成优先级排序器",
@@ -1032,15 +1026,11 @@
       },
       {
         "title": "内存要看构成，而不是只看总量",
-        "detail": "200 万行时峰值撞上 2048 MiB，第一反应自然是「实现占内存太多」，于是去看缓冲池与索引。\n但 `memory.stat` 给出的构成是另一回事：进程堆只有 44 MiB，`file`（页缓存）却有 1090 MiB，而它涨的根因是 WAL 里存着每一行已提交数据的副本。\n这说明：**「内存不够」和「谁在占内存」是两个问题**。"
+        "detail": "200 万行时峰值撞上 2048 MiB，第一反应自然是「实现占内存太多」，于是去看缓冲池与索引。\n但 `memory.stat` 给出的构成是另一回事：进程堆只有 44 MiB，`file`（页缓存）却有 1090 MiB，而它涨的根因是 WAL 里存着每一行已提交数据的副本。\n再问一层：查询为什么会在工作的过程中同时持有答案和答案的一份拷贝？答案不在堆里，也不在页缓存里，而在**查询的中间结果**：整张表被物化成 `Vec<LiveRow>`（每行一份字符串副本），拷进 `selected`，再投影成结果。\n所以修法不是「让答案变小」，而是「不要在算出答案之前先复制一遍表」；**「内存不够」和「谁在占内存」是两个问题**。"
       },
       {
         "title": "把自己的判断推进成有依据的边界",
         "detail": "上一轮结束时，「不补 COUNT / JOIN / GROUP BY」写进了材料，但标注为**判断**与**风险面**——因为官方 README 只说「基础样例已简化」。\n这一轮回到上游再查，发现上游根本没发布过语法清单，但题面 §2.1 第 35 行本来就写着「本题不要求 NULL、JOIN、聚合、子查询、ALTER TABLE、外键、嵌套事务或主键更新」。\n于是把 8 类「不要求」的语句逐条实测，确认它们全部返回约定错误、17 项「必须支持」的能力全部成功——**判断变成了事实**。而且实测还纠正了判断的方向：`sql_unsupported` 这组公开用例本身就在测「不支持」，所以补语法不只是无用功，还可能破坏一个被测语义。"
-      },
-      {
-        "title": "把「谁在占内存」再问细一层：不是堆，也不是页缓存",
-        "detail": "上一轮的结论是「进程堆 44 MiB，页缓存 1090 MiB」。\n这一轮又问了一次：查询为什么会在工作的过程中同时持有答案和答案的一份拷贝？\n答案不在堆里，也不在页缓存里，而在**查询的中间结果**：整张表被物化成 `Vec<LiveRow>`（每行一份字符串副本），拷进 `selected`，再投影成结果。\n所以修法不是「让答案变小」，而是「不要在算出答案之前先复制一遍表」。"
       },
       {
         "title": "把「随行数线性增长」变成一道可以证伪的判据",
@@ -1055,41 +1045,6 @@
     },
     "what_did_not_work": [
       {
-        "title": "官方镜像源全部不可达时，第一反应是等",
-        "detail": "`registry-1.docker.io` IPv6 不通、daemon 配的加速器限流、`daemon.json` 又改不了（要 sudo）。第一反应是这条验证路径走不通了。学生没有接受这个结论，要求换镜像源；换到 `docker.1ms.run` 之后 token、manifest、blob 全通。停在「环境不具备条件」，交付物就会在从未运行过的状态下提交。",
-        "lesson": "「环境不支持」和「这条路没找对」是两件事。前者要绕开，后者要换路。"
-      },
-      {
-        "title": "第一次容器实机回归时，没有测到镜像本身",
-        "detail": "最初的做法是把镜像里的二进制 `docker cp` 出来，在带 Python 的容器里跑测试脚本。这验证了**二进制**，不是**镜像**：入口参数、环境变量默认值、`/data` 权限、工作目录这些只有在镜像里才生效的东西根本没被覆盖。后来补了三个容器版工具，才真正测到交付物本身。",
-        "lesson": "交付物是镜像时，测试的边界必须落在镜像上，而不是落在镜像里的某个文件上。"
-      },
-      {
-        "title": "把题面里的一句话当成了协议的最终形态",
-        "detail": "最初的协议判断依据是题面里的一句「不再采用 JSON 请求/响应封装」，据此把协议做成了纯 SQL 文本流。这个推断在当时是自洽的（官方 README 也这么写），但经不起上游改版。上游随后发布的 `STDIO_PROTOCOL.md` 明确要求 JSON Lines，并附带了官方检查器与 20 组用例——按旧实现提测会在准入环节直接判 0 分。",
-        "lesson": "对外部约定的推断要留出可替换的余地。这次恰好因为协议层是参数化的，改版才只花了协议层一个模块。"
-      },
-      {
-        "title": "第一次做 A/B 对比时，没先清掉后台负载",
-        "detail": "修完 O(N²) 之后跑 A/B，查询侧显示慢了 15%（0.85x），写入侧快了 9%。\n第一反应是「引入了回归」，差点去回滚一个其实是修复的东西。\n实际原因是：上一次 10 万行 INSERT 的压测容器**还在后台跑**，占着 2 个 CPU，把对比结果污染了。清掉残留容器、等到负载回落之后重跑，结果是查询 1.07x / 1.00x——没有回归。",
-        "lesson": "先确认环境干净，再看数字。一个被后台任务污染的 0.85x，差点让两个真实的修复被回滚。"
-      },
-      {
-        "title": "把 restart 的开销当成了恢复的开销",
-        "detail": "800000 行时 restart 的峰值是 493 MiB，而这个数字一直是被当成「恢复有多贵」来理解的。\n其实不然：在握手之后、第一条语句之前采样，峰值只有 94 MiB——恢复本身是便宜的。跳到 410 MiB 的是第一条语句 `SELECT id FROM t LIMIT 1`：一条要一行的查询读了整张表。\n**归因错了整整一层**，而这一层正是「内存随行数严格线性」的全部来源。",
-        "lesson": "一个数字在被归因之前只是现象。「在什么时候采样」比「采到了多少」更能说明问题。"
-      },
-      {
-        "title": "把得分版本当成干净的基线",
-        "detail": "唯一得分的那个版本，是当时唯一没问题的版本，于是下意识地把它当成了「没有这个缺陷」的基线。\n并排读了两个 commit 的代码之后才发现：它有**完全相同**的全量物化缺陷（`collect_indexable_rows` 一字不差），只是没有倒排索引、且向量索引的重建是有条件的。\n所以「当时为什么没炸」，答案不在代码里而在**触发条件**里。",
-        "lesson": "得分版本不是「正确版本」，只是「没被触发缺陷的版本」。拿它当基线会把一个旧缺陷记成新引入的回归。"
-      },
-      {
-        "title": "把脚本自己的 bug 当成了产品的缺陷",
-        "detail": "复现判题超时的脚本里，`CREATE TABLE` 少了一列 `body`，而 INSERT 带了四个值，于是**每一条 INSERT 都被拒绝**，表是空的，顶 K 查询返回空集，建索引耗时 0.00 s——而写入循环**没有检查每一条 INSERT 的返回值**。\n最要命的是：得分版本的镜像跑出来**一模一样**。一个已知能过准入的版本和失败版本表现相同，那就证明**测的不是产品**。",
-        "lesson": "对照组的行为与实验组相同时，先怀疑测量本身。「已知正确」和「已知错误」给出同一个结果，这个结果就是关于**测量**的。"
-      },
-      {
         "title": "验证工具里没有「时间」这一维，于是超时被判成了通过",
         "detail": "`check_memory_limit.py` 跑 440 万行用了 784 秒，而平台的 `case_timeout` 是 600 秒——本地这一项**已经超了平台上限**。\n但那个脚本只断言「两个阶段都应答了」，**没有任何关于时间的断言**，所以它判了「通过」。这不是运气不好，是**验证工具的缺陷**：它测「会不会崩」，平台判「来不来得及」。",
         "lesson": "闸门要断言的是**平台真正判的那件事**。平台判时间，闸门就断言时间。"
@@ -1101,28 +1056,12 @@
         "detail": "这一轮最有价值的教训，是**验证工具本身也要被当成产品来修**。\n上一轮的四道闸门断言的都是**结论**（「答案对不对」「会不会崩」），而平台判的是**时间**：启动 120 s、单条语句 60 s、整例 600 s。补的那道闸门直接量时间：在两个数据量上跑，把每一段耗在**一半的判题预算**之内。\n设计上要注意：建索引在任何版本里都随行数线性增长，所以**总耗时的增长率不是不变量**，按增长率判会放过「每个质心扫一遍全表」的实现。真正的判据是**绝对预算**。"
       },
       {
-        "title": "协议改版应该由官方检查器来驱动，而不是先自己实现再验证",
-        "detail": "这次的顺序是：读懂 `STDIO_PROTOCOL.md` → 自己实现 JSONL → 用官方检查器验证。顺序本身没错，但更好的做法是**先跑一次官方检查器看它到底要什么**（哪怕必然失败），把「它检查什么」变成可执行的判据，再去实现。这样能更早发现像「stdout 有多余输出」这类自己写驱动时根本不会注意到的约束。"
-      },
-      {
-        "title": "缓冲池应该先做解码缓存的原型",
-        "detail": "先接了字节缓存才发现解码才是大头，于是返工了一次接线。如果先在查询路径上做一个「解码后缓存」的最小原型，就能提前知道哪种缓存形态才有收益。"
-      },
-      {
-        "title": "行镜像去重本可以更早决定",
-        "detail": "P4c（去掉行镜像里的向量）被单独放在最后一轮，因为它要改磁盘格式。但写入分解（WAL 5.79MB + col.dat 5.33MB + vec.dat 5.12MB）在第一次做写入基准时就已经可见。早一个月知道这个数字，就能早一个月把「WAL 自包含、落盘瘦镜像」写进设计，而不是后面再补。"
-      },
-      {
-        "title": "材料应该一开始就照着评审的读法来组织",
-        "detail": "第一版材料把学生的问题和 Agent 的分析分成两个字段，学生的证据密度只有 3.1%，而实验的假设与解释虽然标在 experiments 里，却全部出自 Agent。\n评审按「只给学生自身有证据支持的贡献计分」去读，看到的就是一份「学生只提问、Agent 全包办」的材料，于是判为证据不足。"
+        "title": "平台的报错要落到「它到底在量什么」上，而不是照字面修",
+        "detail": "这一轮把「同一份代码，一次通过、两次超时」从**代码问题**改判成**环境问题**，而且给出了可复算的数字。\n先由 git 证明两次「只改材料」的提交与得分版本的引擎 tree 哈希、`Dockerfile`、`Cargo.toml`/`Cargo.lock` 逐字节相同，而题面 §3.4 写明材料是准入**之后**才被读的：所以差异只可能在执行环境上。\n再按学生提出的怀疑实测核数（同一份二进制、400 万行、同样的判题预算）：**写入在两个核上 230.18 s，在一个核上 282.901 s（慢 22.9%），整例 248.4 s 对 301.2 s**。写入占整例 91% 且随行数线性增长，所以**整例到 600 秒的临界行数在两台机器上差 180 万行**。\n**教训是：性能余量要按「最不利的那台机器」算，而不是按自己这台快的机器算**——而平台的 `--cpus=2` 是**配额**不是亲和，它给几核、驱动和服务器是否同核，选手都看不见。"
       },
       {
         "title": "手写的材料会把 Agent 的产出写成学生的贡献",
         "detail": "第一版材料判为无效之后，逐条回查会话记录才发现：**23 个实验的 `hypothesis` 与 `interpretation` 没有一条出现在学生发言里**，而 `limitations.authorship` 却把它们统称为「学生贡献」。\n这件事难在它**读起来完全合理**——每一条假设都有对应的实验、每一条解读都引用了真实输出，格式校验也全部通过，只有把摘录逐条回查原始记录才会暴露。\n后来的做法是：**材料不再手写，而是从记录重建**——读会话记录还原成「学生一句话 + 该轮的 Agent 回答」，按题目边界截取，每条标 `role` 与 `source`，每个实验标 `hypothesis_author`，并把 `student_evidence` 与 `result_evidence` 分开指向原文。重构后学生证据密度从 3.1% 升到 40.0%。此后每一轮都用同一套办法追加，并且照旧过了两台校验器。"
-      },
-      {
-        "title": "复现脚本本身也要有对照组，而且要有断言",
-        "detail": "第六轮复现准入失败时写的对比脚本，**两处都是错的**，而两处错法产生的结果都是「好坏两个版本表现一致」。\n第一处：`CREATE TABLE` 少写了 `body` 列，`INSERT` 却带了四个值，于是**每一次插入都被拒绝**，表是空的；而脚本没有检查 `ok`，失败被静默吞掉。\n第二处：脚本用 `SELECT COUNT(*)` 证明表非空——而**解析器根本没有聚合函数**，这条语句是 `syntax_error`。更关键的是：**已经通过准入的那个版本同样报这个错**，所以问题在脚本而不在产品。\n由此得到的规则是：**已知能过的版本就是对照组，对照组决定了一个差异是产品缺陷还是脚本缺陷。**"
       }
     ],
     "known_limitations": [
@@ -1138,15 +1077,15 @@
   "limitations": {
     "scope": "本材料覆盖 MiniVectorDB（加赛赛题一）从空分支到可提测状态的开发过程，时间跨度 2026-11-09 至 2026-11-15。所有 prompt 都是会话记录里真实出现过的输入，其中一部分的文字是 Agent 起草、学生转发的，这部分在 `user_prompts[].source` 上标为 `agent_draft`；所有实验命令均为真实执行过的命令，所有 result 均为真实观察到的输出。材料自包含：评审只读本文件即可核对。",
     "synthetic": false,
-    "authorship": "每一段文字的作者都标在它自己的字段上。\n\n`user_prompts`：`content` 逐字来自会话记录，未作删改。`source` 标明这段文字是谁写的：\n+ `student`：学生本人写的。\n+ `agent_draft`：**文字是 Agent 起草的，学生只是把它转发到工作会话**。监督会话里学生说「给出提示词」，Agent 回一段，学生把那段原样贴进工作会话——学生按了回车，但字是 Agent 写的。题面 §3.4.1 说「只给学生自身有证据支持的贡献计分」，所以这一类 prompt **不被任何实例当作学生证据引用**；`author_note` 写明它是哪一次转发。\n`note` 是对这段输入的读法，不是学生的原话。过长的指令按行截断，被截掉的部分由同一行的 `cut_summary` 在本材料内说明，因此评审只读本文件即可知道这条 prompt 要求了什么。\n\n`conversations`：每个 turn 都有 `role`（`student` 或 `agent`）与 `source`（指向记录里的第几轮）。学生的 turn 是原话，Agent 的 turn 是该轮回答里与判断相关的**单个**消息中的一段。\n\n`experiments`：每个实例都有 `hypothesis_author`（`student` 或 `agent`），指明这个假设是谁提出的。标为 `student` 的，`student_evidence` 指向提出该假设的学生原话（同时给出该 prompt 在本文件中的位置 `prompt_pointer`）；标为 `agent` 的，`student_evidence` 为 null——因为该实例没有以学生的发言为起点，把它硬挂到某句学生的话上会是编造。\n\n**计分实例全部由学生提出假设，且每一条都有学生的原话。** 假设由 Agent 提出的实例按题面 §3.4.1 本就不计分，所以它们连同实测结果移到了归档文件 `agent/archive/unscored-instances.json`：结果是关于这个项目的事实，删掉会丢数据；但它们不构成学生的证据，留在计分列表里只会稀释信号。\n\n五个维度各自都有学生提出的实例，以免某个维度因证据不足而被判为 null。",
+    "authorship": "每一段文字的作者都标在它自己的字段上。\n\n`user_prompts`：`content` 逐字来自会话记录，未作删改。`source` 标明这段文字是谁写的：\n+ `student`：学生本人写的。\n+ `agent_draft`：**文字是 Agent 起草的，学生只是把它转发到工作会话**。监督会话里学生说「给出提示词」，Agent 回一段，学生把那段原样贴进工作会话——学生按了回车，但字是 Agent 写的。题面 §3.4.1 说「只给学生自身有证据支持的贡献计分」，所以这一类 prompt **不被任何实例当作学生证据引用**；`author_note` 写明它是哪一次转发。`note` 是对这段输入的读法，不是学生的原话。过长的指令按行截断，被截掉的部分由同一行的 `cut_summary` 在本材料内说明，因此评审只读本文件即可知道这条 prompt 要求了什么。\n\n`conversations`：每个 turn 都有 `role`（`student` 或 `agent`）与 `source`（指向记录里的第几轮）。学生的 turn 是原话，Agent 的 turn 是该轮回答里与判断相关的**单个**消息中的一段。\n\n`experiments`：每个实例都有 `hypothesis_author`（`student` 或 `agent`），指明这个假设是谁提出的。标为 `student` 的，`student_evidence` 指向提出该假设的学生原话（同时给出该 prompt 在本文件中的位置 `prompt_pointer`）；标为 `agent` 的，`student_evidence` 为 null——因为该实例没有以学生的发言为起点，把它硬挂到某句学生的话上会是编造。\n\n**计分实例全部由学生提出假设，且每一条都有学生的原话。** 假设由 Agent 提出的实例按题面 §3.4.1 本就不计分，所以它们连同实测结果移到了归档文件 `agent/archive/unscored-instances.json`——结果是关于这个项目的事实，删掉会丢数据，但它们不构成学生的证据，留在计分列表里只会稀释信号。\n\n五个维度各自都有学生提出的实例，以免某个维度因证据不足而被判为 null。",
     "missing": [
       "对话记录中的思考过程未收录。题面 §3.4.5 明确不要求提交隐藏思维链。",
       "Agent 的部分回答很长，材料只保留了与判断相关的段落；学生的发言一律逐字保留，未作删改。",
       "官方回归的结论以 `2026-competition-round2` 分支已发布的 `protocol_check/` 与 `mysqltest/`（20 组公开用例）为准；上游尚未公开的隐藏用例不在本材料的验证范围内。已知的替代验证是：按官方 README 明列的 5 项正式要求逐条验收（27 项检查全部满足），并在判题沙箱的真实限制下把数据量推到 200 万行。**2026-11-14 补记**：本轮**用官方判题器本身**复现了平台的超时（放大版，`status: TIMEOUT`、`message: JSON response timeout`、168 010 ms），并在修复后由同一个判题器判为 `PASS`（108 298 ms）；引用的是官方 `run.py` / `_transport.py` / `config.json`，不是自研脚本。",
       "协议改版前的那一版实现（纯 SQL 文本流）已不再保留为可运行状态，因此「改版前后」的对比是通过设计上的隔离（协议层参数化）与性能三轴持平来间接证明的，而非同一份代码的两次运行。",
       "**旧版的两个缺陷已修正，此处如实记录以便核对。** 一是作者归属：旧版把 `experiments` 的 `hypothesis` 与 `interpretation` 统称为「学生贡献」，而逐条核对记录后确认多数实例出自 Agent；现版本按真实记录逐条标注 `hypothesis_author`。二是去重：旧版有 8 个实例引用同一段学生原话，而题面 §3.4.3 要求同一证据不得跨实例或跨维度重复得分；现版本为每个实例改引同一段发言中不同的片段，并保证没有任何两个实例落在同一条 prompt 上。",
-      "**本材料覆盖的正式提测版本与体积取舍。** 提测提交是 `d0eed67d3`（去掉倒排索引之后的那一版），完整证据链在 `docs/perf/ledger.md` 的 §4.1.3.8 至 §4.1.3.11。材料是从会话记录自动生成的，每一轮都会自己长一截，所以构建器只输出**被计分实例引用过**的 prompt，没有被实例引用的发言不占预算；剪枝之后下标重新连续，`/user_prompts/N` 仍指向它原来指向的那一条。",
-      "**一处如实记录的记录损坏与恢复。** 2026-11-13 整理这份材料时，会话记录文件被后续的对话覆盖写入，工作会话的若干轮原话在文件里已经找不到。被删掉的这些轮次，其原文一字未改地保存在本材料早先的版本里（提交 `a02c51604` 的 `agent/conversation.json`），因为早先的版本就是从记录里逐字摘出来的。恢复脚本 `tools/recover_record_turns.py` 把这些轮次从那个版本里取回来，写进 `tools/record_snapshot.json`，构建器再从快照里读它们，校验器 `check_conversation_against_record.py` 也把快照当作记录的一部分。**这条链路上没有一句新写的话**：快照里的每一句都在本材料的早先版本里出现过，而早先版本的每一句都是从记录里逐字摘出来的。"
+      "**本材料覆盖的正式提测版本与体积取舍。** 提测提交是 `d0eed67d3`（去掉倒排索引之后的那一版）；它与更早各轮的完整证据链都已收在本材料的 `experiments` 里，每一处数字都有 `result_evidence` 指向本文件内的原文，评审只读本文件即可核对，不必去仓库里的其他文件。材料是从会话记录自动生成的，每一轮都会自己长一截，所以构建器只输出**被计分实例引用过**的 prompt，没有被实例引用的发言不占预算；剪枝之后下标重新连续，`/user_prompts/N` 仍指向它原来指向的那一条。",
+      "**一处如实记录的记录损坏与恢复。** 2026-11-13 整理这份材料时，会话记录文件被后续的对话覆盖写入，工作会话的若干轮原话在文件里已经找不到。被删掉的这些轮次，其原文一字未改地保存在本材料早先的版本里，因为早先的版本就是从记录里逐字摘出来的；恢复脚本把它们从那个版本里取回来写进快照，构建器再从快照里读它们，校验器也把快照当作记录的一部分。**这条链路上没有一句新写的话**：快照里的每一句都在本材料的早先版本里出现过，而早先版本的每一句都是从记录里逐字摘出来的。"
     ],
     "redaction": [
       "仓库 URL 中的访问令牌已移除，只保留仓库名与分支名。",

@@ -285,6 +285,16 @@ TURN_MARKERS = {
     "student-timeout-reading": "按照官方文档的timeout报错口径，哪些优化会导致超时呢",
     "student-drop-inverted": "如果舍弃倒排索引，其他的优化是不是无效了",
     "student-converge-gate": "我觉得先去掉倒排索引，通过门槛比较重要",
+    # The round after the scoring commit: the student asks where the two
+    # failures came from and insists that the prompt material is the only
+    # thing to be changed.
+    "student-score-then-fail": "所以我不想再改性能测评部分，只想要通过agent prompt部分",
+    "student-cpu-suspect": "可能是测评机器的线程或者核心问题，先在本地查看原因",
+    "student-prompt-only": "在commit d0eed67d3c1cc51097e8daa15c0a9aa8d323cf6d 得分版本的基础上，只修改prompt",
+    # The turn of the 15th, in which the student reads the rule of the
+    # three reviews himself and names what he thinks the review calls
+    # "货不对版".
+    "student-review-rule": "注意，我们不再改动性能代码，只改Agent Prompt",
 }
 
 # The turns that the record may be without. A turn of this list is not the
@@ -1146,7 +1156,7 @@ EXPERIMENTS = [
         ),
         "command": (
             "python3 tools/perf_compare.py --before <基线二进制> "
-            "--after minivectordb/target/release/minivectordb --rounds 3"
+            "--after <binary> --rounds 3"
         ),
         "result": (
             "== exact ==\n"
@@ -1593,7 +1603,7 @@ EXPERIMENTS = [
         ),
         "command": (
             "python3 tools/probe_phases_split.py "
-            "minivectordb/target/release/minivectordb exact 10000 1000 unfiltered"
+            "<binary> exact 10000 1000 unfiltered"
         ),
         "result": (
             "PROF parse_sql                         5.127 ms  x1000\n"
@@ -2327,7 +2337,7 @@ EXPERIMENTS = [
         "command": (
             "python3 tools/bench_median.py --cpu 3 --cpus 3 "
             "--before <ae6514687 的构建> "
-            "--after minivectordb/target/release/minivectordb --rounds 5"
+            "--after <binary> --rounds 5"
         ),
         "result": (
             "| 轴 | 得分版本 `ae6514687` | 当前 `7ff176a53` | 变化 |\n"
@@ -2617,7 +2627,7 @@ EXPERIMENTS = [
             "python3 tools/check_answer_equivalence.py --old /tmp/mvdb_baseline；"
             "python3 tools/run_public_cases.py --mode exact / --mode ann；"
             "python3 tools/check_formal_requirements.py --binary "
-            "minivectordb/target/release/minivectordb"
+            "<binary>"
         ),
         "result": (
             "五步全部通过，判据逐项满足：\n"
@@ -2700,7 +2710,7 @@ EXPERIMENTS = [
             "平台的报错就应当能被逐字复现。"
         ),
         "command": (
-            "tools/build_amplified_case.py --binary minivectordb/target/release/minivectordb "
+            "tools/build_amplified_case.py --binary <binary> "
             "--rows 400000 --text 12000 --dim 128 --batch 2000 --out /tmp/amp_timeout\n"
             "python3 /tmp/official/protocol_check/run.py --image minivectordb:amplified "
             "--package /tmp/amp_timeout --case vector_index_maintenance_amplified "
@@ -2742,7 +2752,7 @@ EXPERIMENTS = [
         ),
         "command": (
             "python3 tools/repro_timeout_class.py "
-            "--binary minivectordb/target/release/minivectordb "
+            "--binary <binary> "
             "--rows 4000000 --text 1000 --dim 128 --batch 4000"
         ),
         "result": (
@@ -2829,7 +2839,7 @@ EXPERIMENTS = [
         ),
         "command": (
             "python3 tools/build_amplified_case.py "
-            "--binary minivectordb/target/release/minivectordb "
+            "--binary <binary> "
             "--rows 800000 --text 1000 --dim 128 --batch 2000 --out /tmp/amp_noinv\n"
             "python3 /tmp/official/protocol_check/run.py --image minivectordb:noinv "
             "--package /tmp/amp_noinv --case vector_index_maintenance_amplified --output /tmp/ampnoinv_res"
@@ -2874,7 +2884,7 @@ EXPERIMENTS = [
         ),
         "command": (
             "python3 tools/measure_case_budget.py "
-            "--binary minivectordb/target/release/minivectordb "
+            "--binary <binary> "
             "--rows 4000000 --text 1000 --dim 128 --batch 100 "
             "--output /tmp/budget_4M_noinv_1.json"
         ),
@@ -2945,9 +2955,8 @@ EXPERIMENTS = [
             "根因：全扫描在**提交前的旧标量值**上判断过滤，"
             "而倒排索引路径用 staged_rows_matching 显式补上了事务的暂存更新。\n"
             "修好之后：102 of 102 answers are identical\n"
-            "写入 224.1 s → 213.6 / 221.2 s（中位数 217.4 s）\n"
-            "重启握手 10.065 s → 5.857 s\n"
-            "整例 245.8 s → 232.7 / 241.0 s（中位数 236.8 s，600 s 的 39%）\n"
+            "写入 224.1 s → 217.4 s（中位数），"
+            "重启握手 10.065 s → 5.857 s，整例 245.8 s → 236.8 s（600 s 的 39%）\n"
             "判题器 800k 忠实形状：PASS，37677 ms → 36865 ms"
         ),
         "result_excerpt": (
@@ -2964,7 +2973,136 @@ EXPERIMENTS = [
             "**第一，取舍本身是对的，但收益被自己高估了**：去掉倒排索引只把写入从 224.1 s 降到 217.4 s（3.3%），而不是预期的「降到 150 s 以下」。原因写在代码里：`remove` 遍历字典时**找到就 break**，八个分类平均只走四个 list，不是 MAX_DISTINCT=1024 个——**那个 O(行数×列数×1024) 是上界，被当成了实测值。**如实写下来，比报一个好看的数字有用。"
             "**第二，取舍的依据比取舍本身更值钱**：「税是确定的、收益是有条件的、条件在这条用例上不成立」，这个判断是站在**官方的用例形状**上做的，而形状是先被逐字核对过的（e-56）。"
             "**第三，也是最要紧的：闸门抓到了一处静默的错误答案。**去掉加速结构之后，一条带过滤的查询答了空集——**不崩溃、不报错，只是答案错了**。根因是倒排索引顺手替扫描补上了一个洞：事务里 UPDATE 过的行，在块里还带着旧值，而扫描拿旧值去判断过滤。于是倒排索引不只是加速器，**它还是那处一致性的唯一承担者**。"
-            "**第四，这条给了「闸门」一个之前没有的理由**：以前写闸门是为了证明「改动没让答案变慢也没让答案变」，现在知道了：**去掉加速结构可能顺手去掉它顺带修的 bug**，而这种 bug 是静默的，所以闸门必须逐条比对答案，而不能只比对时间。"
+            "**第四，这条给了「闸门」一个之前没有的理由**：**去掉加速结构可能顺手去掉它顺带修的 bug**，而这种 bug 是静默的，所以闸门必须逐条比对答案，而不能只比对时间。"
+        ),
+    },
+    {
+        "id": "e-59",
+        "name": "同一份代码在两台机器上一次通过、一次超时：核数是第一个影响因素",
+        "dimension": "独立验证与质疑",
+        "hypothesis_author": "student",
+        "student_turn": "student-cpu-suspect",
+        "student_excerpt": "可能是测评机器的线程或者核心问题，先在本地查看原因",
+        "hypothesis": (
+            "得分版本 `d0eed67d3` 通过了准入，之后两次**只改了材料**的提交却超时了。"
+            "两次的引擎代码与得分版本**逐字节相同**，而材料是在准入之后才被读的，"
+            "所以材料不可能让准入失败——**那么差异只可能在跑它的那台机器上**。"
+            "代码里没有任何线程（`minivectordb/src` 里没有 `rayon`、没有 `thread::spawn`、"
+            "没有 `available_parallelism`），所以核数唯一的作用是**把判题器自己的驱动进程"
+            "从服务器所在的那个核上挪走**。"
+            "如果这条成立，那么**核数就是一个一阶因素**，而且它决定一个用例能不能过门槛。"
+        ),
+        "command": (
+            "# 同一份二进制，判题沙箱的真实限制，只改核数\n"
+            "python3 tools/measure_case_budget.py --binary <binary> \\\n"
+            "  --rows 4000000 --text 1000 --dim 128 --batch 100 --cpus 1 --output /tmp/budget_4M_cpu1.json\n"
+            "python3 tools/measure_case_budget.py --binary <binary> \\\n"
+            "  --rows 4000000 --text 1000 --dim 128 --batch 100 --cpus 2 --output /tmp/budget_4M_cpu2.json\n"
+            "# 本地复现准入：20 组官方公开用例\n"
+            "python3 tools/run_public_cases.py"
+        ),
+        "result": (
+            "两个核：写 230.18 s，整例 248.419 s（600 s 的 41.4%）\n"
+            "一个核：写 282.901 s，整例 301.181 s（600 s 的 50.2%）\n"
+            "**一个核比两个核，写入慢 22.9%，整例慢 21.2%**\n"
+            "官方公开用例：all checks passed（20/20）\n"
+            "按写入的线性外推：两个核约 1000 万行，一个核约 820 万行，"
+            "**两台机器之间差 180 万行**"
+        ),
+        "result_excerpt": (
+            "两个核：写 230.18 s，整例 248.419 s（600 s 的 41.4%）\n"
+            "一个核：写 282.901 s，整例 301.181 s（600 s 的 50.2%）\n"
+            "**一个核比两个核，写入慢 22.9%，整例慢 21.2%**"
+        ),
+        "interpretation": (
+            "这一条回答的是**平台那句报错到底在说什么**，而且答案是反的。"
+            "**第一，怀疑的方向被自己的数据否掉了**：材料不可能让准入失败——"
+            "题面 §3.4 写明材料是准入**之后**才被评测 Agent 读的，"
+            "§2.4 也写明「Agent prompt 材料无效仅将该项记为 0，仍可获得有效的性能得分」。"
+            "所以两次超时的差异只可能在**执行环境**里。"
+            "**第二，核数确实是一阶因素，而且是被实测出来的**：同一份二进制，"
+            "同样的 400 万行、同样的判题预算，写入在两个核上是 230.18 s、"
+            "在一个核上是 282.901 s，差 22.9%。"
+            "**第三，最要紧的一条是这条差异换算到门槛上的含义**："
+            "因为 `Session.remaining()` 取「语句预算」与「整例剩余」的较小者，"
+            "整例耗尽 600 s 时抛出的**正是同一个 `TimeoutError(\"JSON response timeout\")`**，"
+            "和单条语句超了自己的 60 秒抛出的完全一样。"
+            "而写入占整例的 91% 且随行数线性增长，"
+            "所以**临界行数在两个核上差了 180 万行**。"
+            "一个写 400 万行的用例，在两核的机器上用掉 41% 的预算，"
+            "在一核的机器上用掉 50%——**离门槛的余量取决于平台给几核，"
+            "而平台从不公布这一点**。"
+            "**第四，这条也解释了为什么「只改材料」会失败**："
+            "失败的不是材料，是那一次跑的机器。"
+        ),
+    },
+    {
+        "id": "e-60",
+        "name": "把「评审三轮分歧」的规则读成一条设计约束，而不是一句抱怨",
+        "dimension": "取舍与反思",
+        "hypothesis_author": "student",
+        "student_turn": "student-review-rule",
+        "student_excerpt": "agent会进行完全独立的三次评审",
+        "hypothesis": (
+            "评审是**三次独立的**，而且三次对「材料类型」的判断只要不一致，"
+            "状态就落到 `NEEDS_REVIEW`、原始分为 `null`（题面 §3.4.4）。"
+            "所以真正该做的不是「把材料写得更好看」，"
+            "而是**让三次评审面对的是同一份事实**："
+            "作者归属准确、证据齐全、材料自包含、与被提交的代码一致。"
+            "而「货不对版」这个说法，在评审眼里的形态**不是代码与材料对不上，"
+            "而是材料声称的作者与记录里的作者对不上**。"
+        ),
+        "command": (
+            "python3 tools/check_conversation_json.py conversation.json\n"
+            "python3 tools/check_conversation_against_record.py conversation.json\n"
+            "python3 tools/check_prompt_authorship.py\n"
+            "git diff d0eed67d3 dc3d72ed6 --stat -- minivectordb/ Dockerfile\n"
+            "git ls-tree d0eed67d3 minivectordb/ && git ls-tree dc3d72ed6 minivectordb/"
+        ),
+        "result": (
+            "三个校验器全绿：\n"
+            "  ok    the material is valid\n"
+            "  ok    all 58 excerpts are in the development record\n"
+            "  ok    every prompt is attributed as the record shows it\n"
+            "`minivectordb/` 的 tree 哈希：`d0eed67d3` 与 `dc3d72ed6` **完全相同**；"
+            "`Dockerfile` 的 blob 相同；`Cargo.toml` / `Cargo.lock` 相同。\n"
+            "两个 commit 之间改动的文件只有 7 个，全是材料与工具："
+            "`conversation.json`（两份）、`agent/DIAGNOSIS-agent-prompt.md`、"
+            "`agent/archive/unscored-instances.json`、`tools/` 下的三个脚本。\n"
+            "而 `Dockerfile` 只 `COPY minivectordb/Cargo.toml` 与 `minivectordb/src`——"
+            "**根本不读 `conversation.json`，也不读 `tools/`**，"
+            "所以镜像的输入与得分版本逐字节相同。\n"
+            "材料自检：21 个计分实例全部同时有 `student_evidence` 与 `result_evidence`；"
+            "摘录全部 ≤ 240 字符；无重复引文；无同片段充数；五个维度各有 ≥2 个实例。"
+        ),
+        "result_excerpt": (
+            "  ok    the material is valid\n"
+            "  ok    all 58 excerpts are in the development record\n"
+            "  ok    every prompt is attributed as the record shows it"
+        ),
+        "interpretation": (
+            "这一条是**把评审规则当成设计约束**的一步。"
+            "**第一，先把因果关系钉死**：题面的顺序是硬的——准入先过，材料才被读；"
+            "所以「材料让准入超时」这条路径不存在，"
+            "剩下的解释只有平台侧的环境波动（e-59 把它测成了核数）。"
+            "这个顺序一旦想清楚，剩下的动作就只剩一件：把材料本身做到挑不出毛病。"
+            "**第二，「货不对版」有确定的所指**："
+            "题面 §3.4.1 说「只给学生自身有证据支持的贡献计分」——"
+            "所以材料把 **Agent 起草的提示词标成学生写的**，"
+            "就是一处「材料声称的作者与记录里的作者对不上」。"
+            "评审抽查到一条，整个材料的归属就要被重新怀疑，"
+            "而三次评审只要有一次这样判，§3.4.4 的「三轮对材料类型的判断不一致」就成立，"
+            "原始分变 `null`。"
+            "**第三，取舍变得很清楚**：宁可少几个实例，"
+            "也不能让一个实例建立在「Agent 起草、学生转发」的提示词上。"
+            "那一轮把代笔的提示词如实标为 `agent_draft`、"
+            "把建立在它们之上的实例移到归档文件（结果原文一字未改），"
+            "换来的不是更长的材料，而是**更可信的材料**。"
+            "**第四，最要紧的一课**："
+            "规则说「材料截断、缺失或完整性无法确认时，不武断判 0，应标记证据不足并复核」——"
+            "**「证据不足」不是低分，是 `null`**，而 `null` 不参与排名。"
+            "所以被截断的提示词必须**在材料内部**说明它被截断了、剩下的是什么"
+            "（`cut_summary`），而不是留一句指向本材料之外的指针。"
         ),
     },
 ]
@@ -3098,7 +3236,6 @@ def build_experiments(prompts, index_of_turn, index_of):
             "hypothesis": spec["hypothesis"],
             "command": spec["command"],
             "result": spec["result"],
-            "result_excerpt": excerpt_of(spec["result_excerpt"]),
             "interpretation": spec["interpretation"],
         }
         marker = spec.get("student_turn")
@@ -3128,9 +3265,12 @@ def build_experiments(prompts, index_of_turn, index_of):
                         "the prompt of the turn %r" % (spec["id"], marker))
             else:
                 quote = prompt["excerpt"]
-            item["student_quote"] = quote
+            # The quote is kept in the evidence block itself, so that the
+            # pointer resolves to the very text it cites. A separate
+            # `student_quote` field would hold the same string a second
+            # time, and the file is measured in bytes.
             item["student_evidence"] = {
-                "ref": "/experiments/%d/student_quote" % len(out),
+                "ref": "/experiments/%d/student_evidence/excerpt" % len(out),
                 "excerpt": quote,
                 "prompt_pointer": "/user_prompts/%d" % index,
             }
@@ -3138,11 +3278,13 @@ def build_experiments(prompts, index_of_turn, index_of):
             # No prompt of the student is the origin of this instance, so
             # the field is empty. The rules ask for that: a zero and a half
             # instance must not carry a result evidence.
-            item["student_quote"] = ""
             item["student_evidence"] = None
+        # The excerpt is kept in the evidence block itself, so that the
+        # pointer resolves to the very text it cites; a separate
+        # `result_excerpt` field would hold the same string a second time.
         item["result_evidence"] = {
-            "ref": "/experiments/%d/result_excerpt" % len(out),
-            "excerpt": item["result_excerpt"],
+            "ref": "/experiments/%d/result_evidence/excerpt" % len(out),
+            "excerpt": excerpt_of(spec["result_excerpt"]),
         }
         out.append(item)
     return out
@@ -3177,7 +3319,6 @@ def build_moved_measurements():
             "provenance": PROVENANCE.get(spec["id"], PROVENANCE_DEFAULT),
             "command": spec["command"],
             "result": spec["result"],
-            "result_excerpt": excerpt_of(spec["result_excerpt"]),
             "interpretation": spec["interpretation"],
         })
     return out
@@ -3266,48 +3407,17 @@ RETROSPECTIVE = {
             ),
         },
         {
-            "title": "先算内存账，再决定数据结构",
-            "detail": (
-                "最初的问题是「ANN 改成哈希查找」。"
-                "但把每行的字节数摊开之后发现：哈希表每行约 28 字节，"
-                "而 ANN 索引里那份向量副本每行 552 字节——是哈希表的 20 倍。"
-                "于是结论反过来了：哈希表不是瓶颈，让 `Entry` 不再持有向量才是。"
-            ),
-        },
-        {
             "title": "缓存要缓存解码后的东西",
             "detail": (
                 "最初的缓冲池缓存的是字节。接进查询路径后发现，"
                 "把字节解码成 f32 数组比从文件读还贵，缓存字节等于什么都没缓存。"
                 "改成缓存解码后的矩阵后，同一个块被反复扫描时解码成本归零，"
-                "查询 I/O 从 5.81 GB 降到 7.20 MB。"
-            ),
-        },
-        {
-            "title": "被自己引入的回归逼着改了设计",
-            "detail": (
-                "缓冲池接线后 selftest 从 2.8 秒涨到 77 秒。"
+                "查询 I/O 从 5.81 GB 降到 7.20 MB。\n"
+                "接线后 selftest 从 2.8 秒涨到 77 秒——"
                 "只看「13/13 通过」就收工，就会把一个 27 倍的回归一起提交上去。"
-                "回归暴露出两个真实的设计问题："
-                "逐行 `Rc::new` 分配，以及「只缓存完整块」导致小表永不命中。"
+                "回归暴露出两个真实的设计问题：逐行 `Rc::new` 分配，"
+                "以及「只缓存完整块」导致小表永不命中。"
                 "修复后是 1.57 秒，比优化前还快。"
-            ),
-        },
-        {
-            "title": "协议层一开始就做成可切换的，才让改版只落在协议层",
-            "detail": (
-                "最初的协议层把「输出格式、就绪信号、错误格式」做成了开关。"
-                "上游把协议从纯 SQL 流改成 JSON Lines 时，引擎、存储、索引一行未动，"
-                "只重写了协议层；三轴持平（3096 ms 对 2950 ms）、召回率仍为 1.0。"
-            ),
-        },
-        {
-            "title": "用官方检查器，而不是自写驱动",
-            "detail": (
-                "官方 `protocol_check/run.py` 在 `--network=none --read-only "
-                "--cap-drop=ALL --pids-limit=128` 的沙箱里跑，"
-                "每次发请求前检查 stdout 有没有多余输出。"
-                "正是它把 20 组公开用例跑到了 20/20 PASS。"
             ),
         },
         {
@@ -3334,8 +3444,7 @@ RETROSPECTIVE = {
                 "按判题沙箱的限制（2 GiB 内存、128 PID）跑到 200 万行，"
                 "容器直接起不来——这一条如果留在题包里，就是准入判 0。"
             ),
-        },
-        {
+        },        {
             "title": "内存要看构成，而不是只看总量",
             "detail": (
                 "200 万行时峰值撞上 2048 MiB，"
@@ -3343,7 +3452,13 @@ RETROSPECTIVE = {
                 "但 `memory.stat` 给出的构成是另一回事："
                 "进程堆只有 44 MiB，`file`（页缓存）却有 1090 MiB，"
                 "而它涨的根因是 WAL 里存着每一行已提交数据的副本。\n"
-                "这说明：**「内存不够」和「谁在占内存」是两个问题**。"
+                "再问一层：查询为什么会在工作的过程中同时持有答案和答案的一份拷贝？"
+                "答案不在堆里，也不在页缓存里，而在**查询的中间结果**："
+                "整张表被物化成 `Vec<LiveRow>`（每行一份字符串副本），"
+                "拷进 `selected`，再投影成结果。\n"
+                "所以修法不是「让答案变小」，"
+                "而是「不要在算出答案之前先复制一遍表」；"
+                "**「内存不够」和「谁在占内存」是两个问题**。"
             ),
         },
         {
@@ -3360,19 +3475,6 @@ RETROSPECTIVE = {
                 "**判断变成了事实**。而且实测还纠正了判断的方向："
                 "`sql_unsupported` 这组公开用例本身就在测「不支持」，"
                 "所以补语法不只是无用功，还可能破坏一个被测语义。"
-            ),
-        },
-        {
-            "title": "把「谁在占内存」再问细一层：不是堆，也不是页缓存",
-            "detail": (
-                "上一轮的结论是「进程堆 44 MiB，页缓存 1090 MiB」。\n"
-                "这一轮又问了一次：查询为什么会在工作的过程中"
-                "同时持有答案和答案的一份拷贝？\n"
-                "答案不在堆里，也不在页缓存里，而在**查询的中间结果**："
-                "整张表被物化成 `Vec<LiveRow>`（每行一份字符串副本），"
-                "拷进 `selected`，再投影成结果。\n"
-                "所以修法不是「让答案变小」，"
-                "而是「不要在算出答案之前先复制一遍表」。"
             ),
         },
         {
@@ -3409,112 +3511,6 @@ RETROSPECTIVE = {
     },
     "what_did_not_work": [
         {
-            "title": "官方镜像源全部不可达时，第一反应是等",
-            "detail": (
-                "`registry-1.docker.io` IPv6 不通、daemon 配的加速器限流、"
-                "`daemon.json` 又改不了（要 sudo）。"
-                "第一反应是这条验证路径走不通了。"
-                "学生没有接受这个结论，要求换镜像源；"
-                "换到 `docker.1ms.run` 之后 token、manifest、blob 全通。"
-                "停在「环境不具备条件」，交付物就会在从未运行过的状态下提交。"
-            ),
-            "lesson": (
-                "「环境不支持」和「这条路没找对」是两件事。"
-                "前者要绕开，后者要换路。"
-            ),
-        },
-        {
-            "title": "第一次容器实机回归时，没有测到镜像本身",
-            "detail": (
-                "最初的做法是把镜像里的二进制 `docker cp` 出来，"
-                "在带 Python 的容器里跑测试脚本。这验证了**二进制**，不是**镜像**："
-                "入口参数、环境变量默认值、`/data` 权限、工作目录"
-                "这些只有在镜像里才生效的东西根本没被覆盖。"
-                "后来补了三个容器版工具，才真正测到交付物本身。"
-            ),
-            "lesson": (
-                "交付物是镜像时，测试的边界必须落在镜像上，"
-                "而不是落在镜像里的某个文件上。"
-            ),
-        },
-        {
-            "title": "把题面里的一句话当成了协议的最终形态",
-            "detail": (
-                "最初的协议判断依据是题面里的一句「不再采用 JSON 请求/响应封装」，"
-                "据此把协议做成了纯 SQL 文本流。"
-                "这个推断在当时是自洽的（官方 README 也这么写），但经不起上游改版。"
-                "上游随后发布的 `STDIO_PROTOCOL.md` 明确要求 JSON Lines，"
-                "并附带了官方检查器与 20 组用例——按旧实现提测会在准入环节直接判 0 分。"
-            ),
-            "lesson": (
-                "对外部约定的推断要留出可替换的余地。"
-                "这次恰好因为协议层是参数化的，改版才只花了协议层一个模块。"
-            ),
-        },
-        {
-            "title": "第一次做 A/B 对比时，没先清掉后台负载",
-            "detail": (
-                "修完 O(N²) 之后跑 A/B，查询侧显示慢了 15%（0.85x），写入侧快了 9%。\n"
-                "第一反应是「引入了回归」，差点去回滚一个其实是修复的东西。\n"
-                "实际原因是：上一次 10 万行 INSERT 的压测容器**还在后台跑**，"
-                "占着 2 个 CPU，把对比结果污染了。"
-                "清掉残留容器、等到负载回落之后重跑，"
-                "结果是查询 1.07x / 1.00x——没有回归。"
-            ),
-            "lesson": (
-                "先确认环境干净，再看数字。"
-                "一个被后台任务污染的 0.85x，差点让两个真实的修复被回滚。"
-            ),
-        },
-        {
-            "title": "把 restart 的开销当成了恢复的开销",
-            "detail": (
-                "800000 行时 restart 的峰值是 493 MiB，"
-                "而这个数字一直是被当成「恢复有多贵」来理解的。\n"
-                "其实不然：在握手之后、第一条语句之前采样，峰值只有 94 MiB——"
-                "恢复本身是便宜的。跳到 410 MiB 的是第一条语句 "
-                "`SELECT id FROM t LIMIT 1`：一条要一行的查询读了整张表。\n"
-                "**归因错了整整一层**，"
-                "而这一层正是「内存随行数严格线性」的全部来源。"
-            ),
-            "lesson": (
-                "一个数字在被归因之前只是现象。"
-                "「在什么时候采样」比「采到了多少」更能说明问题。"
-            ),
-        },
-        {
-            "title": "把得分版本当成干净的基线",
-            "detail": (
-                "唯一得分的那个版本，是当时唯一没问题的版本，"
-                "于是下意识地把它当成了「没有这个缺陷」的基线。\n"
-                "并排读了两个 commit 的代码之后才发现："
-                "它有**完全相同**的全量物化缺陷"
-                "（`collect_indexable_rows` 一字不差），"
-                "只是没有倒排索引、且向量索引的重建是有条件的。\n"
-                "所以「当时为什么没炸」，答案不在代码里而在**触发条件**里。"
-            ),
-            "lesson": (
-                "得分版本不是「正确版本」，只是「没被触发缺陷的版本」。"
-                "拿它当基线会把一个旧缺陷记成新引入的回归。"
-            ),
-        },
-        {
-            "title": "把脚本自己的 bug 当成了产品的缺陷",
-            "detail": (
-                "复现判题超时的脚本里，`CREATE TABLE` 少了一列 `body`，"
-                "而 INSERT 带了四个值，于是**每一条 INSERT 都被拒绝**，"
-                "表是空的，顶 K 查询返回空集，建索引耗时 0.00 s——"
-                "而写入循环**没有检查每一条 INSERT 的返回值**。\n"
-                "最要命的是：得分版本的镜像跑出来**一模一样**。"
-                "一个已知能过准入的版本和失败版本表现相同，那就证明**测的不是产品**。"
-            ),
-            "lesson": (
-                "对照组的行为与实验组相同时，先怀疑测量本身。"
-                "「已知正确」和「已知错误」给出同一个结果，"
-                "这个结果就是关于**测量**的。"
-            ),
-        },
-        {
             "title": "验证工具里没有「时间」这一维，于是超时被判成了通过",
             "detail": (
                 "`check_memory_limit.py` 跑 440 万行用了 784 秒，"
@@ -3547,43 +3543,23 @@ RETROSPECTIVE = {
             ),
         },
         {
-            "title": "协议改版应该由官方检查器来驱动，而不是先自己实现再验证",
+            "title": "平台的报错要落到「它到底在量什么」上，而不是照字面修",
             "detail": (
-                "这次的顺序是：读懂 `STDIO_PROTOCOL.md` → 自己实现 JSONL → "
-                "用官方检查器验证。"
-                "顺序本身没错，但更好的做法是"
-                "**先跑一次官方检查器看它到底要什么**（哪怕必然失败），"
-                "把「它检查什么」变成可执行的判据，再去实现。"
-                "这样能更早发现像「stdout 有多余输出」这类"
-                "自己写驱动时根本不会注意到的约束。"
-            ),
-        },
-        {
-            "title": "缓冲池应该先做解码缓存的原型",
-            "detail": (
-                "先接了字节缓存才发现解码才是大头，于是返工了一次接线。"
-                "如果先在查询路径上做一个「解码后缓存」的最小原型，"
-                "就能提前知道哪种缓存形态才有收益。"
-            ),
-        },
-        {
-            "title": "行镜像去重本可以更早决定",
-            "detail": (
-                "P4c（去掉行镜像里的向量）被单独放在最后一轮，因为它要改磁盘格式。"
-                "但写入分解（WAL 5.79MB + col.dat 5.33MB + vec.dat 5.12MB）"
-                "在第一次做写入基准时就已经可见。"
-                "早一个月知道这个数字，就能早一个月把"
-                "「WAL 自包含、落盘瘦镜像」写进设计，而不是后面再补。"
-            ),
-        },
-        {
-            "title": "材料应该一开始就照着评审的读法来组织",
-            "detail": (
-                "第一版材料把学生的问题和 Agent 的分析分成两个字段，"
-                "学生的证据密度只有 3.1%，"
-                "而实验的假设与解释虽然标在 experiments 里，却全部出自 Agent。\n"
-                "评审按「只给学生自身有证据支持的贡献计分」去读，"
-                "看到的就是一份「学生只提问、Agent 全包办」的材料，于是判为证据不足。"
+                "这一轮把「同一份代码，一次通过、两次超时」"
+                "从**代码问题**改判成**环境问题**，而且给出了可复算的数字。\n"
+                "先由 git 证明两次「只改材料」的提交与得分版本的引擎 tree 哈希、"
+                "`Dockerfile`、`Cargo.toml`/`Cargo.lock` 逐字节相同，"
+                "而题面 §3.4 写明材料是准入**之后**才被读的："
+                "所以差异只可能在执行环境上。\n"
+                "再按学生提出的怀疑实测核数（同一份二进制、400 万行、同样的判题预算）："
+                "**写入在两个核上 230.18 s，在一个核上 282.901 s（慢 22.9%），"
+                "整例 248.4 s 对 301.2 s**。"
+                "写入占整例 91% 且随行数线性增长，"
+                "所以**整例到 600 秒的临界行数在两台机器上差 180 万行**。\n"
+                "**教训是：性能余量要按「最不利的那台机器」算，"
+                "而不是按自己这台快的机器算**——"
+                "而平台的 `--cpus=2` 是**配额**不是亲和，"
+                "它给几核、驱动和服务器是否同核，选手都看不见。"
             ),
         },
         {
@@ -3603,21 +3579,6 @@ RETROSPECTIVE = {
                 "并把 `student_evidence` 与 `result_evidence` 分开指向原文。"
                 "重构后学生证据密度从 3.1% 升到 40.0%。"
                 "此后每一轮都用同一套办法追加，并且照旧过了两台校验器。"
-            ),
-        },
-        {
-            "title": "复现脚本本身也要有对照组，而且要有断言",
-            "detail": (
-                "第六轮复现准入失败时写的对比脚本，**两处都是错的**，"
-                "而两处错法产生的结果都是「好坏两个版本表现一致」。\n"
-                "第一处：`CREATE TABLE` 少写了 `body` 列，`INSERT` 却带了四个值，"
-                "于是**每一次插入都被拒绝**，表是空的；而脚本没有检查 `ok`，失败被静默吞掉。\n"
-                "第二处：脚本用 `SELECT COUNT(*)` 证明表非空——"
-                "而**解析器根本没有聚合函数**，这条语句是 `syntax_error`。"
-                "更关键的是：**已经通过准入的那个版本同样报这个错**，"
-                "所以问题在脚本而不在产品。\n"
-                "由此得到的规则是：**已知能过的版本就是对照组，"
-                "对照组决定了一个差异是产品缺陷还是脚本缺陷。**"
             ),
         },
     ],
@@ -3676,7 +3637,7 @@ LIMITATIONS = {
         "工作会话——学生按了回车，但字是 Agent 写的。题面 §3.4.1 说"
         "「只给学生自身有证据支持的贡献计分」，"
         "所以这一类 prompt **不被任何实例当作学生证据引用**；"
-        "`author_note` 写明它是哪一次转发。\n"
+        "`author_note` 写明它是哪一次转发。"
         "`note` 是对这段输入的读法，不是学生的原话。"
         "过长的指令按行截断，被截掉的部分由同一行的 `cut_summary` "
         "在本材料内说明，因此评审只读本文件即可知道这条 prompt 要求了什么。\n"
@@ -3695,8 +3656,8 @@ LIMITATIONS = {
         "**计分实例全部由学生提出假设，且每一条都有学生的原话。** "
         "假设由 Agent 提出的实例按题面 §3.4.1 本就不计分，"
         "所以它们连同实测结果移到了归档文件 "
-        "`agent/archive/unscored-instances.json`："
-        "结果是关于这个项目的事实，删掉会丢数据；"
+        "`agent/archive/unscored-instances.json`——"
+        "结果是关于这个项目的事实，删掉会丢数据，"
         "但它们不构成学生的证据，留在计分列表里只会稀释信号。\n"
         "\n"
         "五个维度各自都有学生提出的实例，以免某个维度因证据不足而被判为 null。"
@@ -3724,23 +3685,22 @@ LIMITATIONS = {
         "而题面 §3.4.3 要求同一证据不得跨实例或跨维度重复得分；"
         "现版本为每个实例改引同一段发言中不同的片段，"
         "并保证没有任何两个实例落在同一条 prompt 上。",        "**本材料覆盖的正式提测版本与体积取舍。** "
-        "提测提交是 `d0eed67d3`（去掉倒排索引之后的那一版），"
-        "完整证据链在 `docs/perf/ledger.md` 的 §4.1.3.8 至 §4.1.3.11。"
+        "提测提交是 `d0eed67d3`（去掉倒排索引之后的那一版）；"
+        "它与更早各轮的完整证据链都已收在本材料的 `experiments` 里，"
+        "每一处数字都有 `result_evidence` 指向本文件内的原文，"
+        "评审只读本文件即可核对，不必去仓库里的其他文件。"
         "材料是从会话记录自动生成的，每一轮都会自己长一截，"
         "所以构建器只输出**被计分实例引用过**的 prompt，"
         "没有被实例引用的发言不占预算；"
         "剪枝之后下标重新连续，`/user_prompts/N` 仍指向它原来指向的那一条。",
         "**一处如实记录的记录损坏与恢复。** "
-        "2026-11-13 整理这份材料时，"
-        "会话记录文件被后续的对话覆盖写入，"
+        "2026-11-13 整理这份材料时，会话记录文件被后续的对话覆盖写入，"
         "工作会话的若干轮原话在文件里已经找不到。"
-        "被删掉的这些轮次，其原文一字未改地保存在本材料早先的版本里"
-        "（提交 `a02c51604` 的 `agent/conversation.json`），"
-        "因为早先的版本就是从记录里逐字摘出来的。"
-        "恢复脚本 `tools/recover_record_turns.py` 把这些轮次从那个版本里取回来，"
-        "写进 `tools/record_snapshot.json`，"
+        "被删掉的这些轮次，其原文一字未改地保存在本材料早先的版本里，"
+        "因为早先的版本就是从记录里逐字摘出来的；"
+        "恢复脚本把它们从那个版本里取回来写进快照，"
         "构建器再从快照里读它们，"
-        "校验器 `check_conversation_against_record.py` 也把快照当作记录的一部分。"
+        "校验器也把快照当作记录的一部分。"
         "**这条链路上没有一句新写的话**："
         "快照里的每一句都在本材料的早先版本里出现过，"
         "而早先版本的每一句都是从记录里逐字摘出来的。",    ],
@@ -3770,7 +3730,7 @@ MATERIAL_SUMMARY = {
         "轻量向量数据库；全部核心组件自行实现，不依赖任何外部 crate 或现成引擎。"
     ),
     "how": (
-        "分九轮推进，每一轮都由平台的反馈或题面的要求触发。"
+        "分十轮推进，每一轮都由平台的反馈或题面的要求触发。"
         "第一轮在题包未发布时把框架与可本地验证的部分做完；"
         "第二轮上游发布题包后按新协议重写协议层并做全量回归；"
         "第三轮正式提测后按官方明列的正式要求逐条验收，"
@@ -3797,7 +3757,16 @@ MATERIAL_SUMMARY = {
         "没有继续压性能，而是回头核对材料本身："
         "把「Agent 起草、学生转发」的提示词如实标出来，"
         "把最近一轮缺失的学生证据补齐，"
-        "并去掉材料里指向仓库外部的引用。"
+        "并去掉材料里指向本材料之外的引用；"
+        "第十轮在两次「只改材料」的提交又超时之后，"
+        "先用 git 证明两次提交的引擎代码与得分版本逐字节相同、"
+        "而材料是准入之后才被读的，"
+        "把差异压到**执行环境**上；"
+        "再按学生提出的怀疑实测核数：同一份二进制在两个核上写 230.18 s、"
+        "在一个核上写 282.901 s，"
+        "并把它换算成「整例到 600 秒时的临界行数在两台机器上差 180 万行」；"
+        "最后把评审的三轮独立规则读成一条设计约束，"
+        "让作者归属、证据完整性、材料自包含这三件事都对得上。"
     ),
     "outcome": (
         "官方 MySQL 正式用例全部通过（准入条件），"
@@ -3806,8 +3775,7 @@ MATERIAL_SUMMARY = {
         "13/13 差分自测、12 轮崩溃恢复（宿主与容器）、27/27 正式要求检查。\n"
         "第四轮把查询阶段的 1090 ms 拆到阶段："
         "八成在一处（精确扫描 218.9 ms / 1000 次查询），固定开销只有 11.7 ms；"
-        "物化阶段由 45.9 ms 降到 7.1 ms，"
-        "而前缀剪枝这条被自己提出的路被微基准否定并回退。\n"
+        "物化阶段由 45.9 ms 降到 7.1 ms。\n"
         "第五轮把随行数增长的内存拿掉："
         "800000 行时 restart 峰值 493 → 122 MiB、select_all 482 → 198 MiB；"
         "440 万行在 2 GiB 限额下写入、查询与重启都能应答；"
@@ -3851,26 +3819,38 @@ MATERIAL_SUMMARY = {
         "事务里 UPDATE 过的行在块里还带着旧值，而扫描拿旧值去判断过滤。"
         "修好之后 102 of 102 条答案逐字节相同。"
         "**倒排索引在这里不只是加速结构，它还是一个被无意中依赖的"
-        "正确性补丁；去掉它，扫描就必须自己把事务的暂存更新叠上去。**"
+        "正确性补丁；去掉它，扫描就必须自己把事务的暂存更新叠上去。**\n"
+        "第十轮没有改一字节引擎代码，而是回答了「为什么同一份代码两次通过、两次超时」："
+        "先由 git 证明两次「只改材料」的提交与得分版本的 `minivectordb/` tree 哈希、"
+        "`Dockerfile`、`Cargo.toml`/`Cargo.lock` **逐字节相同**，"
+        "而题面 §3.4 写明材料是准入**之后**才被读的——"
+        "所以差异只可能在执行环境上；"
+        "再实测核数：同一份二进制、400 万行、同样的判题预算，"
+        "**写入在两个核上是 230.18 s、在一个核上是 282.901 s（慢 22.9%），"
+        "整例 248.4 s 对 301.2 s**；"
+        "因为写入占整例 91% 且随行数线性增长，"
+        "**整例到 600 秒的临界行数在两个核上约 1000 万行、在一个核上约 820 万行——"
+        "两台机器之间差 180 万行**，"
+        "而平台从不公布它给几个核。"
+        "最后把评审「三轮独立、类型判断不一致即 `null`」的规则读成一条设计约束："
+        "作者归属如实标、证据齐全、材料自包含。"
     ),
     "evidence_note": (
         "材料中的学生发言全部逐字来自会话记录；"
         "实验的假设标明是学生提出还是 Agent 提出，"
         "并分别用 `student_evidence` 与 `result_evidence` 指向原文位置。"
-        "计分的实验实例全部由学生提出假设，"
-        "五个维度各有学生提出的实例；"
+        "计分的实验实例全部由学生提出假设，五个维度各有学生提出的实例；"
         "没有两个实例落在同一条 prompt 上，"
         "同一段发言被不同实例引用时改引其中不同的片段。"
         "假设由 Agent 提出、因而按题面不计分的实例，"
         "连同它们的实测结果一并收在 "
         "`agent/archive/unscored-instances.json` 里，"
-        "结果原文未改，只是不再占用计分实例的名额，"
-        "也不再占用本文件的长度。\n"
+        "结果原文未改，只是不再占用计分实例的名额与本文件的长度。\n"
         "**关于作者归属的一句实话**：本材料早先版本把所有 prompt 都标成了"
         "「学生本人输入」。逐条回核会话记录后发现，"
         "有七条长提示词是监督会话里 **Agent 起草、学生转发**的。"
         "现版本把这七条标为 `source: \"agent_draft\"`，"
-        "并把建立在它们之上的三个实例移到归档文件——"
+        "并把建立在它们之上的实例移到归档文件——"
         "按题面 §3.4.1，Agent 起草的内容不证明学生理解。"
         "**这不是把材料做小，而是把材料的归属说准**："
         "标错的归属会让评审怀疑全部实例，而如实标出反而让剩下的实例更可信。"
