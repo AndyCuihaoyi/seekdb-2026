@@ -1,6 +1,6 @@
 {
   "note": "以下是假设由 Agent 提出、因而**不参与计分**的实验实例，以及按题面 §3.4.2 与 §3.4.3 移出计分列表的实例。\n它们的结果原文一字未改：结果是关于这个项目的事实，删掉会丢数据；但它们不构成学生的证据，所以不占用计分实例的名额，也不占用材料文件的长度。\n材料中的 `retrospective.agent_side_measurements.archive` 指向这个文件。\n\n**这个文件不是证据。** 题面评的是 `conversation.json` 里的计分实例，这里的实例一个都不参与计分。\n每一条的 `provenance` 写明它的结果是从哪里来的：标着「结果原文见开发记录」的那几条能在 `topics/mvdb-01-minivectordb/03-impl-log.md` 与 `04-test-report.md` 里逐字查到；其余各条是当轮实测的产物，当时的会话记录已被后来的会话覆盖，开发记录里也没有逐字收录，所以**无法回溯到原始记录** —— 它们只是过程留痕。",
-  "count": 23,
+  "count": 26,
   "instances": [
     {
       "id": "e-02",
@@ -277,6 +277,42 @@
       "result": "{\n  \"data_directory_mib\": 6638.3,\n  \"data_larger_than_the_budget\": true,\n  \"dim\": 128,\n  \"limit_mb\": 2048,\n  \"phases\": {\"restart\": \"answered\", \"write_and_query\": \"answered\"},\n  \"rows\": 4400000\n}",
       "result_excerpt": "\"data_larger_than_the_budget\": true,\n  \"dim\": 128,\n  \"limit_mb\": 2048,",
       "interpretation": "这是本轮的**准入判据**，而不是性能判据：\n440 万行 × 128 维 × 1000 字节文本，数据目录 6638 MiB —— 是 2 GiB 限额的 3.2 倍，而在 `RLIMIT_AS` 2048 MiB 下，写入加查询与重启**都答了话**。\n值得对照的是平台报的错：`database exited before response`，而本地复现出来的正是 `memory allocation of 512 bytes failed` —— 同一个签名。\n所以这一轮的结论不是「内存变小了」，而是**那个让两轮提测归零的签名被复现并被消掉了**。"
+    },
+    {
+      "id": "e-51",
+      "name": "把准入验证写成有判据的五步，并规定任何一项不满足就停",
+      "dimension": "实验与反馈迭代",
+      "hypothesis_author": "student",
+      "why_not_scored": "出发点是 Agent 起草、学生转发的提示词，文字不是学生自己的",
+      "provenance": "本轮实测的产物：命令在当轮真实执行过，输出如上，原文一字未改。当时的会话记录已被后来的会话覆盖，开发记录里也没有逐字收录这一条，所以这条摘录**无法回溯到原始记录**。它记录的是过程，不是可引用的证据。",
+      "command": "python3 tools/check_memory_limit.py --rows 4400000 --dim 128 --text 1000 --limit-mb 2048；python3 tools/check_answer_equivalence.py --old /tmp/mvdb_baseline；python3 tools/run_public_cases.py --mode exact / --mode ann；python3 tools/check_formal_requirements.py --binary minivectordb/target/release/minivectordb",
+      "result": "五步全部通过，判据逐项满足：\ndata_larger_than_the_budget = true、phases.restart = answered、phases.write_and_query = answered、102 of 102 answers are identical、两种模式各 20/20、27 of 27 requirements hold。\n**但提测仍然失败了**，签名是 JSON response timeout。",
+      "result_excerpt": "五步全部通过，判据逐项满足：\ndata_larger_than_the_budget = true、phases.restart =",
+      "interpretation": "**全绿之后仍然失败，是这一轮最有分量的证据。**如果五步里有红项，学生会先看到红项；但五步全绿，这本身就说明**这些检查测的不是导致失败的那件事**。于是下一步的问题变成了「平台判的那件事，本地哪一个检查在测它」——答案是：一个都没有。这条链子（检查全绿 → 提测仍败 → 发现检查里没有时间这一维 → 补上时间预算）是学生自己的追问推动出来的，不是 agent 单方面猜出来的。"
+    },
+    {
+      "id": "e-52",
+      "name": "用 0.005 分的确定损失，换掉一票否决的不确定风险",
+      "dimension": "取舍与反思",
+      "hypothesis_author": "student",
+      "why_not_scored": "出发点是 Agent 起草、学生转发的提示词，文字不是学生自己的",
+      "provenance": "本轮实测的产物：命令在当轮真实执行过，输出如上，原文一字未改。当时的会话记录已被后来的会话覆盖，开发记录里也没有逐字收录这一条，所以这条摘录**无法回溯到原始记录**。它记录的是过程，不是可引用的证据。",
+      "command": "python3 tools/check_time_budget.py --rows 4000000 --dim 128 --limit-mb 2048；python3 tools/check_memory_limit.py --rows 4400000 --dim 128 --text 1000 --limit-mb 2048",
+      "result": "修好的版本在 400 万行上建索引 5.5 s、重启握手 6.9 s，坏掉的版本是 76.2 s 和 77.4 s。\n4.4M 行 + text=1000 的整体耗时：修复前 784 s → 修复后 568 s，而平台的 case_timeout 是 600 s。\n代价照实写：查询阶段的峰值内存从 11 392 KB 回到约 13 892 KB。",
+      "result_excerpt": "4.4M 行 + text=1000 的整体耗时：修复前 784 s → 修复后 568 s，而平台的 case_timeout 是 600 s。",
+      "interpretation": "这是一个**用可量化的小损失换掉不可量化的灾难**的判断，而且判断的依据是门槛的性质，不是分数的大小。学生没有说「0.005 分不重要」，他说的是「**准入是时间门槛，性能分是次要的**」——准入是一票否决的，不是加权求和的。同一轮里还有第二个同性质的判断：**在拿到三个镜像的对比数据之前不许提交**。两次都是在「急着要那一点分」和「先把门槛守住」之间选了后者。"
+    },
+    {
+      "id": "e-54",
+      "name": "「超时」这两个字，先拆成三个可以分别测的阶段",
+      "dimension": "问题理解与自主拆解",
+      "hypothesis_author": "student",
+      "why_not_scored": "出发点是 Agent 起草、学生转发的提示词，文字不是学生自己的",
+      "provenance": "本轮实测的产物：命令在当轮真实执行过，输出如上，原文一字未改。当时的会话记录已被后来的会话覆盖，开发记录里也没有逐字收录这一条，所以这条摘录**无法回溯到原始记录**。它记录的是过程，不是可引用的证据。",
+      "command": "python3 tools/repro_timeout_class.py --binary minivectordb/target/release/minivectordb --rows 4000000 --text 1000 --dim 128 --batch 4000",
+      "result": "STARTUP（重启握手）  400k 0.999s / 1.6M 3.910s / 4M 10.110s，预算 120s，从不超时\nSHUTDOWN             0.064s（曲线平坦），预算 60s，从不超时\nSTATEMENT（近似模式过滤 TopK）  7.780s / 34.126s / 60.03s，预算 60s，4M 时超时\nSTATEMENT（精确模式同查询）      0.337s / 1.429s / 3.980s，从不超时\n复现器在 4M 行抛出 \"STATEMENT timeout: JSON response timeout\"（60.06s）",
+      "result_excerpt": "STATEMENT（近似模式过滤 TopK）  7.780s / 34.126s / 60.03s，预算 60s，4M 时超时",
+      "interpretation": "这一步把一句模糊的反馈变成了一张三个阶段的表，而且它是**用判题器自己的代码测出来的**：复现器直接 import 官方的 _transport.py 的 Session，只在 read() 外面包一层，把三处等待分别标记成 STARTUP / STATEMENT / SHUTDOWN，再按官方 config.json 的预算跑。**结论是排他的**：只有 STATEMENT 超时，而且只有「近似模式 + 过滤」这一条语句；同一张表还顺带排除了两种量级不同的可能——4M 行时握手只要 10.1s（预算 120s），精确模式的同一条查询只要 3.98s（预算 60s）。所以定位不是「数据库慢」，而是「**近似模式的过滤查询**慢」，而精确模式的对照把变量的范围缩到了「近似路径 + 过滤」这一个交集上。"
     }
   ]
 }
